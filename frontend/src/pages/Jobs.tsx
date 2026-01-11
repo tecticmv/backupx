@@ -43,6 +43,7 @@ import {
   CalendarClock,
   TrendingUp,
   TrendingDown,
+  Database,
 } from "lucide-react";
 
 export default function Jobs() {
@@ -63,7 +64,7 @@ export default function Jobs() {
       if (response.ok) {
         setJobs(await response.json());
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to fetch jobs");
     } finally {
       setIsLoading(false);
@@ -262,7 +263,7 @@ export default function Jobs() {
                 <TableRow>
                   <TableHead className="w-[50px]">Status</TableHead>
                   <TableHead>Name</TableHead>
-                  <TableHead>Remote Host</TableHead>
+                  <TableHead>Type</TableHead>
                   <TableHead>Schedule</TableHead>
                   <TableHead>Last Run</TableHead>
                   <TableHead className="text-right">Actions</TableHead>
@@ -282,8 +283,20 @@ export default function Jobs() {
                         <p className="text-xs text-muted-foreground">{jobId}</p>
                       </div>
                     </TableCell>
-                    <TableCell className="text-muted-foreground">
-                      {job.remote_host}
+                    <TableCell>
+                      <Badge variant="outline" className="gap-1">
+                        {job.backup_type === "database" ? (
+                          <>
+                            <Database className="h-3 w-3" />
+                            MySQL
+                          </>
+                        ) : (
+                          <>
+                            <FolderSync className="h-3 w-3" />
+                            Files
+                          </>
+                        )}
+                      </Badge>
                     </TableCell>
                     <TableCell>
                       {job.schedule_enabled ? (

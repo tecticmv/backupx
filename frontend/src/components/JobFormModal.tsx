@@ -24,6 +24,7 @@ import { toast } from "sonner";
 import type { Job, JobFormData } from "@/types/job";
 import type { S3Config } from "@/types/s3";
 import type { Server } from "@/types/server";
+import type { DatabaseConfig } from "@/types/database";
 import {
   Loader2,
   Save,
@@ -33,14 +34,17 @@ import {
   CalendarClock,
   Shield,
   Settings,
+  Database,
 } from "lucide-react";
 
 const defaultFormData: JobFormData = {
   job_id: "",
   name: "",
+  backup_type: "filesystem",
   server_id: "",
   directories: "",
   excludes: "",
+  database_config_id: "",
   s3_config_id: "",
   restic_password: "",
   backup_prefix: "",
@@ -71,6 +75,7 @@ export default function JobFormModal({
   const [formData, setFormData] = useState<JobFormData>(defaultFormData);
   const [s3Configs, setS3Configs] = useState<S3Config[]>([]);
   const [servers, setServers] = useState<Server[]>([]);
+  const [dbConfigs, setDbConfigs] = useState<DatabaseConfig[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
@@ -78,12 +83,14 @@ export default function JobFormModal({
     if (open) {
       fetchS3Configs();
       fetchServers();
-      if (isEditing) {
+      fetchDbConfigs();
+      if (jobId) {
         fetchJob();
       } else {
         setFormData(defaultFormData);
       }
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, jobId]);
 
   const fetchS3Configs = async () => {
@@ -110,6 +117,18 @@ export default function JobFormModal({
     }
   };
 
+  const fetchDbConfigs = async () => {
+    try {
+      const response = await fetch("/api/databases");
+      if (response.ok) {
+        const configs = await response.json();
+        setDbConfigs(configs);
+      }
+    } catch (error) {
+      console.error("Failed to fetch database configs:", error);
+    }
+  };
+
   const fetchJob = async () => {
     setIsLoading(true);
     try {
@@ -121,9 +140,11 @@ export default function JobFormModal({
           setFormData({
             job_id: jobId!,
             name: job.name,
+            backup_type: job.backup_type || "filesystem",
             server_id: job.server_id || "",
-            directories: job.directories.join("\n"),
-            excludes: job.excludes.join("\n"),
+            directories: (job.directories || []).join("\n"),
+            excludes: (job.excludes || []).join("\n"),
+            database_config_id: job.database_config_id || "",
             s3_config_id: job.s3_config_id || "",
             restic_password: "",
             backup_prefix: job.backup_prefix,
@@ -137,7 +158,7 @@ export default function JobFormModal({
           });
         }
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to fetch job");
     } finally {
       setIsLoading(false);
@@ -164,6 +185,11 @@ export default function JobFormModal({
 
     if (!formData.s3_config_id) {
       toast.error("Please select an S3 storage configuration");
+      return;
+    }
+
+    if (formData.backup_type === "database" && !formData.database_config_id) {
+      toast.error("Please select a database configuration");
       return;
     }
 
@@ -206,6 +232,7 @@ export default function JobFormModal({
 
   const selectedServer = servers.find((s) => s.id === formData.server_id);
   const selectedS3Config = s3Configs.find((c) => c.id === formData.s3_config_id);
+  const selectedDbConfig = dbConfigs.find((c) => c.id === formData.database_config_id);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -259,6 +286,33 @@ export default function JobFormModal({
                         required
                       />
                     </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Backup Type</Label>
+                    <Select
+                      value={formData.backup_type}
+                      onValueChange={(value: "filesystem" | "database") =>
+                        setFormData((prev) => ({ ...prev, backup_type: value }))
+                      }
+                    >
+                      <SelectTrigger>
+                        <SelectValue placeholder="Select backup type" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="filesystem">
+                          <div className="flex items-center gap-2">
+                            <FolderSync className="h-4 w-4" />
+                            Filesystem Backup
+                          </div>
+                        </SelectItem>
+                        <SelectItem value="database">
+                          <div className="flex items-center gap-2">
+                            <Database className="h-4 w-4" />
+                            MySQL Database Backup
+                          </div>
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
                 </div>
 
@@ -319,47 +373,106 @@ export default function JobFormModal({
 
                 <Separator />
 
-                {/* Backup Directories */}
-                <div className="space-y-4">
-                  <div className="flex items-center gap-2 text-sm font-medium">
-                    <FolderSync className="h-4 w-4 text-primary" />
-                    Backup Directories
-                  </div>
-                  <div className="grid gap-4 md:grid-cols-2">
-                    <div className="space-y-2">
-                      <Label htmlFor="directories">Directories to Backup</Label>
-                      <Textarea
-                        id="directories"
-                        name="directories"
-                        value={formData.directories}
-                        onChange={handleChange}
-                        placeholder={"/home\n/etc\n/var/www"}
-                        rows={4}
-                        className="font-mono text-sm"
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        One directory per line
-                      </p>
+                {/* Backup Directories - Only for filesystem backups */}
+                {formData.backup_type === "filesystem" && (
+                  <div className="space-y-4">
+                    <div className="flex items-center gap-2 text-sm font-medium">
+                      <FolderSync className="h-4 w-4 text-primary" />
+                      Backup Directories
                     </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="excludes">Exclude Patterns</Label>
-                      <Textarea
-                        id="excludes"
-                        name="excludes"
-                        value={formData.excludes}
-                        onChange={handleChange}
-                        placeholder={"*.log\nnode_modules\n.cache"}
-                        rows={4}
-                        className="font-mono text-sm"
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        One pattern per line
-                      </p>
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <div className="space-y-2">
+                        <Label htmlFor="directories">Directories to Backup</Label>
+                        <Textarea
+                          id="directories"
+                          name="directories"
+                          value={formData.directories}
+                          onChange={handleChange}
+                          placeholder={"/home\n/etc\n/var/www"}
+                          rows={4}
+                          className="font-mono text-sm"
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          One directory per line
+                        </p>
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="excludes">Exclude Patterns</Label>
+                        <Textarea
+                          id="excludes"
+                          name="excludes"
+                          value={formData.excludes}
+                          onChange={handleChange}
+                          placeholder={"*.log\nnode_modules\n.cache"}
+                          rows={4}
+                          className="font-mono text-sm"
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          One pattern per line
+                        </p>
+                      </div>
                     </div>
                   </div>
-                </div>
+                )}
 
-                <Separator />
+                {/* Database Selection - Only for database backups */}
+                {formData.backup_type === "database" && (
+                  <div className="space-y-4">
+                    <div className="flex items-center gap-2 text-sm font-medium">
+                      <Database className="h-4 w-4 text-primary" />
+                      Database Configuration
+                    </div>
+                    <div className="space-y-4">
+                      <div className="space-y-2">
+                        <Label>Database</Label>
+                        <Select
+                          value={formData.database_config_id}
+                          onValueChange={(value) =>
+                            setFormData((prev) => ({ ...prev, database_config_id: value }))
+                          }
+                        >
+                          <SelectTrigger>
+                            <SelectValue placeholder="Select a database configuration" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {dbConfigs.length === 0 ? (
+                              <SelectItem value="_empty" disabled>
+                                No database configurations available
+                              </SelectItem>
+                            ) : (
+                              dbConfigs.map((config) => (
+                                <SelectItem key={config.id} value={config.id}>
+                                  {config.name} ({config.host}:{config.port})
+                                </SelectItem>
+                              ))
+                            )}
+                          </SelectContent>
+                        </Select>
+                        {dbConfigs.length === 0 && (
+                          <p className="text-xs text-amber-600">
+                            Please configure databases in Configuration &gt; Databases first
+                          </p>
+                        )}
+                      </div>
+                      {selectedDbConfig && (
+                        <div className="rounded-lg border bg-muted/50 p-3 text-sm">
+                          <div className="grid grid-cols-2 gap-2 text-muted-foreground">
+                            <span>Host:</span>
+                            <span className="font-mono">{selectedDbConfig.host}:{selectedDbConfig.port}</span>
+                            <span>Username:</span>
+                            <span className="font-mono">{selectedDbConfig.username}</span>
+                            <span>Databases:</span>
+                            <span className="font-mono">
+                              {selectedDbConfig.databases === "*" ? "All databases" : selectedDbConfig.databases}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {(formData.backup_type === "filesystem" || formData.backup_type === "database") && <Separator />}
 
                 {/* S3 Storage */}
                 <div className="space-y-4">

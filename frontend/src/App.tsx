@@ -9,6 +9,7 @@ import Jobs from "@/pages/Jobs";
 import Snapshots from "@/pages/Snapshots";
 import History from "@/pages/History";
 import Servers from "@/pages/Servers";
+import Databases from "@/pages/Databases";
 import Storage from "@/pages/Storage";
 import { Loader2 } from "lucide-react";
 
@@ -79,6 +80,14 @@ function AppRoutes() {
           element={
             <ProtectedRoute>
               <Servers />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/databases"
+          element={
+            <ProtectedRoute>
+              <Databases />
             </ProtectedRoute>
           }
         />

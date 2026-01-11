@@ -18,6 +18,7 @@ services:
       - SECRET_KEY=${SECRET_KEY:-change-this-secret-key}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=UTC
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]

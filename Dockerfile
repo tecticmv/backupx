@@ -29,5 +29,5 @@ RUN mkdir -p /app/config /app/logs /app/data
 # Expose port
 EXPOSE 5000
 
-# Run the application
-CMD ["python", "app/main.py"]
+# Run the application with gunicorn
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--access-logfile", "-", "--error-logfile", "-", "app.main:app"]

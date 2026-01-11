@@ -19,5 +19,16 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      // Allow shadcn/ui component patterns
+      'react-refresh/only-export-components': ['warn', { allowExportNames: ['badgeVariants', 'buttonVariants', 'useFormField', 'Form', 'FormItem', 'FormLabel', 'FormControl', 'FormDescription', 'FormMessage', 'FormField', 'useSidebar', 'SidebarProvider', 'Sidebar', 'SidebarContent', 'SidebarFooter', 'SidebarGroup', 'SidebarGroupContent', 'SidebarGroupLabel', 'SidebarHeader', 'SidebarInput', 'SidebarInset', 'SidebarMenu', 'SidebarMenuAction', 'SidebarMenuBadge', 'SidebarMenuButton', 'SidebarMenuItem', 'SidebarMenuSkeleton', 'SidebarMenuSub', 'SidebarMenuSubButton', 'SidebarMenuSubItem', 'SidebarRail', 'SidebarSeparator', 'SidebarTrigger', 'useTheme', 'ThemeProvider'] }],
+    },
+  },
+  // Ignore purity warnings in UI components that use patterns like Math.random for skeleton loading
+  {
+    files: ['src/components/ui/**/*.{ts,tsx}'],
+    rules: {
+      'react-hooks/purity': 'off',
+    },
   },
 ])

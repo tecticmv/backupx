@@ -20,6 +20,7 @@ const routeNames: Record<string, string> = {
   "/jobs": "Backup Jobs",
   "/history": "History",
   "/servers": "Servers",
+  "/databases": "Databases",
   "/storage": "S3 Storage",
 };
 

@@ -44,6 +44,7 @@ export default function Snapshots() {
 
   useEffect(() => {
     fetchData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId]);
 
   const fetchData = async () => {
@@ -65,7 +66,7 @@ export default function Snapshots() {
         setSnapshots(data.snapshots || []);
         setStats(data.stats || null);
       }
-    } catch (error) {
+    } catch {
       toast.error("Failed to fetch data");
     } finally {
       setIsLoading(false);

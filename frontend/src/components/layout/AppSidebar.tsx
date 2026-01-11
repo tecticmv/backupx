@@ -48,6 +48,7 @@ const navItems = [
 
 const configItems = [
   { path: "/servers", label: "Servers", icon: Server },
+  { path: "/databases", label: "Databases", icon: Database },
   { path: "/storage", label: "S3 Storage", icon: HardDrive },
 ];
 
