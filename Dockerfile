@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cron \
     && rm -rf /var/lib/apt/lists/*
 
+# Create non-root user for running the application
+RUN groupadd -r backupx && useradd -r -g backupx -d /app -s /sbin/nologin backupx
+
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -23,8 +26,12 @@ COPY static/ ./static/
 # Copy React frontend build
 COPY frontend/dist/ ./frontend/dist/
 
-# Create directories
-RUN mkdir -p /app/config /app/logs /app/data
+# Create directories with proper ownership
+RUN mkdir -p /app/config /app/logs /app/data /home/backupx/.ssh \
+    && chown -R backupx:backupx /app /home/backupx
+
+# Switch to non-root user
+USER backupx
 
 # Expose port
 EXPOSE 5000

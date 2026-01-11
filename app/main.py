@@ -13,6 +13,8 @@ import sqlite3
 import logging
 import smtplib
 import ssl
+import shlex
+import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from urllib.request import Request, urlopen
@@ -121,6 +123,70 @@ CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# =============================================================================
+# Input Validation
+# =============================================================================
+
+def validate_hostname(hostname: str) -> bool:
+    """Validate hostname or IP address"""
+    if not hostname or len(hostname) > 255:
+        return False
+    # Allow IPv4, IPv6, or valid hostname
+    hostname_pattern = re.compile(
+        r'^('
+        r'([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z]{2,}|'  # hostname
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|'  # IPv4
+        r'\[?[a-fA-F0-9:]+\]?'  # IPv6
+        r')$'
+    )
+    return bool(hostname_pattern.match(hostname))
+
+
+def validate_port(port: int) -> bool:
+    """Validate port number"""
+    return isinstance(port, int) and 1 <= port <= 65535
+
+
+def validate_path(path: str) -> bool:
+    """Validate filesystem path (no path traversal)"""
+    if not path:
+        return False
+    # Block path traversal attempts
+    if '..' in path or path.startswith('~'):
+        return False
+    return path.startswith('/')
+
+
+def validate_cron(cron_expr: str) -> bool:
+    """Validate cron expression format"""
+    if not cron_expr:
+        return False
+    parts = cron_expr.strip().split()
+    if len(parts) != 5:
+        return False
+    # Basic validation - each part should be numeric, *, or contain valid cron chars
+    cron_pattern = re.compile(r'^[\d\*,\-/]+$')
+    return all(cron_pattern.match(p) for p in parts)
+
+
+def validate_s3_endpoint(endpoint: str) -> bool:
+    """Validate S3 endpoint format"""
+    if not endpoint:
+        return False
+    # Allow domain:port or just domain
+    endpoint_pattern = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9](:\d+)?$')
+    return bool(endpoint_pattern.match(endpoint))
+
+
+def validate_bucket_name(name: str) -> bool:
+    """Validate S3 bucket name"""
+    if not name or len(name) < 3 or len(name) > 63:
+        return False
+    # S3 bucket naming rules
+    bucket_pattern = re.compile(r'^[a-z0-9][a-z0-9\-\.]*[a-z0-9]$')
+    return bool(bucket_pattern.match(name))
+
 # Scheduler
 scheduler = BackgroundScheduler()
 scheduler.start()
@@ -164,7 +230,7 @@ def init_db():
             host TEXT NOT NULL,
             ssh_port INTEGER DEFAULT 22,
             ssh_user TEXT NOT NULL,
-            ssh_key TEXT DEFAULT '/root/.ssh/id_rsa',
+            ssh_key TEXT DEFAULT '/home/backupx/.ssh/id_rsa',
             created_at TEXT NOT NULL,
             updated_at TEXT
         );
@@ -292,7 +358,7 @@ def migrate_json_to_sqlite():
                     INSERT INTO servers (id, name, host, ssh_port, ssh_user, ssh_key, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (s['id'], s['name'], s['host'], s.get('ssh_port', 22), s['ssh_user'],
-                      s.get('ssh_key', '/root/.ssh/id_rsa'), s.get('created_at', datetime.now().isoformat()),
+                      s.get('ssh_key', '/home/backupx/.ssh/id_rsa'), s.get('created_at', datetime.now().isoformat()),
                       s.get('updated_at')))
             logger.info(f"  Migrated {len(servers)} servers")
         except Exception as e:
@@ -605,7 +671,7 @@ def create_server(server):
         INSERT INTO servers (id, name, host, ssh_port, ssh_user, ssh_key, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ''', (server['id'], server['name'], server['host'], server.get('ssh_port', 22), server['ssh_user'],
-          server.get('ssh_key', '/root/.ssh/id_rsa'), server.get('created_at', datetime.now().isoformat()),
+          server.get('ssh_key', '/home/backupx/.ssh/id_rsa'), server.get('created_at', datetime.now().isoformat()),
           server.get('updated_at')))
     conn.commit()
     conn.close()
@@ -618,7 +684,7 @@ def update_server_in_db(server_id, server):
         UPDATE servers SET name=?, host=?, ssh_port=?, ssh_user=?, ssh_key=?, updated_at=?
         WHERE id=?
     ''', (server['name'], server['host'], server.get('ssh_port', 22), server['ssh_user'],
-          server.get('ssh_key', '/root/.ssh/id_rsa'), datetime.now().isoformat(), server_id))
+          server.get('ssh_key', '/home/backupx/.ssh/id_rsa'), datetime.now().isoformat(), server_id))
     conn.commit()
     conn.close()
 
@@ -992,6 +1058,18 @@ def run_backup(job_id):
         return run_filesystem_backup(job_id, job)
 
 
+def sanitize_error_message(error: str, max_length: int = 500) -> str:
+    """Sanitize error messages to prevent sensitive data leakage"""
+    if not error:
+        return "Unknown error"
+    # Remove potential secrets from error messages
+    sanitized = re.sub(r'(password|secret|key|token)[\s]*[=:]\s*[^\s]+', r'\1=***', error, flags=re.IGNORECASE)
+    # Truncate to max length
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length] + '...'
+    return sanitized
+
+
 def run_filesystem_backup(job_id, job):
     """Execute a filesystem backup job"""
     start_time = datetime.now()
@@ -1001,34 +1079,39 @@ def run_filesystem_backup(job_id, job):
     update_job_status(job_id, 'running', last_run=start_time.isoformat())
 
     try:
-        # Build restic command
-        env = os.environ.copy()
-        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
-        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
-        env['RESTIC_PASSWORD'] = job['restic_password']
-        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
-
-        # Build exclude args
-        excludes = []
+        # Build exclude args with proper escaping
+        exclude_args = []
         for pattern in job.get('excludes', []):
-            excludes.extend(['--exclude', pattern])
+            exclude_args.append(f'--exclude {shlex.quote(pattern)}')
+
+        # Build directory list with proper escaping
+        directories = ' '.join(shlex.quote(d) for d in job['directories'])
+
+        # Escape all values for shell
+        s3_access_key = shlex.quote(job['s3_access_key'])
+        s3_secret_key = shlex.quote(job['s3_secret_key'])
+        restic_password = shlex.quote(job['restic_password'])
+        s3_endpoint = shlex.quote(job['s3_endpoint'])
+        s3_bucket = shlex.quote(job['s3_bucket'])
+        backup_prefix = shlex.quote(job['backup_prefix'])
 
         # Run backup via SSH on remote
         ssh_cmd = [
-            'ssh', '-i', job.get('ssh_key', '/root/.ssh/id_rsa'),
+            'ssh', '-i', job.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
             '-p', str(job.get('ssh_port', 22)),
             '-o', 'StrictHostKeyChecking=no',
             '-o', 'BatchMode=yes',
+            '-o', 'ConnectTimeout=30',
             job['remote_host']
         ]
 
-        # Build remote command
+        # Build remote command with proper escaping
         remote_cmd = f"""
-export AWS_ACCESS_KEY_ID='{job['s3_access_key']}'
-export AWS_SECRET_ACCESS_KEY='{job['s3_secret_key']}'
-export RESTIC_PASSWORD='{job['restic_password']}'
-export RESTIC_REPOSITORY='s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}'
-restic backup --compression auto --tag automated {' '.join(excludes)} {' '.join(job['directories'])}
+export AWS_ACCESS_KEY_ID={s3_access_key}
+export AWS_SECRET_ACCESS_KEY={s3_secret_key}
+export RESTIC_PASSWORD={restic_password}
+export RESTIC_REPOSITORY="s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+restic backup --compression auto --tag automated {' '.join(exclude_args)} {directories}
 """
 
         # Execute
@@ -1046,13 +1129,14 @@ restic backup --compression auto --tag automated {' '.join(excludes)} {' '.join(
             add_history(job_id, job['name'], 'success', 'Backup completed successfully', duration)
             send_notification(job_id, job['name'], 'success', 'Backup completed successfully', duration)
             logger.info(f"Filesystem backup completed successfully: {job_id} (duration: {duration:.1f}s)")
-            return True, result.stdout
+            return True, "Backup completed successfully"
         else:
+            error_msg = sanitize_error_message(result.stderr)
             update_job_status(job_id, 'failed')
-            add_history(job_id, job['name'], 'failed', result.stderr, duration)
-            send_notification(job_id, job['name'], 'failed', result.stderr, duration)
-            logger.error(f"Filesystem backup failed: {job_id} - {result.stderr[:200]}")
-            return False, result.stderr
+            add_history(job_id, job['name'], 'failed', error_msg, duration)
+            send_notification(job_id, job['name'], 'failed', error_msg, duration)
+            logger.error(f"Filesystem backup failed: {job_id} - {error_msg[:200]}")
+            return False, error_msg
 
     except subprocess.TimeoutExpired:
         update_job_status(job_id, 'timeout')
@@ -1061,11 +1145,12 @@ restic backup --compression auto --tag automated {' '.join(excludes)} {' '.join(
         logger.error(f"Filesystem backup timed out: {job_id}")
         return False, "Backup timed out"
     except Exception as e:
+        error_msg = sanitize_error_message(str(e))
         update_job_status(job_id, 'error')
-        add_history(job_id, job['name'], 'error', str(e), 0)
-        send_notification(job_id, job['name'], 'error', str(e), 0)
+        add_history(job_id, job['name'], 'error', error_msg, 0)
+        send_notification(job_id, job['name'], 'error', error_msg, 0)
         logger.exception(f"Filesystem backup error: {job_id}")
-        return False, str(e)
+        return False, error_msg
 
 
 def run_database_backup(job_id, job):
@@ -1089,42 +1174,49 @@ def run_database_backup(job_id, job):
 
         # Build SSH command to run on remote server
         ssh_cmd = [
-            'ssh', '-i', job.get('ssh_key', '/root/.ssh/id_rsa'),
+            'ssh', '-i', job.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
             '-p', str(job.get('ssh_port', 22)),
             '-o', 'StrictHostKeyChecking=no',
             '-o', 'BatchMode=yes',
+            '-o', 'ConnectTimeout=30',
             job['remote_host']
         ]
 
-        # Get database list
+        # Get database list with proper escaping
         databases = db_config.get('databases', '*')
         if databases == '*':
             db_flag = '--all-databases'
         else:
-            # Multiple databases separated by comma or single db
-            db_list = [db.strip() for db in databases.split(',') if db.strip()]
+            # Multiple databases separated by comma or single db - escape each
+            db_list = [shlex.quote(db.strip()) for db in databases.split(',') if db.strip()]
             db_flag = '--databases ' + ' '.join(db_list)
 
         # Generate backup filename with timestamp
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         backup_filename = f"mysql_backup_{timestamp}.sql.gz"
 
-        # Build remote command to:
-        # 1. Dump MySQL database(s)
-        # 2. Compress with gzip
-        # 3. Upload to S3 using restic
+        # Escape all values for shell
+        s3_access_key = shlex.quote(job['s3_access_key'])
+        s3_secret_key = shlex.quote(job['s3_secret_key'])
+        restic_password = shlex.quote(job['restic_password'])
+        db_host = shlex.quote(db_config['host'])
+        db_port = int(db_config.get('port', 3306))
+        db_user = shlex.quote(db_config['username'])
+        db_pass = shlex.quote(db_config['password'])
+
+        # Build remote command with proper escaping
         remote_cmd = f"""
-export AWS_ACCESS_KEY_ID='{job['s3_access_key']}'
-export AWS_SECRET_ACCESS_KEY='{job['s3_secret_key']}'
-export RESTIC_PASSWORD='{job['restic_password']}'
-export RESTIC_REPOSITORY='s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}'
+export AWS_ACCESS_KEY_ID={s3_access_key}
+export AWS_SECRET_ACCESS_KEY={s3_secret_key}
+export RESTIC_PASSWORD={restic_password}
+export RESTIC_REPOSITORY="s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
 
 # Create temp directory for backup
 BACKUP_DIR=$(mktemp -d)
 BACKUP_FILE="$BACKUP_DIR/{backup_filename}"
 
 # Dump MySQL database
-mysqldump -h '{db_config['host']}' -P {db_config.get('port', 3306)} -u '{db_config['username']}' -p'{db_config['password']}' {db_flag} --single-transaction --routines --triggers | gzip > "$BACKUP_FILE"
+mysqldump -h {db_host} -P {db_port} -u {db_user} -p{db_pass} {db_flag} --single-transaction --routines --triggers | gzip > "$BACKUP_FILE"
 
 if [ $? -ne 0 ]; then
     echo "mysqldump failed"
@@ -1158,13 +1250,14 @@ exit $RESTIC_EXIT
             add_history(job_id, job['name'], 'success', message, duration)
             send_notification(job_id, job['name'], 'success', message, duration)
             logger.info(f"Database backup completed successfully: {job_id} (duration: {duration:.1f}s)")
-            return True, result.stdout
+            return True, "Database backup completed successfully"
         else:
+            error_msg = sanitize_error_message(result.stderr)
             update_job_status(job_id, 'failed')
-            add_history(job_id, job['name'], 'failed', result.stderr, duration)
-            send_notification(job_id, job['name'], 'failed', result.stderr, duration)
-            logger.error(f"Database backup failed: {job_id} - {result.stderr[:200]}")
-            return False, result.stderr
+            add_history(job_id, job['name'], 'failed', error_msg, duration)
+            send_notification(job_id, job['name'], 'failed', error_msg, duration)
+            logger.error(f"Database backup failed: {job_id} - {error_msg[:200]}")
+            return False, error_msg
 
     except subprocess.TimeoutExpired:
         update_job_status(job_id, 'timeout')
@@ -1173,11 +1266,12 @@ exit $RESTIC_EXIT
         logger.error(f"Database backup timed out: {job_id}")
         return False, "Database backup timed out"
     except Exception as e:
+        error_msg = sanitize_error_message(str(e))
         update_job_status(job_id, 'error')
-        add_history(job_id, job['name'], 'error', str(e), 0)
-        send_notification(job_id, job['name'], 'error', str(e), 0)
+        add_history(job_id, job['name'], 'error', error_msg, 0)
+        send_notification(job_id, job['name'], 'error', error_msg, 0)
         logger.exception(f"Database backup error: {job_id}")
-        return False, str(e)
+        return False, error_msg
 
 
 def get_snapshots(job):
@@ -1361,7 +1455,7 @@ def api_create_job():
         # Store resolved values for backup execution
         'remote_host': f"{server['ssh_user']}@{server['host']}" if server else data.get('remote_host'),
         'ssh_port': server['ssh_port'] if server else int(data.get('ssh_port', 22)),
-        'ssh_key': server['ssh_key'] if server else data.get('ssh_key', '/root/.ssh/id_rsa'),
+        'ssh_key': server['ssh_key'] if server else data.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
         's3_endpoint': s3_config['endpoint'] if s3_config else data.get('s3_endpoint'),
         's3_bucket': s3_config['bucket'] if s3_config else data.get('s3_bucket'),
         's3_access_key': s3_config['access_key'] if s3_config else data.get('s3_access_key'),
@@ -1431,7 +1525,7 @@ def api_update_job(job_id):
         # Store resolved values for backup execution
         'remote_host': f"{server['ssh_user']}@{server['host']}" if server else job.get('remote_host'),
         'ssh_port': server['ssh_port'] if server else job.get('ssh_port', 22),
-        'ssh_key': server['ssh_key'] if server else job.get('ssh_key', '/root/.ssh/id_rsa'),
+        'ssh_key': server['ssh_key'] if server else job.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
         's3_endpoint': s3_config['endpoint'] if s3_config else job.get('s3_endpoint'),
         's3_bucket': s3_config['bucket'] if s3_config else job.get('s3_bucket'),
         's3_access_key': s3_config['access_key'] if s3_config else job.get('s3_access_key'),
@@ -1695,13 +1789,25 @@ def api_create_server_route():
         if not data.get(field):
             return jsonify({'error': f'{field} is required'}), 400
 
+    # Validate inputs
+    if not validate_hostname(data['host']):
+        return jsonify({'error': 'Invalid hostname or IP address'}), 400
+
+    ssh_port = int(data.get('ssh_port', 22))
+    if not validate_port(ssh_port):
+        return jsonify({'error': 'Invalid SSH port (must be 1-65535)'}), 400
+
+    ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
+    if not validate_path(ssh_key):
+        return jsonify({'error': 'Invalid SSH key path'}), 400
+
     new_server = {
         'id': generate_id(),
         'name': data['name'],
         'host': data['host'],
-        'ssh_port': int(data.get('ssh_port', 22)),
+        'ssh_port': ssh_port,
         'ssh_user': data['ssh_user'],
-        'ssh_key': data.get('ssh_key', '/root/.ssh/id_rsa'),
+        'ssh_key': ssh_key,
         'created_at': datetime.now().isoformat(),
         'updated_at': datetime.now().isoformat()
     }
@@ -1730,7 +1836,7 @@ def api_update_server_route(server_id):
     server['host'] = data.get('host', server['host'])
     server['ssh_port'] = int(data.get('ssh_port', server.get('ssh_port', 22)))
     server['ssh_user'] = data.get('ssh_user', server['ssh_user'])
-    server['ssh_key'] = data.get('ssh_key', server.get('ssh_key', '/root/.ssh/id_rsa'))
+    server['ssh_key'] = data.get('ssh_key', server.get('ssh_key', '/home/backupx/.ssh/id_rsa'))
 
     update_server_in_db(server_id, server)
 
@@ -1764,7 +1870,7 @@ def api_test_server_connection():
     host = data.get('host', '')
     ssh_port = int(data.get('ssh_port', 22))
     ssh_user = data.get('ssh_user', '')
-    ssh_key = data.get('ssh_key', '/root/.ssh/id_rsa')
+    ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
 
     if not all([host, ssh_user]):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -1930,15 +2036,20 @@ def api_test_db_connection():
         return jsonify({'error': 'Server not found'}), 400
 
     try:
+        # Escape all values for shell to prevent command injection
+        escaped_host = shlex.quote(db_host)
+        escaped_user = shlex.quote(db_user)
+        escaped_pass = shlex.quote(db_pass)
+
         # Build SSH command to test MySQL connection
         ssh_cmd = [
-            'ssh', '-i', server.get('ssh_key', '/root/.ssh/id_rsa'),
+            'ssh', '-i', server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
             '-p', str(server.get('ssh_port', 22)),
             '-o', 'StrictHostKeyChecking=no',
             '-o', 'BatchMode=yes',
             '-o', 'ConnectTimeout=10',
             f"{server['ssh_user']}@{server['host']}",
-            f"mysql -h '{db_host}' -P {db_port} -u '{db_user}' -p'{db_pass}' -e 'SELECT 1' 2>&1"
+            f"mysql -h {escaped_host} -P {db_port} -u {escaped_user} -p{escaped_pass} -e 'SELECT 1' 2>&1"
         ]
 
         result = subprocess.run(
@@ -1951,13 +2062,13 @@ def api_test_db_connection():
         if result.returncode == 0:
             return jsonify({'success': True, 'message': 'Database connection successful'})
         else:
-            error_msg = result.stderr or result.stdout or 'Connection failed'
+            error_msg = sanitize_error_message(result.stderr or result.stdout or 'Connection failed')
             return jsonify({'error': error_msg}), 400
 
     except subprocess.TimeoutExpired:
         return jsonify({'error': 'Connection timed out'}), 400
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': sanitize_error_message(str(e))}), 500
 
 
 # --- Notification Channel Endpoints ---
