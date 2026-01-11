@@ -11,6 +11,12 @@ import subprocess
 import threading
 import sqlite3
 import logging
+import smtplib
+import ssl
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from datetime import datetime
 from pathlib import Path
 
@@ -235,6 +241,19 @@ def init_db():
             status TEXT NOT NULL,
             message TEXT,
             duration REAL DEFAULT 0
+        );
+
+        -- Notification channels table
+        CREATE TABLE IF NOT EXISTS notification_channels (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            config TEXT NOT NULL,
+            notify_on_success INTEGER DEFAULT 1,
+            notify_on_failure INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT
         );
 
         -- Indexes
@@ -664,6 +683,301 @@ def delete_db_config_from_db(config_id):
     conn.close()
 
 
+# --- Notification Channels ---
+
+def load_notification_channels():
+    """Load all notification channels from database"""
+    conn = get_db_connection()
+    rows = conn.execute('SELECT * FROM notification_channels').fetchall()
+    conn.close()
+    channels = []
+    for row in rows:
+        channel = dict(row)
+        channel['config'] = json.loads(channel['config'] or '{}')
+        channel['enabled'] = bool(channel['enabled'])
+        channel['notify_on_success'] = bool(channel['notify_on_success'])
+        channel['notify_on_failure'] = bool(channel['notify_on_failure'])
+        channels.append(channel)
+    return channels
+
+
+def get_notification_channel(channel_id):
+    """Get a single notification channel by ID"""
+    conn = get_db_connection()
+    row = conn.execute('SELECT * FROM notification_channels WHERE id = ?', (channel_id,)).fetchone()
+    conn.close()
+    if row:
+        channel = dict(row)
+        channel['config'] = json.loads(channel['config'] or '{}')
+        channel['enabled'] = bool(channel['enabled'])
+        channel['notify_on_success'] = bool(channel['notify_on_success'])
+        channel['notify_on_failure'] = bool(channel['notify_on_failure'])
+        return channel
+    return None
+
+
+def create_notification_channel(channel):
+    """Create a new notification channel"""
+    conn = get_db_connection()
+    conn.execute('''
+        INSERT INTO notification_channels (id, name, type, enabled, config, notify_on_success, notify_on_failure, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (channel['id'], channel['name'], channel['type'], 1 if channel.get('enabled', True) else 0,
+          json.dumps(channel.get('config', {})), 1 if channel.get('notify_on_success', True) else 0,
+          1 if channel.get('notify_on_failure', True) else 0, channel.get('created_at', datetime.now().isoformat()),
+          channel.get('updated_at')))
+    conn.commit()
+    conn.close()
+
+
+def update_notification_channel(channel_id, channel):
+    """Update a notification channel"""
+    conn = get_db_connection()
+    conn.execute('''
+        UPDATE notification_channels SET name=?, type=?, enabled=?, config=?, notify_on_success=?, notify_on_failure=?, updated_at=?
+        WHERE id=?
+    ''', (channel['name'], channel['type'], 1 if channel.get('enabled', True) else 0,
+          json.dumps(channel.get('config', {})), 1 if channel.get('notify_on_success', True) else 0,
+          1 if channel.get('notify_on_failure', True) else 0, datetime.now().isoformat(), channel_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_notification_channel(channel_id):
+    """Delete a notification channel"""
+    conn = get_db_connection()
+    conn.execute('DELETE FROM notification_channels WHERE id = ?', (channel_id,))
+    conn.commit()
+    conn.close()
+
+
+# --- Notification Senders ---
+
+def format_duration(seconds):
+    """Format duration in human-readable format"""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    mins = int(seconds / 60)
+    secs = int(seconds % 60)
+    if mins < 60:
+        return f"{mins}m {secs}s"
+    hours = int(mins / 60)
+    remaining_mins = mins % 60
+    return f"{hours}h {remaining_mins}m"
+
+
+def get_status_emoji(status):
+    """Get emoji for status"""
+    emojis = {
+        'success': '\u2705',  # Green checkmark
+        'failed': '\u274C',   # Red X
+        'timeout': '\u23F0',  # Alarm clock
+        'error': '\u26A0\uFE0F'    # Warning sign
+    }
+    return emojis.get(status, '\u2753')  # Question mark for unknown
+
+
+def send_email_notification(channel, job_name, status, message, duration):
+    """Send notification via email"""
+    config = channel['config']
+    smtp_host = config.get('smtp_host', 'localhost')
+    smtp_port = int(config.get('smtp_port', 587))
+    smtp_user = config.get('smtp_user', '')
+    smtp_password = config.get('smtp_password', '')
+    smtp_tls = config.get('smtp_tls', True)
+    from_address = config.get('from_address', smtp_user)
+    to_addresses = config.get('to_addresses', [])
+
+    if isinstance(to_addresses, str):
+        to_addresses = [addr.strip() for addr in to_addresses.split(',') if addr.strip()]
+
+    if not to_addresses:
+        logger.warning("No email recipients configured")
+        return
+
+    # Create email
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = f"[BackupX] {job_name} - {status.upper()}"
+    msg['From'] = from_address
+    msg['To'] = ', '.join(to_addresses)
+
+    # Plain text body
+    text_body = f"""Backup Job: {job_name}
+Status: {status.upper()}
+Duration: {format_duration(duration)}
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{message}
+"""
+    msg.attach(MIMEText(text_body, 'plain'))
+
+    # Send email
+    try:
+        if smtp_tls:
+            context = ssl.create_default_context()
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.starttls(context=context)
+                if smtp_user and smtp_password:
+                    server.login(smtp_user, smtp_password)
+                server.sendmail(from_address, to_addresses, msg.as_string())
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                if smtp_user and smtp_password:
+                    server.login(smtp_user, smtp_password)
+                server.sendmail(from_address, to_addresses, msg.as_string())
+        logger.info(f"Email notification sent for job {job_name}")
+    except Exception as e:
+        logger.error(f"Failed to send email notification: {e}")
+        raise
+
+
+def send_slack_notification(channel, job_name, status, message, duration):
+    """Send notification to Slack via webhook"""
+    config = channel['config']
+    webhook_url = config.get('webhook_url', '')
+
+    if not webhook_url:
+        logger.warning("No Slack webhook URL configured")
+        return
+
+    emoji = get_status_emoji(status)
+    color = '#36a64f' if status == 'success' else '#dc3545'
+
+    payload = {
+        "attachments": [{
+            "color": color,
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"{emoji} *Backup Job: {job_name}*\n*Status:* {status.upper()}\n*Duration:* {format_duration(duration)}"
+                    }
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"```{message[:500]}```" if message else "_No additional details_"
+                    }
+                }
+            ]
+        }]
+    }
+
+    data = json.dumps(payload).encode('utf-8')
+    req = Request(webhook_url, data=data, headers={'Content-Type': 'application/json'})
+
+    try:
+        with urlopen(req, timeout=30) as response:
+            if response.status == 200:
+                logger.info(f"Slack notification sent for job {job_name}")
+            else:
+                logger.warning(f"Slack webhook returned status {response.status}")
+    except (URLError, HTTPError) as e:
+        logger.error(f"Failed to send Slack notification: {e}")
+        raise
+
+
+def send_discord_notification(channel, job_name, status, message, duration):
+    """Send notification to Discord via webhook"""
+    config = channel['config']
+    webhook_url = config.get('webhook_url', '')
+
+    if not webhook_url:
+        logger.warning("No Discord webhook URL configured")
+        return
+
+    emoji = get_status_emoji(status)
+    color = 0x36a64f if status == 'success' else 0xdc3545
+
+    payload = {
+        "embeds": [{
+            "title": f"{emoji} Backup Job: {job_name}",
+            "color": color,
+            "fields": [
+                {"name": "Status", "value": status.upper(), "inline": True},
+                {"name": "Duration", "value": format_duration(duration), "inline": True}
+            ],
+            "description": f"```{message[:1000]}```" if message else "_No additional details_",
+            "timestamp": datetime.now().isoformat()
+        }]
+    }
+
+    data = json.dumps(payload).encode('utf-8')
+    req = Request(webhook_url, data=data, headers={'Content-Type': 'application/json'})
+
+    try:
+        with urlopen(req, timeout=30) as response:
+            if response.status in (200, 204):
+                logger.info(f"Discord notification sent for job {job_name}")
+            else:
+                logger.warning(f"Discord webhook returned status {response.status}")
+    except (URLError, HTTPError) as e:
+        logger.error(f"Failed to send Discord notification: {e}")
+        raise
+
+
+def send_webhook_notification(channel, job_name, status, message, duration):
+    """Send notification to generic webhook"""
+    config = channel['config']
+    webhook_url = config.get('url', '')
+    method = config.get('method', 'POST').upper()
+    headers = config.get('headers', {})
+
+    if not webhook_url:
+        logger.warning("No webhook URL configured")
+        return
+
+    payload = {
+        "job_name": job_name,
+        "status": status,
+        "message": message,
+        "duration": duration,
+        "timestamp": datetime.now().isoformat()
+    }
+
+    data = json.dumps(payload).encode('utf-8')
+    req_headers = {'Content-Type': 'application/json'}
+    req_headers.update(headers)
+
+    req = Request(webhook_url, data=data, headers=req_headers, method=method)
+
+    try:
+        with urlopen(req, timeout=30) as response:
+            logger.info(f"Webhook notification sent for job {job_name} (status: {response.status})")
+    except (URLError, HTTPError) as e:
+        logger.error(f"Failed to send webhook notification: {e}")
+        raise
+
+
+def send_notification(job_id, job_name, status, message, duration):
+    """Send notifications to all enabled channels"""
+    channels = load_notification_channels()
+
+    for channel in channels:
+        if not channel['enabled']:
+            continue
+
+        # Check if should notify for this status
+        if status == 'success' and not channel['notify_on_success']:
+            continue
+        if status != 'success' and not channel['notify_on_failure']:
+            continue
+
+        try:
+            if channel['type'] == 'email':
+                send_email_notification(channel, job_name, status, message, duration)
+            elif channel['type'] == 'slack':
+                send_slack_notification(channel, job_name, status, message, duration)
+            elif channel['type'] == 'discord':
+                send_discord_notification(channel, job_name, status, message, duration)
+            elif channel['type'] == 'webhook':
+                send_webhook_notification(channel, job_name, status, message, duration)
+        except Exception as e:
+            logger.error(f"Failed to send {channel['type']} notification to {channel['name']}: {e}")
+
+
 def run_backup(job_id):
     """Execute a backup job"""
     job = get_job(job_id)
@@ -730,22 +1044,26 @@ restic backup --compression auto --tag automated {' '.join(excludes)} {' '.join(
         if result.returncode == 0:
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=datetime.now().isoformat())
             add_history(job_id, job['name'], 'success', 'Backup completed successfully', duration)
+            send_notification(job_id, job['name'], 'success', 'Backup completed successfully', duration)
             logger.info(f"Filesystem backup completed successfully: {job_id} (duration: {duration:.1f}s)")
             return True, result.stdout
         else:
             update_job_status(job_id, 'failed')
             add_history(job_id, job['name'], 'failed', result.stderr, duration)
+            send_notification(job_id, job['name'], 'failed', result.stderr, duration)
             logger.error(f"Filesystem backup failed: {job_id} - {result.stderr[:200]}")
             return False, result.stderr
 
     except subprocess.TimeoutExpired:
         update_job_status(job_id, 'timeout')
         add_history(job_id, job['name'], 'timeout', 'Backup timed out', 0)
+        send_notification(job_id, job['name'], 'timeout', 'Backup timed out', 0)
         logger.error(f"Filesystem backup timed out: {job_id}")
         return False, "Backup timed out"
     except Exception as e:
         update_job_status(job_id, 'error')
         add_history(job_id, job['name'], 'error', str(e), 0)
+        send_notification(job_id, job['name'], 'error', str(e), 0)
         logger.exception(f"Filesystem backup error: {job_id}")
         return False, str(e)
 
@@ -836,23 +1154,28 @@ exit $RESTIC_EXIT
 
         if result.returncode == 0:
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=datetime.now().isoformat())
-            add_history(job_id, job['name'], 'success', f'MySQL backup completed successfully ({databases})', duration)
+            message = f'MySQL backup completed successfully ({databases})'
+            add_history(job_id, job['name'], 'success', message, duration)
+            send_notification(job_id, job['name'], 'success', message, duration)
             logger.info(f"Database backup completed successfully: {job_id} (duration: {duration:.1f}s)")
             return True, result.stdout
         else:
             update_job_status(job_id, 'failed')
             add_history(job_id, job['name'], 'failed', result.stderr, duration)
+            send_notification(job_id, job['name'], 'failed', result.stderr, duration)
             logger.error(f"Database backup failed: {job_id} - {result.stderr[:200]}")
             return False, result.stderr
 
     except subprocess.TimeoutExpired:
         update_job_status(job_id, 'timeout')
         add_history(job_id, job['name'], 'timeout', 'Database backup timed out', 0)
+        send_notification(job_id, job['name'], 'timeout', 'Database backup timed out', 0)
         logger.error(f"Database backup timed out: {job_id}")
         return False, "Database backup timed out"
     except Exception as e:
         update_job_status(job_id, 'error')
         add_history(job_id, job['name'], 'error', str(e), 0)
+        send_notification(job_id, job['name'], 'error', str(e), 0)
         logger.exception(f"Database backup error: {job_id}")
         return False, str(e)
 
@@ -1633,6 +1956,141 @@ def api_test_db_connection():
 
     except subprocess.TimeoutExpired:
         return jsonify({'error': 'Connection timed out'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# --- Notification Channel Endpoints ---
+
+@app.route('/api/notifications', methods=['GET'])
+@login_required
+def api_get_notifications():
+    """Get all notification channels"""
+    channels = load_notification_channels()
+    # Mask sensitive data in config
+    for channel in channels:
+        if channel['type'] == 'email':
+            if 'smtp_password' in channel['config']:
+                channel['config']['smtp_password'] = '********' if channel['config']['smtp_password'] else ''
+    return jsonify(channels)
+
+
+@app.route('/api/notifications', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_create_notification():
+    """Create a new notification channel"""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+
+    required = ['name', 'type', 'config']
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({'error': f'Missing required fields: {", ".join(missing)}'}), 400
+
+    # Validate type
+    valid_types = ['email', 'slack', 'discord', 'webhook']
+    if data['type'] not in valid_types:
+        return jsonify({'error': f'Invalid type. Must be one of: {", ".join(valid_types)}'}), 400
+
+    import uuid
+    channel = {
+        'id': str(uuid.uuid4()),
+        'name': data['name'],
+        'type': data['type'],
+        'enabled': data.get('enabled', True),
+        'config': data['config'],
+        'notify_on_success': data.get('notify_on_success', True),
+        'notify_on_failure': data.get('notify_on_failure', True),
+        'created_at': datetime.now().isoformat()
+    }
+
+    create_notification_channel(channel)
+    return jsonify({'success': True, 'id': channel['id']})
+
+
+@app.route('/api/notifications/<channel_id>', methods=['PUT'])
+@login_required
+@csrf.exempt
+def api_update_notification(channel_id):
+    """Update a notification channel"""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+
+    existing = get_notification_channel(channel_id)
+    if not existing:
+        return jsonify({'error': 'Channel not found'}), 404
+
+    # If password is masked, keep the existing password
+    if data.get('type') == 'email' and data.get('config', {}).get('smtp_password') == '********':
+        data['config']['smtp_password'] = existing['config'].get('smtp_password', '')
+
+    channel = {
+        'name': data.get('name', existing['name']),
+        'type': data.get('type', existing['type']),
+        'enabled': data.get('enabled', existing['enabled']),
+        'config': data.get('config', existing['config']),
+        'notify_on_success': data.get('notify_on_success', existing['notify_on_success']),
+        'notify_on_failure': data.get('notify_on_failure', existing['notify_on_failure'])
+    }
+
+    update_notification_channel(channel_id, channel)
+    return jsonify({'success': True})
+
+
+@app.route('/api/notifications/<channel_id>', methods=['DELETE'])
+@login_required
+@csrf.exempt
+def api_delete_notification(channel_id):
+    """Delete a notification channel"""
+    existing = get_notification_channel(channel_id)
+    if not existing:
+        return jsonify({'error': 'Channel not found'}), 404
+
+    delete_notification_channel(channel_id)
+    return jsonify({'success': True})
+
+
+@app.route('/api/notifications/test', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_test_notification():
+    """Send a test notification"""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+
+    channel_type = data.get('type')
+    config = data.get('config', {})
+
+    if not channel_type:
+        return jsonify({'error': 'Channel type required'}), 400
+
+    # Create a temporary channel object for testing
+    channel = {
+        'name': 'Test Channel',
+        'type': channel_type,
+        'config': config
+    }
+
+    try:
+        if channel_type == 'email':
+            send_email_notification(channel, 'Test Job', 'success', 'This is a test notification from BackupX', 0)
+        elif channel_type == 'slack':
+            send_slack_notification(channel, 'Test Job', 'success', 'This is a test notification from BackupX', 0)
+        elif channel_type == 'discord':
+            send_discord_notification(channel, 'Test Job', 'success', 'This is a test notification from BackupX', 0)
+        elif channel_type == 'webhook':
+            send_webhook_notification(channel, 'Test Job', 'success', 'This is a test notification from BackupX', 0)
+        else:
+            return jsonify({'error': f'Unknown channel type: {channel_type}'}), 400
+
+        return jsonify({'success': True, 'message': 'Test notification sent successfully'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

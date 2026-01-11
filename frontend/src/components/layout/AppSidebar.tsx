@@ -38,6 +38,7 @@ import {
   Check,
   Server,
   HardDrive,
+  Bell,
 } from "lucide-react";
 
 const navItems = [
@@ -50,6 +51,7 @@ const configItems = [
   { path: "/servers", label: "Servers", icon: Server },
   { path: "/databases", label: "Databases", icon: Database },
   { path: "/storage", label: "S3 Storage", icon: HardDrive },
+  { path: "/notifications", label: "Notifications", icon: Bell },
 ];
 
 export function AppSidebar() {
