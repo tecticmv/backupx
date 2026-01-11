@@ -30,13 +30,14 @@ import {
   FolderSync,
   History,
   Settings,
-  HardDrive,
   LogOut,
   ChevronUp,
   Sun,
   Moon,
   Monitor,
   Check,
+  Server,
+  HardDrive,
 } from "lucide-react";
 
 const navItems = [
@@ -45,8 +46,9 @@ const navItems = [
   { path: "/history", label: "History", icon: History },
 ];
 
-const settingsItems = [
-  { path: "/settings", label: "S3 Storage", icon: HardDrive },
+const configItems = [
+  { path: "/servers", label: "Servers", icon: Server },
+  { path: "/storage", label: "S3 Storage", icon: HardDrive },
 ];
 
 export function AppSidebar() {
@@ -104,10 +106,10 @@ export function AppSidebar() {
         </SidebarGroup>
 
         <SidebarGroup>
-          <SidebarGroupLabel>Settings</SidebarGroupLabel>
+          <SidebarGroupLabel>Configuration</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {settingsItems.map((item) => {
+              {configItems.map((item) => {
                 const Icon = item.icon;
                 return (
                   <SidebarMenuItem key={item.path}>

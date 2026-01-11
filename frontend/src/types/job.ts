@@ -1,14 +1,18 @@
 export interface Job {
   name: string;
-  remote_host: string;
-  ssh_port: number;
-  ssh_key: string;
+  server_id: string;
+  // Legacy fields for backwards compatibility (populated from server)
+  remote_host?: string;
+  ssh_port?: number;
+  ssh_key?: string;
   directories: string[];
   excludes: string[];
-  s3_endpoint: string;
-  s3_bucket: string;
-  s3_access_key: string;
-  s3_secret_key: string;
+  s3_config_id: string;
+  // Legacy fields for backwards compatibility (populated from s3 config)
+  s3_endpoint?: string;
+  s3_bucket?: string;
+  s3_access_key?: string;
+  s3_secret_key?: string;
   restic_password: string;
   backup_prefix: string;
   schedule_enabled: boolean;
@@ -54,15 +58,10 @@ export interface RepoStats {
 export interface JobFormData {
   job_id: string;
   name: string;
-  remote_host: string;
-  ssh_port: number;
-  ssh_key: string;
+  server_id: string;
   directories: string;
   excludes: string;
-  s3_endpoint: string;
-  s3_bucket: string;
-  s3_access_key: string;
-  s3_secret_key: string;
+  s3_config_id: string;
   restic_password: string;
   backup_prefix: string;
   schedule_enabled: boolean;

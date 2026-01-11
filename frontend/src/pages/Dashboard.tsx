@@ -11,6 +11,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import type { Jobs, HistoryEntry } from "@/types/job";
+import JobFormModal from "@/components/JobFormModal";
 import {
   Play,
   Camera,
@@ -31,6 +32,7 @@ export default function Dashboard() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [runningJobs, setRunningJobs] = useState<Set<string>>(new Set());
+  const [jobModalOpen, setJobModalOpen] = useState(false);
 
   useEffect(() => {
     fetchData();
@@ -216,12 +218,10 @@ export default function Dashboard() {
               <CardTitle>Backup Jobs</CardTitle>
               <CardDescription>Manage and run your backup jobs</CardDescription>
             </div>
-            <Link to="/jobs/new">
-              <Button size="sm">
-                <Plus className="h-4 w-4 mr-1" />
-                New Job
-              </Button>
-            </Link>
+            <Button size="sm" onClick={() => setJobModalOpen(true)}>
+              <Plus className="h-4 w-4 mr-1" />
+              New Job
+            </Button>
           </CardHeader>
           <CardContent>
             {jobsList.length === 0 ? (
@@ -231,12 +231,10 @@ export default function Dashboard() {
                 <p className="text-sm text-muted-foreground mt-1 mb-4">
                   Create your first backup job to get started
                 </p>
-                <Link to="/jobs/new">
-                  <Button>
-                    <Plus className="h-4 w-4 mr-2" />
-                    Create Job
-                  </Button>
-                </Link>
+                <Button onClick={() => setJobModalOpen(true)}>
+                  <Plus className="h-4 w-4 mr-2" />
+                  Create Job
+                </Button>
               </div>
             ) : (
               <div className="space-y-2">
@@ -325,6 +323,12 @@ export default function Dashboard() {
           </CardContent>
         </Card>
       </div>
+
+      <JobFormModal
+        open={jobModalOpen}
+        onOpenChange={setJobModalOpen}
+        onSuccess={fetchData}
+      />
     </div>
   );
 }

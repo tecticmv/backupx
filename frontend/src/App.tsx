@@ -6,10 +6,10 @@ import Layout from "@/components/layout/Layout";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Jobs from "@/pages/Jobs";
-import JobForm from "@/pages/JobForm";
 import Snapshots from "@/pages/Snapshots";
 import History from "@/pages/History";
-import Settings from "@/pages/Settings";
+import Servers from "@/pages/Servers";
+import Storage from "@/pages/Storage";
 import { Loader2 } from "lucide-react";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -59,22 +59,6 @@ function AppRoutes() {
           }
         />
         <Route
-          path="/jobs/new"
-          element={
-            <ProtectedRoute>
-              <JobForm />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/jobs/:jobId/edit"
-          element={
-            <ProtectedRoute>
-              <JobForm />
-            </ProtectedRoute>
-          }
-        />
-        <Route
           path="/jobs/:jobId/snapshots"
           element={
             <ProtectedRoute>
@@ -91,10 +75,18 @@ function AppRoutes() {
           }
         />
         <Route
-          path="/settings"
+          path="/servers"
           element={
             <ProtectedRoute>
-              <Settings />
+              <Servers />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/storage"
+          element={
+            <ProtectedRoute>
+              <Storage />
             </ProtectedRoute>
           }
         />

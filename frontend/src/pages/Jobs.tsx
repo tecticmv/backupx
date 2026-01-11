@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import type { Jobs as JobsType } from "@/types/job";
+import JobFormModal from "@/components/JobFormModal";
 import {
   Plus,
   Play,
@@ -49,6 +50,8 @@ export default function Jobs() {
   const [isLoading, setIsLoading] = useState(true);
   const [deleteJobId, setDeleteJobId] = useState<string | null>(null);
   const [runningJobs, setRunningJobs] = useState<Set<string>>(new Set());
+  const [jobModalOpen, setJobModalOpen] = useState(false);
+  const [editingJobId, setEditingJobId] = useState<string | undefined>(undefined);
 
   useEffect(() => {
     fetchJobs();
@@ -109,6 +112,16 @@ export default function Jobs() {
     } finally {
       setDeleteJobId(null);
     }
+  };
+
+  const openNewJobModal = () => {
+    setEditingJobId(undefined);
+    setJobModalOpen(true);
+  };
+
+  const openEditJobModal = (jobId: string) => {
+    setEditingJobId(jobId);
+    setJobModalOpen(true);
   };
 
   const getStatusIcon = (status: string) => {
@@ -225,12 +238,10 @@ export default function Jobs() {
               {totalJobs} backup job{totalJobs !== 1 && "s"} configured
             </CardDescription>
           </div>
-          <Link to="/jobs/new">
-            <Button>
-              <Plus className="h-4 w-4 mr-2" />
-              New Job
-            </Button>
-          </Link>
+          <Button onClick={openNewJobModal}>
+            <Plus className="h-4 w-4 mr-2" />
+            New Job
+          </Button>
         </CardHeader>
         <CardContent>
           {jobsList.length === 0 ? (
@@ -240,12 +251,10 @@ export default function Jobs() {
               <p className="text-sm text-muted-foreground mt-1 mb-4">
                 Create your first backup job to get started
               </p>
-              <Link to="/jobs/new">
-                <Button>
-                  <Plus className="h-4 w-4 mr-2" />
-                  Create Job
-                </Button>
-              </Link>
+              <Button onClick={openNewJobModal}>
+                <Plus className="h-4 w-4 mr-2" />
+                Create Job
+              </Button>
             </div>
           ) : (
             <Table>
@@ -314,11 +323,14 @@ export default function Jobs() {
                             <Camera className="h-4 w-4" />
                           </Button>
                         </Link>
-                        <Link to={`/jobs/${jobId}/edit`}>
-                          <Button size="icon" variant="ghost" title="Edit job">
-                            <Pencil className="h-4 w-4" />
-                          </Button>
-                        </Link>
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          title="Edit job"
+                          onClick={() => openEditJobModal(jobId)}
+                        >
+                          <Pencil className="h-4 w-4" />
+                        </Button>
                         <Button
                           size="icon"
                           variant="ghost"
@@ -358,6 +370,13 @@ export default function Jobs() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <JobFormModal
+        open={jobModalOpen}
+        onOpenChange={setJobModalOpen}
+        jobId={editingJobId}
+        onSuccess={fetchJobs}
+      />
     </div>
   );
 }

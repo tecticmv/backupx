@@ -39,6 +39,7 @@ DATA_DIR = Path('/app/data')
 JOBS_FILE = DATA_DIR / 'jobs.json'
 HISTORY_FILE = DATA_DIR / 'history.json'
 S3_CONFIGS_FILE = DATA_DIR / 's3_configs.json'
+SERVERS_FILE = DATA_DIR / 'servers.json'
 
 # Ensure directories exist
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -120,6 +121,20 @@ def save_s3_configs(configs):
     """Save S3 configurations to file"""
     with open(S3_CONFIGS_FILE, 'w') as f:
         json.dump(configs, f, indent=2)
+
+
+def load_servers():
+    """Load servers from file"""
+    if SERVERS_FILE.exists():
+        with open(SERVERS_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def save_servers(servers):
+    """Save servers to file"""
+    with open(SERVERS_FILE, 'w') as f:
+        json.dump(servers, f, indent=2)
 
 
 def generate_id():
@@ -360,17 +375,39 @@ def api_create_job():
     if job_id in jobs:
         return jsonify({'error': 'Job ID already exists'}), 400
 
+    # Resolve server and S3 config
+    server_id = data.get('server_id')
+    s3_config_id = data.get('s3_config_id')
+
+    server = None
+    s3_config = None
+
+    if server_id:
+        servers = load_servers()
+        server = next((s for s in servers if s['id'] == server_id), None)
+        if not server:
+            return jsonify({'error': 'Server not found'}), 400
+
+    if s3_config_id:
+        s3_configs = load_s3_configs()
+        s3_config = next((c for c in s3_configs if c['id'] == s3_config_id), None)
+        if not s3_config:
+            return jsonify({'error': 'S3 configuration not found'}), 400
+
     job = {
         'name': data.get('name', job_id),
-        'remote_host': data.get('remote_host'),
-        'ssh_port': int(data.get('ssh_port', 22)),
-        'ssh_key': data.get('ssh_key', '/root/.ssh/id_rsa'),
+        'server_id': server_id,
+        's3_config_id': s3_config_id,
+        # Store resolved values for backup execution
+        'remote_host': f"{server['ssh_user']}@{server['host']}" if server else data.get('remote_host'),
+        'ssh_port': server['ssh_port'] if server else int(data.get('ssh_port', 22)),
+        'ssh_key': server['ssh_key'] if server else data.get('ssh_key', '/root/.ssh/id_rsa'),
+        's3_endpoint': s3_config['endpoint'] if s3_config else data.get('s3_endpoint'),
+        's3_bucket': s3_config['bucket'] if s3_config else data.get('s3_bucket'),
+        's3_access_key': s3_config['access_key'] if s3_config else data.get('s3_access_key'),
+        's3_secret_key': s3_config['secret_key'] if s3_config else data.get('s3_secret_key'),
         'directories': data.get('directories', []),
         'excludes': data.get('excludes', []),
-        's3_endpoint': data.get('s3_endpoint'),
-        's3_bucket': data.get('s3_bucket'),
-        's3_access_key': data.get('s3_access_key'),
-        's3_secret_key': data.get('s3_secret_key'),
         'restic_password': data.get('restic_password'),
         'backup_prefix': data.get('backup_prefix', job_id),
         'schedule_enabled': data.get('schedule_enabled', False),
@@ -407,16 +444,39 @@ def api_update_job(job_id):
         return jsonify({'error': 'Job not found'}), 404
 
     job = jobs[job_id]
+
+    # Resolve server and S3 config if provided
+    server_id = data.get('server_id', job.get('server_id'))
+    s3_config_id = data.get('s3_config_id', job.get('s3_config_id'))
+
+    server = None
+    s3_config = None
+
+    if server_id:
+        servers = load_servers()
+        server = next((s for s in servers if s['id'] == server_id), None)
+        if not server:
+            return jsonify({'error': 'Server not found'}), 400
+
+    if s3_config_id:
+        s3_configs = load_s3_configs()
+        s3_config = next((c for c in s3_configs if c['id'] == s3_config_id), None)
+        if not s3_config:
+            return jsonify({'error': 'S3 configuration not found'}), 400
+
     job.update({
         'name': data.get('name', job['name']),
-        'remote_host': data.get('remote_host', job['remote_host']),
-        'ssh_port': int(data.get('ssh_port', job.get('ssh_port', 22))),
-        'ssh_key': data.get('ssh_key', job.get('ssh_key', '/root/.ssh/id_rsa')),
+        'server_id': server_id,
+        's3_config_id': s3_config_id,
+        # Store resolved values for backup execution
+        'remote_host': f"{server['ssh_user']}@{server['host']}" if server else job.get('remote_host'),
+        'ssh_port': server['ssh_port'] if server else job.get('ssh_port', 22),
+        'ssh_key': server['ssh_key'] if server else job.get('ssh_key', '/root/.ssh/id_rsa'),
+        's3_endpoint': s3_config['endpoint'] if s3_config else job.get('s3_endpoint'),
+        's3_bucket': s3_config['bucket'] if s3_config else job.get('s3_bucket'),
+        's3_access_key': s3_config['access_key'] if s3_config else job.get('s3_access_key'),
         'directories': data.get('directories', job['directories']),
         'excludes': data.get('excludes', job.get('excludes', [])),
-        's3_endpoint': data.get('s3_endpoint', job['s3_endpoint']),
-        's3_bucket': data.get('s3_bucket', job['s3_bucket']),
-        's3_access_key': data.get('s3_access_key', job['s3_access_key']),
         'backup_prefix': data.get('backup_prefix', job.get('backup_prefix', job_id)),
         'schedule_enabled': data.get('schedule_enabled', job.get('schedule_enabled', False)),
         'schedule_cron': data.get('schedule_cron', job.get('schedule_cron', '0 2 * * *')),
@@ -429,7 +489,9 @@ def api_update_job(job_id):
     })
 
     # Only update secrets if provided
-    if data.get('s3_secret_key'):
+    if s3_config:
+        job['s3_secret_key'] = s3_config['secret_key']
+    elif data.get('s3_secret_key'):
         job['s3_secret_key'] = data['s3_secret_key']
     if data.get('restic_password'):
         job['restic_password'] = data['restic_password']
@@ -646,6 +708,146 @@ def api_test_s3_connection():
             capture_output=True,
             text=True,
             env=env,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            return jsonify({'success': True, 'message': 'Connection successful'})
+        else:
+            return jsonify({'error': result.stderr or 'Connection failed'}), 400
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Connection timed out'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# Server API Routes
+@app.route('/api/servers', methods=['GET'])
+@login_required
+def api_get_servers():
+    """Get all servers"""
+    servers = load_servers()
+    return jsonify(servers)
+
+
+@app.route('/api/servers', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_create_server():
+    """Create a new server"""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+
+    required_fields = ['name', 'host', 'ssh_user']
+    for field in required_fields:
+        if not data.get(field):
+            return jsonify({'error': f'{field} is required'}), 400
+
+    servers = load_servers()
+
+    new_server = {
+        'id': generate_id(),
+        'name': data['name'],
+        'host': data['host'],
+        'ssh_port': int(data.get('ssh_port', 22)),
+        'ssh_user': data['ssh_user'],
+        'ssh_key': data.get('ssh_key', '/root/.ssh/id_rsa'),
+        'created_at': datetime.now().isoformat(),
+        'updated_at': datetime.now().isoformat()
+    }
+
+    servers.append(new_server)
+    save_servers(servers)
+
+    return jsonify(new_server), 201
+
+
+@app.route('/api/servers/<server_id>', methods=['PUT'])
+@login_required
+@csrf.exempt
+def api_update_server(server_id):
+    """Update a server"""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+
+    servers = load_servers()
+    server_index = next((i for i, s in enumerate(servers) if s['id'] == server_id), None)
+
+    if server_index is None:
+        return jsonify({'error': 'Server not found'}), 404
+
+    server = servers[server_index]
+
+    # Update fields
+    server['name'] = data.get('name', server['name'])
+    server['host'] = data.get('host', server['host'])
+    server['ssh_port'] = int(data.get('ssh_port', server.get('ssh_port', 22)))
+    server['ssh_user'] = data.get('ssh_user', server['ssh_user'])
+    server['ssh_key'] = data.get('ssh_key', server.get('ssh_key', '/root/.ssh/id_rsa'))
+    server['updated_at'] = datetime.now().isoformat()
+
+    servers[server_index] = server
+    save_servers(servers)
+
+    return jsonify(server)
+
+
+@app.route('/api/servers/<server_id>', methods=['DELETE'])
+@login_required
+@csrf.exempt
+def api_delete_server(server_id):
+    """Delete a server"""
+    servers = load_servers()
+    server_index = next((i for i, s in enumerate(servers) if s['id'] == server_id), None)
+
+    if server_index is None:
+        return jsonify({'error': 'Server not found'}), 404
+
+    servers.pop(server_index)
+    save_servers(servers)
+
+    return jsonify({'success': True})
+
+
+@app.route('/api/servers/test', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_test_server_connection():
+    """Test SSH connection to server"""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+
+    host = data.get('host', '')
+    ssh_port = int(data.get('ssh_port', 22))
+    ssh_user = data.get('ssh_user', '')
+    ssh_key = data.get('ssh_key', '/root/.ssh/id_rsa')
+
+    if not all([host, ssh_user]):
+        return jsonify({'error': 'Missing required fields'}), 400
+
+    try:
+        # Test SSH connection
+        ssh_cmd = [
+            'ssh', '-i', ssh_key,
+            '-p', str(ssh_port),
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'BatchMode=yes',
+            '-o', 'ConnectTimeout=10',
+            f'{ssh_user}@{host}',
+            'echo "Connection successful"'
+        ]
+
+        result = subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            text=True,
             timeout=30
         )
 

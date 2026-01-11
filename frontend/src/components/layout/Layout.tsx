@@ -18,9 +18,9 @@ interface LayoutProps {
 const routeNames: Record<string, string> = {
   "/": "Dashboard",
   "/jobs": "Backup Jobs",
-  "/jobs/new": "New Job",
   "/history": "History",
-  "/settings": "S3 Storage",
+  "/servers": "Servers",
+  "/storage": "S3 Storage",
 };
 
 export default function Layout({ children }: LayoutProps) {
@@ -29,23 +29,11 @@ export default function Layout({ children }: LayoutProps) {
   const getBreadcrumbs = () => {
     const path = location.pathname;
 
-    // Handle job edit/snapshots routes
-    if (path.match(/\/jobs\/[^/]+\/edit/)) {
-      return [
-        { path: "/jobs", label: "Backup Jobs" },
-        { path: path, label: "Edit Job", isCurrentPage: true },
-      ];
-    }
+    // Handle job snapshots routes
     if (path.match(/\/jobs\/[^/]+\/snapshots/)) {
       return [
         { path: "/jobs", label: "Backup Jobs" },
         { path: path, label: "Snapshots", isCurrentPage: true },
-      ];
-    }
-    if (path === "/jobs/new") {
-      return [
-        { path: "/jobs", label: "Backup Jobs" },
-        { path: path, label: "New Job", isCurrentPage: true },
       ];
     }
 
