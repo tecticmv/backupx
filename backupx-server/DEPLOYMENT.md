@@ -215,7 +215,149 @@ docker compose ps
    - Discord webhook
    - Generic webhook
 
-## Remote Server Requirements
+## Connection Methods
+
+BackupX supports two methods to connect to remote servers:
+
+### Method 1: SSH Connection (Traditional)
+
+Requires SSH key authentication from the BackupX server to remote servers.
+
+**Pros:**
+- No additional software on remote servers (only restic required)
+- Works with existing SSH infrastructure
+
+**Cons:**
+- Requires SSH key management
+- BackupX server needs network access to remote SSH ports
+- Some cloud environments restrict SSH access
+
+### Method 2: BackupX Agent (Recommended)
+
+Deploy a lightweight agent on remote servers that communicates with the main BackupX server via HTTP API.
+
+**Pros:**
+- No SSH key management required
+- Agent handles backup execution locally
+- Better for cloud/containerized environments
+- API key authentication
+
+**Cons:**
+- Requires deploying agent on each remote server
+
+## Deploying BackupX Agent
+
+Deploy the agent on each remote server you want to backup.
+
+### Agent Quick Start
+
+```bash
+# On each remote server
+cd /opt
+git clone https://github.com/SaiphMuhammad/backupx.git
+cd backupx/agent
+
+# Create environment file
+cp .env.example .env
+
+# Generate API key
+API_KEY=$(openssl rand -hex 32)
+echo "AGENT_API_KEY=$API_KEY" >> .env
+echo "AGENT_NAME=my-server-$(hostname)" >> .env
+
+# Optional: Restrict backup paths
+echo "ALLOWED_PATHS=/var/www,/home,/etc" >> .env
+
+# Start the agent
+docker compose up -d
+```
+
+### Agent Configuration
+
+Edit `/opt/backupx/agent/.env`:
+
+```bash
+# REQUIRED: API key (must match in BackupX UI)
+AGENT_API_KEY=your-secure-api-key-here
+
+# Agent name (displayed in BackupX UI)
+AGENT_NAME=production-server
+
+# Logging level
+LOG_LEVEL=INFO
+
+# Restrict backup paths (optional, comma-separated)
+# Leave empty to allow all mounted paths
+ALLOWED_PATHS=/var/www,/home,/etc,/opt
+```
+
+### Agent Docker Compose
+
+```yaml
+version: "3.8"
+
+services:
+  backupx-agent:
+    build: .
+    container_name: backupx-agent
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      # Mount paths you want to backup
+      - /var/www:/data/www:ro
+      - /home:/data/home:ro
+      - /etc:/data/etc:ro
+    environment:
+      - AGENT_API_KEY=${AGENT_API_KEY}
+      - AGENT_NAME=${AGENT_NAME:-server-agent}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ALLOWED_PATHS=${ALLOWED_PATHS:-}
+```
+
+### Adding Agent Server in BackupX UI
+
+1. Go to **Configuration > Servers**
+2. Click **Add Server**
+3. Select **Connection Type: BackupX Agent**
+4. Enter:
+   - **Name**: Descriptive server name
+   - **Host**: Remote server IP or hostname
+   - **Agent Port**: 8090 (default)
+   - **Agent API Key**: The key from agent's `.env` file
+5. Click **Test Connection** to verify
+6. Click **Save**
+
+### Agent Security
+
+1. **Firewall Rules**:
+   ```bash
+   # Only allow BackupX server to connect
+   sudo ufw allow from BACKUPX_SERVER_IP to any port 8090
+   ```
+
+2. **Use Strong API Keys**:
+   ```bash
+   openssl rand -hex 32
+   ```
+
+3. **Restrict Paths**: Configure `ALLOWED_PATHS` to limit what directories can be backed up
+
+4. **Network Isolation**: Consider placing agent on internal network only accessible by BackupX server
+
+### Agent Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check (no auth) |
+| `/info` | GET | Agent information |
+| `/backup/filesystem` | POST | Run filesystem backup |
+| `/backup/database` | POST | Run MySQL backup |
+| `/snapshots` | POST | List snapshots |
+| `/stats` | POST | Repository stats |
+| `/init` | POST | Initialize repository |
+
+## Remote Server Requirements (SSH Method)
 
 ### For Filesystem Backups
 

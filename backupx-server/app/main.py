@@ -86,6 +86,72 @@ def validate_environment():
 
     return len(warnings) == 0
 
+
+# =============================================================================
+# Credential Encryption
+# =============================================================================
+
+# Encryption key derived from SECRET_KEY (for encrypting stored credentials)
+_fernet = None
+
+def get_fernet():
+    """Get Fernet instance for encryption/decryption"""
+    global _fernet
+    if _fernet is None:
+        from cryptography.fernet import Fernet
+        import base64
+        import hashlib
+        # Derive a 32-byte key from SECRET_KEY using SHA-256
+        secret_key = os.environ.get('SECRET_KEY', 'change-this-secret-key')
+        key = hashlib.sha256(secret_key.encode()).digest()
+        _fernet = Fernet(base64.urlsafe_b64encode(key))
+    return _fernet
+
+
+def encrypt_credential(plaintext: str) -> str:
+    """Encrypt a credential for storage"""
+    if not plaintext:
+        return ''
+    try:
+        fernet = get_fernet()
+        return fernet.encrypt(plaintext.encode()).decode()
+    except Exception as e:
+        logger.error(f"Encryption error: {e}")
+        # Return original if encryption fails (for backwards compatibility during migration)
+        return plaintext
+
+
+def decrypt_credential(ciphertext: str) -> str:
+    """Decrypt a stored credential"""
+    if not ciphertext:
+        return ''
+    try:
+        fernet = get_fernet()
+        return fernet.decrypt(ciphertext.encode()).decode()
+    except Exception:
+        # If decryption fails, assume it's a legacy plaintext value
+        return ciphertext
+
+
+def is_encrypted(value: str) -> bool:
+    """Check if a value appears to be Fernet-encrypted"""
+    if not value:
+        return False
+    # Fernet tokens start with 'gAAAAA' (base64-encoded version byte)
+    return value.startswith('gAAAAA')
+
+
+# Hash the admin password at startup for secure comparison
+_admin_password_hash = None
+
+def get_admin_password_hash():
+    """Get hashed admin password"""
+    global _admin_password_hash
+    if _admin_password_hash is None:
+        admin_pass = os.environ.get('ADMIN_PASSWORD', 'changeme')
+        _admin_password_hash = generate_password_hash(admin_pass)
+    return _admin_password_hash
+
 # Validate environment on startup
 env_valid = validate_environment()
 if not env_valid:
@@ -100,10 +166,51 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'change-this-secret-key'
 # CSRF Protection
 csrf = CSRFProtect(app)
 
+# Rate Limiting
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://",
+)
+
 # Login Manager
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
+
+
+# =============================================================================
+# Security Headers Middleware
+# =============================================================================
+
+@app.after_request
+def add_security_headers(response):
+    """Add security headers to all responses"""
+    # Prevent clickjacking
+    response.headers['X-Frame-Options'] = 'DENY'
+    # Prevent MIME type sniffing
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    # Enable XSS filter
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    # Referrer policy
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    # Permissions policy (restrict browser features)
+    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    # Content Security Policy
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none';"
+    )
+    return response
 
 # Paths
 CONFIG_DIR = Path('/app/config')
@@ -228,9 +335,12 @@ def init_db():
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             host TEXT NOT NULL,
+            connection_type TEXT DEFAULT 'ssh',
             ssh_port INTEGER DEFAULT 22,
-            ssh_user TEXT NOT NULL,
+            ssh_user TEXT,
             ssh_key TEXT DEFAULT '/home/backupx/.ssh/id_rsa',
+            agent_port INTEGER DEFAULT 8090,
+            agent_api_key TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT
         );
@@ -322,11 +432,73 @@ def init_db():
             updated_at TEXT
         );
 
+        -- Audit log table (enterprise feature)
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            user_id TEXT,
+            user_name TEXT,
+            action TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT,
+            resource_name TEXT,
+            changes TEXT,
+            ip_address TEXT,
+            user_agent TEXT,
+            status TEXT DEFAULT 'success',
+            error_message TEXT
+        );
+
+        -- Scheduler tables for distributed mode (enterprise feature)
+        CREATE TABLE IF NOT EXISTS scheduler_lock (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            leader_instance TEXT,
+            acquired_at TEXT,
+            heartbeat_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS scheduled_jobs (
+            job_id TEXT PRIMARY KEY,
+            cron_expression TEXT NOT NULL,
+            next_run TEXT,
+            last_run TEXT,
+            is_active INTEGER DEFAULT 1,
+            FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+        );
+
         -- Indexes
         CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_history_job_id ON history(job_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_log(resource_type, resource_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+        CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_next_run ON scheduled_jobs(next_run);
     ''')
     conn.commit()
+
+    # Add new columns if they don't exist (migration for existing databases)
+    try:
+        conn = get_db_connection()
+        # Check and add connection_type column
+        cursor = conn.execute("PRAGMA table_info(servers)")
+        columns = [col[1] for col in cursor.fetchall()]
+
+        if 'connection_type' not in columns:
+            conn.execute("ALTER TABLE servers ADD COLUMN connection_type TEXT DEFAULT 'ssh'")
+            logger.info("Added connection_type column to servers table")
+        if 'agent_port' not in columns:
+            conn.execute("ALTER TABLE servers ADD COLUMN agent_port INTEGER DEFAULT 8090")
+            logger.info("Added agent_port column to servers table")
+        if 'agent_api_key' not in columns:
+            conn.execute("ALTER TABLE servers ADD COLUMN agent_api_key TEXT")
+            logger.info("Added agent_api_key column to servers table")
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Migration check failed: {e}")
+
     conn.close()
 
 
@@ -355,11 +527,12 @@ def migrate_json_to_sqlite():
                 servers = json.load(f)
             for s in servers:
                 conn.execute('''
-                    INSERT INTO servers (id, name, host, ssh_port, ssh_user, ssh_key, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (s['id'], s['name'], s['host'], s.get('ssh_port', 22), s['ssh_user'],
-                      s.get('ssh_key', '/home/backupx/.ssh/id_rsa'), s.get('created_at', datetime.now().isoformat()),
-                      s.get('updated_at')))
+                    INSERT INTO servers (id, name, host, connection_type, ssh_port, ssh_user, ssh_key, agent_port, agent_api_key, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (s['id'], s['name'], s['host'], s.get('connection_type', 'ssh'),
+                      s.get('ssh_port', 22), s.get('ssh_user'), s.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
+                      s.get('agent_port', 8090), s.get('agent_api_key'),
+                      s.get('created_at', datetime.now().isoformat()), s.get('updated_at')))
             logger.info(f"  Migrated {len(servers)} servers")
         except Exception as e:
             logger.error(f"  Error migrating servers: {e}")
@@ -464,6 +637,15 @@ def generate_id():
 
 # --- Jobs ---
 
+def _decrypt_job(job):
+    """Decrypt sensitive fields in job config"""
+    if job:
+        job['s3_access_key'] = decrypt_credential(job.get('s3_access_key', '') or '')
+        job['s3_secret_key'] = decrypt_credential(job.get('s3_secret_key', '') or '')
+        job['restic_password'] = decrypt_credential(job.get('restic_password', '') or '')
+    return job
+
+
 def load_jobs():
     """Load all backup jobs from database"""
     conn = get_db_connection()
@@ -472,7 +654,7 @@ def load_jobs():
 
     jobs = {}
     for row in rows:
-        job = dict(row)
+        job = _decrypt_job(dict(row))
         # Convert JSON strings to lists
         job['directories'] = json.loads(job['directories'] or '[]')
         job['excludes'] = json.loads(job['excludes'] or '[]')
@@ -491,7 +673,7 @@ def get_job(job_id):
     conn.close()
 
     if row:
-        job = dict(row)
+        job = _decrypt_job(dict(row))
         job['directories'] = json.loads(job['directories'] or '[]')
         job['excludes'] = json.loads(job['excludes'] or '[]')
         job['schedule_enabled'] = bool(job['schedule_enabled'])
@@ -502,6 +684,11 @@ def get_job(job_id):
 def save_job(job_id, job):
     """Save a job to database (insert or update)"""
     conn = get_db_connection()
+
+    # Encrypt sensitive fields
+    encrypted_s3_access_key = encrypt_credential(job.get('s3_access_key', '') or '')
+    encrypted_s3_secret_key = encrypt_credential(job.get('s3_secret_key', '') or '')
+    encrypted_restic_password = encrypt_credential(job.get('restic_password', '') or '')
 
     # Check if job exists
     exists = conn.execute('SELECT 1 FROM jobs WHERE id = ?', (job_id,)).fetchone()
@@ -515,9 +702,9 @@ def save_job(job_id, job):
             WHERE id=?
         ''', (job['name'], job.get('backup_type', 'filesystem'), job.get('server_id'), job.get('s3_config_id'),
               job.get('remote_host'), job.get('ssh_port', 22), job.get('ssh_key'),
-              job.get('s3_endpoint'), job.get('s3_bucket'), job.get('s3_access_key'), job.get('s3_secret_key'),
+              job.get('s3_endpoint'), job.get('s3_bucket'), encrypted_s3_access_key, encrypted_s3_secret_key,
               json.dumps(job.get('directories', [])), json.dumps(job.get('excludes', [])), job.get('database_config_id'),
-              job.get('restic_password'), job.get('backup_prefix'), 1 if job.get('schedule_enabled') else 0,
+              encrypted_restic_password, job.get('backup_prefix'), 1 if job.get('schedule_enabled') else 0,
               job.get('schedule_cron', '0 2 * * *'), job.get('retention_hourly', 24), job.get('retention_daily', 7),
               job.get('retention_weekly', 4), job.get('retention_monthly', 12), job.get('timeout', 7200),
               job.get('status', 'pending'), job.get('updated_at'), job.get('last_run'), job.get('last_success'),
@@ -531,9 +718,9 @@ def save_job(job_id, job):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (job_id, job['name'], job.get('backup_type', 'filesystem'), job.get('server_id'), job.get('s3_config_id'),
               job.get('remote_host'), job.get('ssh_port', 22), job.get('ssh_key'),
-              job.get('s3_endpoint'), job.get('s3_bucket'), job.get('s3_access_key'), job.get('s3_secret_key'),
+              job.get('s3_endpoint'), job.get('s3_bucket'), encrypted_s3_access_key, encrypted_s3_secret_key,
               json.dumps(job.get('directories', [])), json.dumps(job.get('excludes', [])), job.get('database_config_id'),
-              job.get('restic_password'), job.get('backup_prefix'), 1 if job.get('schedule_enabled') else 0,
+              encrypted_restic_password, job.get('backup_prefix'), 1 if job.get('schedule_enabled') else 0,
               job.get('schedule_cron', '0 2 * * *'), job.get('retention_hourly', 24), job.get('retention_daily', 7),
               job.get('retention_weekly', 4), job.get('retention_monthly', 12), job.get('timeout', 7200),
               job.get('status', 'pending'), job.get('created_at', datetime.now().isoformat()), job.get('updated_at'),
@@ -597,12 +784,20 @@ def add_history(job_id, job_name, status, message, duration=0):
 
 # --- S3 Configs ---
 
+def _decrypt_s3_config(config):
+    """Decrypt sensitive fields in S3 config"""
+    if config:
+        config['access_key'] = decrypt_credential(config.get('access_key', ''))
+        config['secret_key'] = decrypt_credential(config.get('secret_key', ''))
+    return config
+
+
 def load_s3_configs():
     """Load S3 configurations from database"""
     conn = get_db_connection()
     rows = conn.execute('SELECT * FROM s3_configs').fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+    return [_decrypt_s3_config(dict(row)) for row in rows]
 
 
 def get_s3_config(config_id):
@@ -610,7 +805,7 @@ def get_s3_config(config_id):
     conn = get_db_connection()
     row = conn.execute('SELECT * FROM s3_configs WHERE id = ?', (config_id,)).fetchone()
     conn.close()
-    return dict(row) if row else None
+    return _decrypt_s3_config(dict(row)) if row else None
 
 
 def create_s3_config(config):
@@ -619,8 +814,9 @@ def create_s3_config(config):
     conn.execute('''
         INSERT INTO s3_configs (id, name, endpoint, bucket, access_key, secret_key, region, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (config['id'], config['name'], config['endpoint'], config['bucket'], config['access_key'],
-          config['secret_key'], config.get('region', ''), config.get('created_at', datetime.now().isoformat()),
+    ''', (config['id'], config['name'], config['endpoint'], config['bucket'],
+          encrypt_credential(config['access_key']), encrypt_credential(config['secret_key']),
+          config.get('region', ''), config.get('created_at', datetime.now().isoformat()),
           config.get('updated_at')))
     conn.commit()
     conn.close()
@@ -632,8 +828,9 @@ def update_s3_config(config_id, config):
     conn.execute('''
         UPDATE s3_configs SET name=?, endpoint=?, bucket=?, access_key=?, secret_key=?, region=?, updated_at=?
         WHERE id=?
-    ''', (config['name'], config['endpoint'], config['bucket'], config['access_key'],
-          config['secret_key'], config.get('region', ''), datetime.now().isoformat(), config_id))
+    ''', (config['name'], config['endpoint'], config['bucket'],
+          encrypt_credential(config['access_key']), encrypt_credential(config['secret_key']),
+          config.get('region', ''), datetime.now().isoformat(), config_id))
     conn.commit()
     conn.close()
 
@@ -648,12 +845,19 @@ def delete_s3_config(config_id):
 
 # --- Servers ---
 
+def _decrypt_server(server):
+    """Decrypt sensitive fields in server config"""
+    if server:
+        server['agent_api_key'] = decrypt_credential(server.get('agent_api_key', '') or '')
+    return server
+
+
 def load_servers():
     """Load servers from database"""
     conn = get_db_connection()
     rows = conn.execute('SELECT * FROM servers').fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+    return [_decrypt_server(dict(row)) for row in rows]
 
 
 def get_server(server_id):
@@ -661,18 +865,19 @@ def get_server(server_id):
     conn = get_db_connection()
     row = conn.execute('SELECT * FROM servers WHERE id = ?', (server_id,)).fetchone()
     conn.close()
-    return dict(row) if row else None
+    return _decrypt_server(dict(row)) if row else None
 
 
 def create_server(server):
     """Create a new server"""
     conn = get_db_connection()
     conn.execute('''
-        INSERT INTO servers (id, name, host, ssh_port, ssh_user, ssh_key, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (server['id'], server['name'], server['host'], server.get('ssh_port', 22), server['ssh_user'],
-          server.get('ssh_key', '/home/backupx/.ssh/id_rsa'), server.get('created_at', datetime.now().isoformat()),
-          server.get('updated_at')))
+        INSERT INTO servers (id, name, host, connection_type, ssh_port, ssh_user, ssh_key, agent_port, agent_api_key, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (server['id'], server['name'], server['host'], server.get('connection_type', 'ssh'),
+          server.get('ssh_port', 22), server.get('ssh_user'), server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
+          server.get('agent_port', 8090), encrypt_credential(server.get('agent_api_key', '') or ''),
+          server.get('created_at', datetime.now().isoformat()), server.get('updated_at')))
     conn.commit()
     conn.close()
 
@@ -681,10 +886,12 @@ def update_server_in_db(server_id, server):
     """Update a server"""
     conn = get_db_connection()
     conn.execute('''
-        UPDATE servers SET name=?, host=?, ssh_port=?, ssh_user=?, ssh_key=?, updated_at=?
+        UPDATE servers SET name=?, host=?, connection_type=?, ssh_port=?, ssh_user=?, ssh_key=?, agent_port=?, agent_api_key=?, updated_at=?
         WHERE id=?
-    ''', (server['name'], server['host'], server.get('ssh_port', 22), server['ssh_user'],
-          server.get('ssh_key', '/home/backupx/.ssh/id_rsa'), datetime.now().isoformat(), server_id))
+    ''', (server['name'], server['host'], server.get('connection_type', 'ssh'),
+          server.get('ssh_port', 22), server.get('ssh_user'), server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
+          server.get('agent_port', 8090), encrypt_credential(server.get('agent_api_key', '') or ''),
+          datetime.now().isoformat(), server_id))
     conn.commit()
     conn.close()
 
@@ -699,12 +906,19 @@ def delete_server_from_db(server_id):
 
 # --- Database Configs ---
 
+def _decrypt_db_config(config):
+    """Decrypt sensitive fields in database config"""
+    if config:
+        config['password'] = decrypt_credential(config.get('password', ''))
+    return config
+
+
 def load_db_configs():
     """Load database configurations from database"""
     conn = get_db_connection()
     rows = conn.execute('SELECT * FROM db_configs').fetchall()
     conn.close()
-    return [dict(row) for row in rows]
+    return [_decrypt_db_config(dict(row)) for row in rows]
 
 
 def get_db_config(config_id):
@@ -712,7 +926,7 @@ def get_db_config(config_id):
     conn = get_db_connection()
     row = conn.execute('SELECT * FROM db_configs WHERE id = ?', (config_id,)).fetchone()
     conn.close()
-    return dict(row) if row else None
+    return _decrypt_db_config(dict(row)) if row else None
 
 
 def create_db_config(config):
@@ -722,7 +936,7 @@ def create_db_config(config):
         INSERT INTO db_configs (id, name, type, host, port, username, password, databases, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (config['id'], config['name'], config.get('type', 'mysql'), config['host'], config.get('port', 3306),
-          config['username'], config['password'], config.get('databases', '*'),
+          config['username'], encrypt_credential(config['password']), config.get('databases', '*'),
           config.get('created_at', datetime.now().isoformat()), config.get('updated_at')))
     conn.commit()
     conn.close()
@@ -735,7 +949,7 @@ def update_db_config_in_db(config_id, config):
         UPDATE db_configs SET name=?, type=?, host=?, port=?, username=?, password=?, databases=?, updated_at=?
         WHERE id=?
     ''', (config['name'], config.get('type', 'mysql'), config['host'], config.get('port', 3306),
-          config['username'], config['password'], config.get('databases', '*'),
+          config['username'], encrypt_credential(config['password']), config.get('databases', '*'),
           datetime.now().isoformat(), config_id))
     conn.commit()
     conn.close()
@@ -1050,12 +1264,25 @@ def run_backup(job_id):
     if not job:
         return False, "Job not found"
 
-    backup_type = job.get('backup_type', 'filesystem')
+    # Get server to determine connection type
+    server_id = job.get('server_id')
+    server = get_server(server_id) if server_id else None
 
-    if backup_type == 'database':
-        return run_database_backup(job_id, job)
+    backup_type = job.get('backup_type', 'filesystem')
+    connection_type = server.get('connection_type', 'ssh') if server else 'ssh'
+
+    if connection_type == 'agent' and server:
+        # Use agent-based backup
+        if backup_type == 'database':
+            return run_agent_database_backup(job_id, job, server)
+        else:
+            return run_agent_filesystem_backup(job_id, job, server)
     else:
-        return run_filesystem_backup(job_id, job)
+        # Use SSH-based backup
+        if backup_type == 'database':
+            return run_database_backup(job_id, job)
+        else:
+            return run_filesystem_backup(job_id, job)
 
 
 def sanitize_error_message(error: str, max_length: int = 500) -> str:
@@ -1099,7 +1326,7 @@ def run_filesystem_backup(job_id, job):
         ssh_cmd = [
             'ssh', '-i', job.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
             '-p', str(job.get('ssh_port', 22)),
-            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'StrictHostKeyChecking=accept-new',
             '-o', 'BatchMode=yes',
             '-o', 'ConnectTimeout=30',
             job['remote_host']
@@ -1176,7 +1403,7 @@ def run_database_backup(job_id, job):
         ssh_cmd = [
             'ssh', '-i', job.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
             '-p', str(job.get('ssh_port', 22)),
-            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'StrictHostKeyChecking=accept-new',
             '-o', 'BatchMode=yes',
             '-o', 'ConnectTimeout=30',
             job['remote_host']
@@ -1274,6 +1501,161 @@ exit $RESTIC_EXIT
         return False, error_msg
 
 
+def run_agent_filesystem_backup(job_id, job, server):
+    """Execute a filesystem backup job via agent"""
+    start_time = datetime.now()
+    logger.info(f"Starting agent-based filesystem backup job: {job_id} ({job['name']})")
+
+    # Update job status
+    update_job_status(job_id, 'running', last_run=start_time.isoformat())
+
+    try:
+        agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/backup/filesystem"
+
+        # Prepare request payload
+        payload = {
+            's3_endpoint': job['s3_endpoint'],
+            's3_bucket': job['s3_bucket'],
+            's3_access_key': job['s3_access_key'],
+            's3_secret_key': job['s3_secret_key'],
+            'restic_password': job['restic_password'],
+            'backup_prefix': job.get('backup_prefix', job_id),
+            'directories': job.get('directories', []),
+            'excludes': job.get('excludes', [])
+        }
+
+        data = json.dumps(payload).encode('utf-8')
+        req = Request(agent_url, data=data, method='POST')
+        req.add_header('Content-Type', 'application/json')
+        req.add_header('X-API-Key', server['agent_api_key'])
+
+        # Make request with timeout
+        timeout = job.get('timeout', 7200)
+        with urlopen(req, timeout=timeout) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+        duration = (datetime.now() - start_time).total_seconds()
+
+        if result.get('success'):
+            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=datetime.now().isoformat())
+            add_history(job_id, job['name'], 'success', 'Backup completed successfully via agent', duration)
+            send_notification(job_id, job['name'], 'success', 'Backup completed successfully via agent', duration)
+            logger.info(f"Agent filesystem backup completed successfully: {job_id} (duration: {duration:.1f}s)")
+            return True, "Backup completed successfully"
+        else:
+            error_msg = sanitize_error_message(result.get('error', 'Unknown error'))
+            update_job_status(job_id, 'failed')
+            add_history(job_id, job['name'], 'failed', error_msg, duration)
+            send_notification(job_id, job['name'], 'failed', error_msg, duration)
+            logger.error(f"Agent filesystem backup failed: {job_id} - {error_msg[:200]}")
+            return False, error_msg
+
+    except (URLError, HTTPError) as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        if hasattr(e, 'code') and e.code == 401:
+            error_msg = "Agent authentication failed - check API key"
+        else:
+            error_msg = sanitize_error_message(str(e))
+        update_job_status(job_id, 'error')
+        add_history(job_id, job['name'], 'error', error_msg, duration)
+        send_notification(job_id, job['name'], 'error', error_msg, duration)
+        logger.error(f"Agent filesystem backup error: {job_id} - {error_msg}")
+        return False, error_msg
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        error_msg = sanitize_error_message(str(e))
+        update_job_status(job_id, 'error')
+        add_history(job_id, job['name'], 'error', error_msg, duration)
+        send_notification(job_id, job['name'], 'error', error_msg, duration)
+        logger.exception(f"Agent filesystem backup error: {job_id}")
+        return False, error_msg
+
+
+def run_agent_database_backup(job_id, job, server):
+    """Execute a MySQL database backup job via agent"""
+    start_time = datetime.now()
+    logger.info(f"Starting agent-based database backup job: {job_id} ({job['name']})")
+
+    # Update job status
+    update_job_status(job_id, 'running', last_run=start_time.isoformat())
+
+    try:
+        # Get database config
+        db_config_id = job.get('database_config_id')
+        if not db_config_id:
+            raise Exception("Database configuration not specified")
+
+        db_config = get_db_config(db_config_id)
+        if not db_config:
+            raise Exception("Database configuration not found")
+
+        agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/backup/database"
+
+        # Prepare request payload
+        payload = {
+            's3_endpoint': job['s3_endpoint'],
+            's3_bucket': job['s3_bucket'],
+            's3_access_key': job['s3_access_key'],
+            's3_secret_key': job['s3_secret_key'],
+            'restic_password': job['restic_password'],
+            'backup_prefix': job.get('backup_prefix', job_id),
+            'db_type': db_config.get('type', 'mysql'),
+            'db_host': db_config['host'],
+            'db_port': db_config.get('port', 3306),
+            'db_user': db_config['username'],
+            'db_password': db_config['password'],
+            'databases': db_config.get('databases', '*')
+        }
+
+        data = json.dumps(payload).encode('utf-8')
+        req = Request(agent_url, data=data, method='POST')
+        req.add_header('Content-Type', 'application/json')
+        req.add_header('X-API-Key', server['agent_api_key'])
+
+        # Make request with timeout
+        timeout = job.get('timeout', 7200)
+        with urlopen(req, timeout=timeout) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+        duration = (datetime.now() - start_time).total_seconds()
+
+        if result.get('success'):
+            databases = db_config.get('databases', '*')
+            message = f'MySQL backup completed successfully via agent ({databases})'
+            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=datetime.now().isoformat())
+            add_history(job_id, job['name'], 'success', message, duration)
+            send_notification(job_id, job['name'], 'success', message, duration)
+            logger.info(f"Agent database backup completed successfully: {job_id} (duration: {duration:.1f}s)")
+            return True, "Database backup completed successfully"
+        else:
+            error_msg = sanitize_error_message(result.get('error', 'Unknown error'))
+            update_job_status(job_id, 'failed')
+            add_history(job_id, job['name'], 'failed', error_msg, duration)
+            send_notification(job_id, job['name'], 'failed', error_msg, duration)
+            logger.error(f"Agent database backup failed: {job_id} - {error_msg[:200]}")
+            return False, error_msg
+
+    except (URLError, HTTPError) as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        if hasattr(e, 'code') and e.code == 401:
+            error_msg = "Agent authentication failed - check API key"
+        else:
+            error_msg = sanitize_error_message(str(e))
+        update_job_status(job_id, 'error')
+        add_history(job_id, job['name'], 'error', error_msg, duration)
+        send_notification(job_id, job['name'], 'error', error_msg, duration)
+        logger.error(f"Agent database backup error: {job_id} - {error_msg}")
+        return False, error_msg
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        error_msg = sanitize_error_message(str(e))
+        update_job_status(job_id, 'error')
+        add_history(job_id, job['name'], 'error', error_msg, duration)
+        send_notification(job_id, job['name'], 'error', error_msg, duration)
+        logger.exception(f"Agent database backup error: {job_id}")
+        return False, error_msg
+
+
 def get_snapshots(job):
     """Get list of snapshots for a job"""
     try:
@@ -1356,6 +1738,7 @@ def health():
 # API Authentication Routes
 @app.route('/api/auth/login', methods=['POST'])
 @csrf.exempt
+@limiter.limit("5 per minute")  # Strict rate limiting for login to prevent brute-force
 def api_login():
     data = request.get_json()
     if not data:
@@ -1365,13 +1748,15 @@ def api_login():
     password = data.get('password')
 
     admin_user = os.environ.get('ADMIN_USERNAME', 'admin')
-    admin_pass = os.environ.get('ADMIN_PASSWORD', 'changeme')
 
-    if username == admin_user and password == admin_pass:
+    # Use secure password hash comparison
+    if username == admin_user and check_password_hash(get_admin_password_hash(), password):
         user = User(username)
         login_user(user)
+        logger.info(f"Successful login for user: {username}")
         return jsonify({'user': {'id': username, 'username': username}})
 
+    logger.warning(f"Failed login attempt for user: {username} from {request.remote_addr}")
     return jsonify({'error': 'Invalid credentials'}), 401
 
 
@@ -1771,7 +2156,14 @@ def api_test_s3_connection():
 def api_get_servers():
     """Get all servers"""
     servers = load_servers()
-    return jsonify(servers)
+    # Mask agent API keys in response
+    safe_servers = []
+    for server in servers:
+        safe_server = {**server}
+        if safe_server.get('agent_api_key'):
+            safe_server['agent_api_key'] = '********'
+        safe_servers.append(safe_server)
+    return jsonify(safe_servers)
 
 
 @app.route('/api/servers', methods=['POST'])
@@ -1784,37 +2176,77 @@ def api_create_server_route():
     if not data:
         return jsonify({'error': 'No data provided'}), 400
 
-    required_fields = ['name', 'host', 'ssh_user']
-    for field in required_fields:
-        if not data.get(field):
-            return jsonify({'error': f'{field} is required'}), 400
+    # Required fields for all servers
+    if not data.get('name'):
+        return jsonify({'error': 'name is required'}), 400
+    if not data.get('host'):
+        return jsonify({'error': 'host is required'}), 400
 
-    # Validate inputs
+    # Validate hostname
     if not validate_hostname(data['host']):
         return jsonify({'error': 'Invalid hostname or IP address'}), 400
 
-    ssh_port = int(data.get('ssh_port', 22))
-    if not validate_port(ssh_port):
-        return jsonify({'error': 'Invalid SSH port (must be 1-65535)'}), 400
+    connection_type = data.get('connection_type', 'ssh')
 
-    ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
-    if not validate_path(ssh_key):
-        return jsonify({'error': 'Invalid SSH key path'}), 400
+    if connection_type == 'ssh':
+        # SSH-specific validation
+        if not data.get('ssh_user'):
+            return jsonify({'error': 'ssh_user is required for SSH connections'}), 400
 
-    new_server = {
-        'id': generate_id(),
-        'name': data['name'],
-        'host': data['host'],
-        'ssh_port': ssh_port,
-        'ssh_user': data['ssh_user'],
-        'ssh_key': ssh_key,
-        'created_at': datetime.now().isoformat(),
-        'updated_at': datetime.now().isoformat()
-    }
+        ssh_port = int(data.get('ssh_port', 22))
+        if not validate_port(ssh_port):
+            return jsonify({'error': 'Invalid SSH port (must be 1-65535)'}), 400
+
+        ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
+        if not validate_path(ssh_key):
+            return jsonify({'error': 'Invalid SSH key path'}), 400
+
+        new_server = {
+            'id': generate_id(),
+            'name': data['name'],
+            'host': data['host'],
+            'connection_type': 'ssh',
+            'ssh_port': ssh_port,
+            'ssh_user': data['ssh_user'],
+            'ssh_key': ssh_key,
+            'agent_port': None,
+            'agent_api_key': None,
+            'created_at': datetime.now().isoformat(),
+            'updated_at': datetime.now().isoformat()
+        }
+    elif connection_type == 'agent':
+        # Agent-specific validation
+        if not data.get('agent_api_key'):
+            return jsonify({'error': 'agent_api_key is required for agent connections'}), 400
+
+        agent_port = int(data.get('agent_port', 8090))
+        if not validate_port(agent_port):
+            return jsonify({'error': 'Invalid agent port (must be 1-65535)'}), 400
+
+        new_server = {
+            'id': generate_id(),
+            'name': data['name'],
+            'host': data['host'],
+            'connection_type': 'agent',
+            'ssh_port': None,
+            'ssh_user': None,
+            'ssh_key': None,
+            'agent_port': agent_port,
+            'agent_api_key': data['agent_api_key'],
+            'created_at': datetime.now().isoformat(),
+            'updated_at': datetime.now().isoformat()
+        }
+    else:
+        return jsonify({'error': 'Invalid connection_type. Must be "ssh" or "agent"'}), 400
 
     create_server(new_server)
 
-    return jsonify(new_server), 201
+    # Mask API key in response
+    response_server = {**new_server}
+    if response_server.get('agent_api_key'):
+        response_server['agent_api_key'] = '********'
+
+    return jsonify(response_server), 201
 
 
 @app.route('/api/servers/<server_id>', methods=['PUT'])
@@ -1831,16 +2263,35 @@ def api_update_server_route(server_id):
     if not server:
         return jsonify({'error': 'Server not found'}), 404
 
-    # Update fields
+    # Update common fields
     server['name'] = data.get('name', server['name'])
     server['host'] = data.get('host', server['host'])
-    server['ssh_port'] = int(data.get('ssh_port', server.get('ssh_port', 22)))
-    server['ssh_user'] = data.get('ssh_user', server['ssh_user'])
-    server['ssh_key'] = data.get('ssh_key', server.get('ssh_key', '/home/backupx/.ssh/id_rsa'))
+    server['connection_type'] = data.get('connection_type', server.get('connection_type', 'ssh'))
+
+    # Update type-specific fields
+    if server['connection_type'] == 'ssh':
+        server['ssh_port'] = int(data.get('ssh_port', server.get('ssh_port', 22)))
+        server['ssh_user'] = data.get('ssh_user', server.get('ssh_user'))
+        server['ssh_key'] = data.get('ssh_key', server.get('ssh_key', '/home/backupx/.ssh/id_rsa'))
+        server['agent_port'] = None
+        server['agent_api_key'] = None
+    elif server['connection_type'] == 'agent':
+        server['agent_port'] = int(data.get('agent_port', server.get('agent_port', 8090)))
+        # Only update API key if provided and not masked
+        if data.get('agent_api_key') and data.get('agent_api_key') != '********':
+            server['agent_api_key'] = data['agent_api_key']
+        server['ssh_port'] = None
+        server['ssh_user'] = None
+        server['ssh_key'] = None
 
     update_server_in_db(server_id, server)
 
-    return jsonify(server)
+    # Mask API key in response
+    response_server = {**server}
+    if response_server.get('agent_api_key'):
+        response_server['agent_api_key'] = '********'
+
+    return jsonify(response_server)
 
 
 @app.route('/api/servers/<server_id>', methods=['DELETE'])
@@ -1861,48 +2312,103 @@ def api_delete_server_route(server_id):
 @login_required
 @csrf.exempt
 def api_test_server_connection():
-    """Test SSH connection to server"""
+    """Test connection to server (SSH or Agent)"""
     data = request.get_json()
 
     if not data:
         return jsonify({'error': 'No data provided'}), 400
 
+    connection_type = data.get('connection_type', 'ssh')
     host = data.get('host', '')
-    ssh_port = int(data.get('ssh_port', 22))
-    ssh_user = data.get('ssh_user', '')
-    ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
 
-    if not all([host, ssh_user]):
-        return jsonify({'error': 'Missing required fields'}), 400
+    if not host:
+        return jsonify({'error': 'Host is required'}), 400
 
-    try:
+    if connection_type == 'ssh':
         # Test SSH connection
-        ssh_cmd = [
-            'ssh', '-i', ssh_key,
-            '-p', str(ssh_port),
-            '-o', 'StrictHostKeyChecking=no',
-            '-o', 'BatchMode=yes',
-            '-o', 'ConnectTimeout=10',
-            f'{ssh_user}@{host}',
-            'echo "Connection successful"'
-        ]
+        ssh_port = int(data.get('ssh_port', 22))
+        ssh_user = data.get('ssh_user', '')
+        ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
 
-        result = subprocess.run(
-            ssh_cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        if not ssh_user:
+            return jsonify({'error': 'SSH user is required'}), 400
 
-        if result.returncode == 0:
-            return jsonify({'success': True, 'message': 'Connection successful'})
-        else:
-            return jsonify({'error': result.stderr or 'Connection failed'}), 400
+        try:
+            ssh_cmd = [
+                'ssh', '-i', ssh_key,
+                '-p', str(ssh_port),
+                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', 'BatchMode=yes',
+                '-o', 'ConnectTimeout=10',
+                f'{ssh_user}@{host}',
+                'echo "Connection successful"'
+            ]
 
-    except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Connection timed out'}), 400
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+            result = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode == 0:
+                return jsonify({'success': True, 'message': 'SSH connection successful'})
+            else:
+                return jsonify({'error': result.stderr or 'SSH connection failed'}), 400
+
+        except subprocess.TimeoutExpired:
+            return jsonify({'error': 'SSH connection timed out'}), 400
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    elif connection_type == 'agent':
+        # Test Agent connection
+        agent_port = int(data.get('agent_port', 8090))
+        agent_api_key = data.get('agent_api_key', '')
+
+        if not agent_api_key:
+            return jsonify({'error': 'Agent API key is required'}), 400
+
+        try:
+            # Call the agent's /health endpoint first (no auth required)
+            health_url = f'http://{host}:{agent_port}/health'
+            health_req = Request(health_url, method='GET')
+            health_req.add_header('Content-Type', 'application/json')
+
+            try:
+                with urlopen(health_req, timeout=10) as response:
+                    if response.status != 200:
+                        return jsonify({'error': 'Agent health check failed'}), 400
+            except (URLError, HTTPError) as e:
+                return jsonify({'error': f'Cannot reach agent: {str(e)}'}), 400
+
+            # Now test with API key via /info endpoint
+            info_url = f'http://{host}:{agent_port}/info'
+            info_req = Request(info_url, method='GET')
+            info_req.add_header('Content-Type', 'application/json')
+            info_req.add_header('X-API-Key', agent_api_key)
+
+            try:
+                with urlopen(info_req, timeout=10) as response:
+                    if response.status == 200:
+                        info_data = json.loads(response.read().decode('utf-8'))
+                        agent_name = info_data.get('agent_name', 'Unknown')
+                        return jsonify({
+                            'success': True,
+                            'message': f'Agent connection successful (Agent: {agent_name})'
+                        })
+                    else:
+                        return jsonify({'error': 'Agent authentication failed'}), 400
+            except HTTPError as e:
+                if e.code == 401:
+                    return jsonify({'error': 'Invalid API key'}), 400
+                return jsonify({'error': f'Agent request failed: {str(e)}'}), 400
+
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    else:
+        return jsonify({'error': 'Invalid connection_type'}), 400
 
 
 # Database Configuration API Routes
@@ -2045,7 +2551,7 @@ def api_test_db_connection():
         ssh_cmd = [
             'ssh', '-i', server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
             '-p', str(server.get('ssh_port', 22)),
-            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'StrictHostKeyChecking=accept-new',
             '-o', 'BatchMode=yes',
             '-o', 'ConnectTimeout=10',
             f"{server['ssh_user']}@{server['host']}",
@@ -2206,6 +2712,150 @@ def api_test_notification():
         return jsonify({'error': str(e)}), 500
 
 
+# =============================================================================
+# Audit Log API Endpoints
+# =============================================================================
+
+@app.route('/api/audit', methods=['GET'])
+@login_required
+def api_get_audit_logs():
+    """Get audit log entries with filtering and pagination"""
+    try:
+        from .audit import get_audit_logger
+        audit_logger = get_audit_logger()
+
+        if not audit_logger:
+            return jsonify({'error': 'Audit logging not initialized'}), 500
+
+        # Parse query parameters
+        limit = min(int(request.args.get('limit', 50)), 500)
+        offset = int(request.args.get('offset', 0))
+        user_id = request.args.get('user_id')
+        action = request.args.get('action')
+        resource_type = request.args.get('resource_type')
+        resource_id = request.args.get('resource_id')
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+        status = request.args.get('status')
+
+        # Get logs and count
+        logs = audit_logger.get_logs(
+            limit=limit,
+            offset=offset,
+            user_id=user_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            start_date=start_date,
+            end_date=end_date,
+            status=status
+        )
+
+        total = audit_logger.get_log_count(
+            user_id=user_id,
+            action=action,
+            resource_type=resource_type,
+            start_date=start_date,
+            end_date=end_date,
+            status=status
+        )
+
+        return jsonify({
+            'logs': logs,
+            'total': total,
+            'limit': limit,
+            'offset': offset
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching audit logs: {e}")
+        return jsonify({'error': 'Failed to fetch audit logs'}), 500
+
+
+@app.route('/api/audit/export', methods=['GET'])
+@login_required
+def api_export_audit_logs():
+    """Export audit logs as JSON or CSV"""
+    try:
+        from .audit import get_audit_logger
+        audit_logger = get_audit_logger()
+
+        if not audit_logger:
+            return jsonify({'error': 'Audit logging not initialized'}), 500
+
+        format_type = request.args.get('format', 'json').lower()
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+
+        data = audit_logger.export(
+            start_date=start_date,
+            end_date=end_date,
+            format=format_type
+        )
+
+        if format_type == 'csv':
+            from flask import Response
+            return Response(
+                data,
+                mimetype='text/csv',
+                headers={'Content-Disposition': 'attachment; filename=audit_log.csv'}
+            )
+        else:
+            return Response(
+                data,
+                mimetype='application/json',
+                headers={'Content-Disposition': 'attachment; filename=audit_log.json'}
+            )
+
+    except Exception as e:
+        logger.error(f"Error exporting audit logs: {e}")
+        return jsonify({'error': 'Failed to export audit logs'}), 500
+
+
+@app.route('/api/audit/stats', methods=['GET'])
+@login_required
+def api_audit_stats():
+    """Get audit log statistics"""
+    try:
+        from .audit import get_audit_logger
+        audit_logger = get_audit_logger()
+
+        if not audit_logger:
+            return jsonify({'error': 'Audit logging not initialized'}), 500
+
+        # Get counts by action type
+        stats = {
+            'total': audit_logger.get_log_count(),
+            'by_action': {},
+            'by_status': {},
+            'by_resource_type': {}
+        }
+
+        # Count by action
+        for action in ['CREATE', 'UPDATE', 'DELETE', 'LOGIN', 'LOGIN_FAILED', 'LOGOUT', 'RUN_BACKUP']:
+            count = audit_logger.get_log_count(action=action)
+            if count > 0:
+                stats['by_action'][action] = count
+
+        # Count by status
+        for status in ['success', 'failure']:
+            count = audit_logger.get_log_count(status=status)
+            if count > 0:
+                stats['by_status'][status] = count
+
+        # Count by resource type
+        for resource_type in ['job', 'server', 's3_config', 'db_config', 'notification_channel', 'session']:
+            count = audit_logger.get_log_count(resource_type=resource_type)
+            if count > 0:
+                stats['by_resource_type'][resource_type] = count
+
+        return jsonify(stats)
+
+    except Exception as e:
+        logger.error(f"Error getting audit stats: {e}")
+        return jsonify({'error': 'Failed to get audit statistics'}), 500
+
+
 # Serve React frontend
 @app.route('/assets/<path:filename>')
 def serve_assets(filename):
@@ -2245,9 +2895,55 @@ def init_schedules():
 def init_app():
     """Initialize the application"""
     logger.info("Initializing BackupX application...")
+
+    # Initialize database
     init_db()
     migrate_json_to_sqlite()
+
+    # Initialize audit logging
+    try:
+        from .audit.logger import init_audit_logger
+        from .db import get_database
+        # Use a simple wrapper to make db compatible with audit logger
+        class DBWrapper:
+            def execute(self, query, params=None):
+                conn = get_db_connection()
+                if params:
+                    conn.execute(query, params)
+                else:
+                    conn.execute(query)
+                conn.commit()
+                conn.close()
+            def commit(self):
+                pass  # Handled in execute
+            def fetchall(self, query, params=None):
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                rows = cursor.fetchall()
+                conn.close()
+                return [dict(row) for row in rows]
+            def fetchone(self, query, params=None):
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                if params:
+                    cursor.execute(query, params)
+                else:
+                    cursor.execute(query)
+                row = cursor.fetchone()
+                conn.close()
+                return dict(row) if row else None
+        init_audit_logger(DBWrapper())
+        logger.info("Audit logging initialized")
+    except Exception as e:
+        logger.warning(f"Audit logging not available: {e}")
+
+    # Initialize schedules
     init_schedules()
+
     logger.info("BackupX application initialized successfully")
 
 

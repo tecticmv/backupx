@@ -51,9 +51,12 @@ const initialS3FormData: S3ConfigFormData = {
 const initialServerFormData: ServerFormData = {
   name: "",
   host: "",
+  connection_type: "ssh",
   ssh_port: 22,
   ssh_user: "root",
-  ssh_key: "/root/.ssh/id_rsa",
+  ssh_key: "/home/backupx/.ssh/id_rsa",
+  agent_port: 8090,
+  agent_api_key: "",
 };
 
 export default function Settings() {
@@ -266,9 +269,12 @@ export default function Settings() {
     setServerFormData({
       name: server.name,
       host: server.host,
-      ssh_port: server.ssh_port,
-      ssh_user: server.ssh_user,
-      ssh_key: server.ssh_key,
+      connection_type: server.connection_type || 'ssh',
+      ssh_port: server.ssh_port || 22,
+      ssh_user: server.ssh_user || 'root',
+      ssh_key: server.ssh_key || '/home/backupx/.ssh/id_rsa',
+      agent_port: server.agent_port || 8090,
+      agent_api_key: server.agent_api_key || '',
     });
     setIsServerDialogOpen(true);
   };

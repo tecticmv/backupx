@@ -12,6 +12,7 @@ import Servers from "@/pages/Servers";
 import Databases from "@/pages/Databases";
 import Storage from "@/pages/Storage";
 import Notifications from "@/pages/Notifications";
+import AuditLog from "@/pages/AuditLog";
 import { Loader2 } from "lucide-react";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -105,6 +106,14 @@ function AppRoutes() {
           element={
             <ProtectedRoute>
               <Notifications />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/audit"
+          element={
+            <ProtectedRoute>
+              <AuditLog />
             </ProtectedRoute>
           }
         />

@@ -1,9 +1,0 @@
-flask==3.0.0
-flask-login==0.6.3
-flask-wtf==1.2.1
-werkzeug==3.0.1
-apscheduler==3.10.4
-python-dotenv==1.0.0
-pyyaml==6.0.1
-humanize==4.9.0
-gunicorn==21.2.0

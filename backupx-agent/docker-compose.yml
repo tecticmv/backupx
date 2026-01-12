@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  backupx-agent:
+    build: .
+    container_name: backupx-agent
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      # Mount directories you want to backup (read-only for safety)
+      - /var/www:/var/www:ro
+      - /home:/home:ro
+      - /etc:/etc:ro
+      # Add more paths as needed
+      # - /path/to/backup:/path/to/backup:ro
+    environment:
+      # REQUIRED: Generate with: openssl rand -hex 32
+      - AGENT_API_KEY=${AGENT_API_KEY}
+      # Agent name (shown in BackupX UI)
+      - AGENT_NAME=${AGENT_NAME:-backupx-agent}
+      # Port to listen on
+      - AGENT_PORT=8090
+      # Logging level
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Optional: Restrict which paths can be backed up (comma-separated)
+      # Leave empty to allow all mounted paths
+      - ALLOWED_PATHS=${ALLOWED_PATHS:-}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
