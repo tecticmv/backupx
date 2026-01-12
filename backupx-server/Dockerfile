@@ -1,3 +1,21 @@
+# Stage 1: Build frontend
+FROM node:20-slim AS frontend-builder
+
+WORKDIR /app/frontend
+
+# Copy frontend package files
+COPY frontend/package*.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy frontend source
+COPY frontend/ ./
+
+# Build frontend
+RUN npm run build
+
+# Stage 2: Python application
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -23,8 +41,8 @@ COPY app/ ./app/
 COPY templates/ ./templates/
 COPY static/ ./static/
 
-# Copy React frontend build
-COPY frontend/dist/ ./frontend/dist/
+# Copy React frontend build from builder stage
+COPY --from=frontend-builder /app/frontend/dist/ ./frontend/dist/
 
 # Create directories with proper ownership
 RUN mkdir -p /app/config /app/logs /app/data /home/backupx/.ssh \
