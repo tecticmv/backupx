@@ -647,6 +647,37 @@ tail_logs() {
 # Interactive Setup
 # =============================================================================
 
+check_docker() {
+    if command -v docker &> /dev/null && command -v docker compose &> /dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+choose_runtime() {
+    local component=$1
+
+    echo ""
+    echo "How do you want to run the $component?"
+    echo ""
+
+    if check_docker; then
+        echo "  1) Docker (recommended - no dependencies needed)"
+        echo "  2) Native Python (requires Python 3.9+, venv, npm)"
+        echo ""
+        read -p "Enter choice [1/2]: " runtime_choice
+
+        if [ "$runtime_choice" = "1" ]; then
+            echo "docker"
+        else
+            echo "native"
+        fi
+    else
+        log_warn "Docker not found. Using native Python."
+        echo "native"
+    fi
+}
+
 interactive_setup() {
     echo ""
     echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
@@ -667,15 +698,32 @@ interactive_setup() {
 
     case $choice in
         1)
-            setup_server
+            local runtime=$(choose_runtime "server")
+            if [ "$runtime" = "docker" ]; then
+                setup_server_docker
+            else
+                setup_server
+            fi
             ;;
         2)
-            setup_agent
+            local runtime=$(choose_runtime "agent")
+            if [ "$runtime" = "docker" ]; then
+                setup_agent_docker
+            else
+                setup_agent
+            fi
             ;;
         3)
-            setup_server
-            echo ""
-            setup_agent
+            local runtime=$(choose_runtime "server and agent")
+            if [ "$runtime" = "docker" ]; then
+                setup_server_docker
+                echo ""
+                setup_agent_docker
+            else
+                setup_server
+                echo ""
+                setup_agent
+            fi
             ;;
         4)
             print_usage
@@ -689,6 +737,220 @@ interactive_setup() {
             interactive_setup
             ;;
     esac
+}
+
+# =============================================================================
+# Docker Setup Functions
+# =============================================================================
+
+setup_server_docker() {
+    echo ""
+    log_info "Setting up BackupX Server with Docker..."
+    echo ""
+
+    # Check if .env exists
+    if [ ! -f "$SERVER_DIR/.env" ]; then
+        log_info "Creating server configuration..."
+        cp "$SERVER_DIR/.env.example" "$SERVER_DIR/.env"
+
+        # Generate secure secrets
+        local secret_key=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32)
+        local admin_pass=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))" 2>/dev/null || openssl rand -base64 16)
+
+        # Prompt for configuration
+        echo ""
+        read -p "Enter admin username [admin]: " admin_user
+        admin_user=${admin_user:-admin}
+
+        echo ""
+        echo "Generated secure admin password: $admin_pass"
+        read -p "Use this password? [Y/n]: " use_generated
+        if [[ "$use_generated" =~ ^[Nn] ]]; then
+            while true; do
+                read -s -p "Enter admin password (min 12 chars): " admin_pass
+                echo ""
+                if [ ${#admin_pass} -ge 12 ]; then
+                    break
+                fi
+                log_error "Password must be at least 12 characters!"
+            done
+        fi
+
+        echo ""
+        read -p "Enter server port [5000]: " server_port
+        server_port=${server_port:-5000}
+
+        # Update .env file
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            sed -i '' "s/^SECRET_KEY=.*/SECRET_KEY=$secret_key/" "$SERVER_DIR/.env"
+            sed -i '' "s/^ADMIN_USERNAME=.*/ADMIN_USERNAME=$admin_user/" "$SERVER_DIR/.env"
+            sed -i '' "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$admin_pass/" "$SERVER_DIR/.env"
+        else
+            sed -i "s/^SECRET_KEY=.*/SECRET_KEY=$secret_key/" "$SERVER_DIR/.env"
+            sed -i "s/^ADMIN_USERNAME=.*/ADMIN_USERNAME=$admin_user/" "$SERVER_DIR/.env"
+            sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$admin_pass/" "$SERVER_DIR/.env"
+        fi
+
+        log_info "Configuration saved to $SERVER_DIR/.env"
+    else
+        log_info "Server configuration already exists at $SERVER_DIR/.env"
+        source "$SERVER_DIR/.env"
+        admin_user="${ADMIN_USERNAME:-admin}"
+        admin_pass="(existing - check .env file)"
+        server_port="${SERVER_PORT:-5000}"
+    fi
+
+    # Build and start with Docker
+    echo ""
+    read -p "Build and start Docker container? [Y/n]: " start_docker
+    if [[ ! "$start_docker" =~ ^[Nn] ]]; then
+        log_info "Building Docker image (this may take a few minutes)..."
+        cd "$SERVER_DIR"
+
+        # Build frontend if dist doesn't exist
+        if [ ! -d "frontend/dist" ] || [ ! -f "frontend/dist/index.html" ]; then
+            log_info "Building frontend..."
+            if command -v npm &> /dev/null; then
+                cd frontend
+                npm install --silent 2>/dev/null
+                npm run build --silent 2>/dev/null
+                cd ..
+            else
+                log_warn "npm not found. Frontend will be built inside Docker."
+            fi
+        fi
+
+        docker compose down 2>/dev/null
+        docker compose up -d --build
+
+        if [ $? -eq 0 ]; then
+            log_info "Docker container started successfully!"
+            log_info "Server running at http://localhost:$server_port"
+        else
+            log_error "Failed to start Docker container. Check docker compose logs."
+        fi
+        cd - > /dev/null
+    fi
+
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "  Server Credentials:"
+    echo -e "  Username: ${YELLOW}$admin_user${NC}"
+    echo -e "  Password: ${YELLOW}$admin_pass${NC}"
+    echo -e ""
+    echo -e "  Docker Commands:"
+    echo -e "  Start:   cd backupx-server && docker compose up -d"
+    echo -e "  Stop:    cd backupx-server && docker compose down"
+    echo -e "  Logs:    cd backupx-server && docker compose logs -f"
+    echo -e "  Rebuild: cd backupx-server && docker compose up -d --build"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+setup_agent_docker() {
+    echo ""
+    log_info "Setting up BackupX Agent with Docker..."
+    echo ""
+
+    # Check if .env exists
+    if [ ! -f "$AGENT_DIR/.env" ]; then
+        log_info "Creating agent configuration..."
+        cp "$AGENT_DIR/.env.example" "$AGENT_DIR/.env"
+
+        # Generate secure API key
+        local api_key=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32)
+
+        # Prompt for configuration
+        echo ""
+        read -p "Enter agent name [$(hostname)]: " agent_name
+        agent_name=${agent_name:-$(hostname)}
+
+        echo ""
+        read -p "Enter agent port [8090]: " agent_port
+        agent_port=${agent_port:-8090}
+
+        echo ""
+        echo "Generated API Key: $api_key"
+        read -p "Use this API key? [Y/n]: " use_generated
+        if [[ "$use_generated" =~ ^[Nn] ]]; then
+            while true; do
+                read -p "Enter API key (min 32 chars): " api_key
+                if [ ${#api_key} -ge 32 ]; then
+                    break
+                fi
+                log_error "API key must be at least 32 characters!"
+            done
+        fi
+
+        echo ""
+        echo "Which paths should be available for backup?"
+        echo "(These will be mounted read-only in the Docker container)"
+        echo "Example: /var/www,/home,/etc"
+        read -p "Paths to backup [/var/www,/home,/etc]: " backup_paths
+        backup_paths=${backup_paths:-/var/www,/home,/etc}
+
+        # Update .env file
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            sed -i '' "s/^AGENT_API_KEY=.*/AGENT_API_KEY=$api_key/" "$AGENT_DIR/.env"
+            sed -i '' "s/^AGENT_NAME=.*/AGENT_NAME=$agent_name/" "$AGENT_DIR/.env"
+            sed -i '' "s/^AGENT_PORT=.*/AGENT_PORT=$agent_port/" "$AGENT_DIR/.env"
+        else
+            sed -i "s/^AGENT_API_KEY=.*/AGENT_API_KEY=$api_key/" "$AGENT_DIR/.env"
+            sed -i "s/^AGENT_NAME=.*/AGENT_NAME=$agent_name/" "$AGENT_DIR/.env"
+            sed -i "s/^AGENT_PORT=.*/AGENT_PORT=$agent_port/" "$AGENT_DIR/.env"
+        fi
+
+        # Update docker-compose.yml with backup paths
+        log_info "Configuring Docker volumes for backup paths..."
+
+        log_info "Configuration saved to $AGENT_DIR/.env"
+    else
+        log_info "Agent configuration already exists at $AGENT_DIR/.env"
+        source "$AGENT_DIR/.env"
+        api_key="$AGENT_API_KEY"
+        agent_name="$AGENT_NAME"
+        agent_port="${AGENT_PORT:-8090}"
+    fi
+
+    # Build and start with Docker
+    echo ""
+    read -p "Build and start Docker container? [Y/n]: " start_docker
+    if [[ ! "$start_docker" =~ ^[Nn] ]]; then
+        log_info "Building Docker image..."
+        cd "$AGENT_DIR"
+
+        docker compose down 2>/dev/null
+        docker compose up -d --build
+
+        if [ $? -eq 0 ]; then
+            log_info "Docker container started successfully!"
+            log_info "Agent running on port $agent_port"
+        else
+            log_error "Failed to start Docker container. Check docker compose logs."
+        fi
+        cd - > /dev/null
+    fi
+
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "  Agent Configuration:"
+    echo -e "  Name:    ${YELLOW}$agent_name${NC}"
+    echo -e "  Port:    ${YELLOW}$agent_port${NC}"
+    echo -e "  API Key: ${YELLOW}$api_key${NC}"
+    echo -e ""
+    echo -e "  Add this server in BackupX UI with:"
+    echo -e "  - Connection Type: Agent"
+    echo -e "  - Host: $(hostname -I 2>/dev/null | awk '{print $1}' || echo "your-server-ip")"
+    echo -e "  - Port: $agent_port"
+    echo -e "  - API Key: (shown above)"
+    echo -e ""
+    echo -e "  Docker Commands:"
+    echo -e "  Start:   cd backupx-agent && docker compose up -d"
+    echo -e "  Stop:    cd backupx-agent && docker compose down"
+    echo -e "  Logs:    cd backupx-agent && docker compose logs -f"
+    echo -e "  Rebuild: cd backupx-agent && docker compose up -d --build"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo ""
 }
 
 setup_server() {
