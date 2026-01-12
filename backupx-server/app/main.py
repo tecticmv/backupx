@@ -354,6 +354,7 @@ def init_db():
             access_key TEXT NOT NULL,
             secret_key TEXT NOT NULL,
             region TEXT DEFAULT '',
+            skip_ssl_verify INTEGER DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT
         );
@@ -544,10 +545,10 @@ def migrate_json_to_sqlite():
                 configs = json.load(f)
             for c in configs:
                 conn.execute('''
-                    INSERT INTO s3_configs (id, name, endpoint, bucket, access_key, secret_key, region, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO s3_configs (id, name, endpoint, bucket, access_key, secret_key, region, skip_ssl_verify, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (c['id'], c['name'], c['endpoint'], c['bucket'], c['access_key'], c['secret_key'],
-                      c.get('region', ''), c.get('created_at', datetime.now().isoformat()), c.get('updated_at')))
+                      c.get('region', ''), c.get('skip_ssl_verify', 0), c.get('created_at', datetime.now().isoformat()), c.get('updated_at')))
             logger.info(f"  Migrated {len(configs)} S3 configs")
         except Exception as e:
             logger.error(f"  Error migrating S3 configs: {e}")
@@ -789,6 +790,7 @@ def _decrypt_s3_config(config):
     if config:
         config['access_key'] = decrypt_credential(config.get('access_key', ''))
         config['secret_key'] = decrypt_credential(config.get('secret_key', ''))
+        config['skip_ssl_verify'] = bool(config.get('skip_ssl_verify', 0))
     return config
 
 
@@ -812,12 +814,12 @@ def create_s3_config(config):
     """Create a new S3 config"""
     conn = get_db_connection()
     conn.execute('''
-        INSERT INTO s3_configs (id, name, endpoint, bucket, access_key, secret_key, region, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO s3_configs (id, name, endpoint, bucket, access_key, secret_key, region, skip_ssl_verify, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (config['id'], config['name'], config['endpoint'], config['bucket'],
           encrypt_credential(config['access_key']), encrypt_credential(config['secret_key']),
-          config.get('region', ''), config.get('created_at', datetime.now().isoformat()),
-          config.get('updated_at')))
+          config.get('region', ''), 1 if config.get('skip_ssl_verify') else 0,
+          config.get('created_at', datetime.now().isoformat()), config.get('updated_at')))
     conn.commit()
     conn.close()
 
@@ -826,11 +828,12 @@ def update_s3_config(config_id, config):
     """Update an S3 config"""
     conn = get_db_connection()
     conn.execute('''
-        UPDATE s3_configs SET name=?, endpoint=?, bucket=?, access_key=?, secret_key=?, region=?, updated_at=?
+        UPDATE s3_configs SET name=?, endpoint=?, bucket=?, access_key=?, secret_key=?, region=?, skip_ssl_verify=?, updated_at=?
         WHERE id=?
     ''', (config['name'], config['endpoint'], config['bucket'],
           encrypt_credential(config['access_key']), encrypt_credential(config['secret_key']),
-          config.get('region', ''), datetime.now().isoformat(), config_id))
+          config.get('region', ''), 1 if config.get('skip_ssl_verify') else 0,
+          datetime.now().isoformat(), config_id))
     conn.commit()
     conn.close()
 
@@ -1333,12 +1336,13 @@ def run_filesystem_backup(job_id, job):
         ]
 
         # Build remote command with proper escaping
+        insecure_flag = '--insecure-tls' if job.get('skip_ssl_verify') else ''
         remote_cmd = f"""
 export AWS_ACCESS_KEY_ID={s3_access_key}
 export AWS_SECRET_ACCESS_KEY={s3_secret_key}
 export RESTIC_PASSWORD={restic_password}
 export RESTIC_REPOSITORY="s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
-restic backup --compression auto --tag automated {' '.join(exclude_args)} {directories}
+restic backup --compression auto --tag automated {insecure_flag} {' '.join(exclude_args)} {directories}
 """
 
         # Execute
@@ -1432,6 +1436,7 @@ def run_database_backup(job_id, job):
         db_pass = shlex.quote(db_config['password'])
 
         # Build remote command with proper escaping
+        insecure_flag = '--insecure-tls' if job.get('skip_ssl_verify') else ''
         remote_cmd = f"""
 export AWS_ACCESS_KEY_ID={s3_access_key}
 export AWS_SECRET_ACCESS_KEY={s3_secret_key}
@@ -1452,7 +1457,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # Backup to restic repository
-restic backup --compression auto --tag automated --tag mysql-backup "$BACKUP_FILE"
+restic backup --compression auto --tag automated --tag mysql-backup {insecure_flag} "$BACKUP_FILE"
 RESTIC_EXIT=$?
 
 # Cleanup
@@ -1521,7 +1526,8 @@ def run_agent_filesystem_backup(job_id, job, server):
             'restic_password': job['restic_password'],
             'backup_prefix': job.get('backup_prefix', job_id),
             'directories': job.get('directories', []),
-            'excludes': job.get('excludes', [])
+            'excludes': job.get('excludes', []),
+            'skip_ssl_verify': job.get('skip_ssl_verify', False)
         }
 
         data = json.dumps(payload).encode('utf-8')
@@ -1604,7 +1610,8 @@ def run_agent_database_backup(job_id, job, server):
             'db_port': db_config.get('port', 3306),
             'db_user': db_config['username'],
             'db_password': db_config['password'],
-            'databases': db_config.get('databases', '*')
+            'databases': db_config.get('databases', '*'),
+            'skip_ssl_verify': job.get('skip_ssl_verify', False)
         }
 
         data = json.dumps(payload).encode('utf-8')
@@ -1845,6 +1852,7 @@ def api_create_job():
         's3_bucket': s3_config['bucket'] if s3_config else data.get('s3_bucket'),
         's3_access_key': s3_config['access_key'] if s3_config else data.get('s3_access_key'),
         's3_secret_key': s3_config['secret_key'] if s3_config else data.get('s3_secret_key'),
+        'skip_ssl_verify': s3_config.get('skip_ssl_verify', False) if s3_config else data.get('skip_ssl_verify', False),
         # Filesystem backup fields
         'directories': data.get('directories', []),
         'excludes': data.get('excludes', []),
@@ -1914,6 +1922,7 @@ def api_update_job(job_id):
         's3_endpoint': s3_config['endpoint'] if s3_config else job.get('s3_endpoint'),
         's3_bucket': s3_config['bucket'] if s3_config else job.get('s3_bucket'),
         's3_access_key': s3_config['access_key'] if s3_config else job.get('s3_access_key'),
+        'skip_ssl_verify': s3_config.get('skip_ssl_verify', False) if s3_config else job.get('skip_ssl_verify', False),
         # Filesystem backup fields
         'directories': data.get('directories', job.get('directories', [])),
         'excludes': data.get('excludes', job.get('excludes', [])),
@@ -2043,6 +2052,7 @@ def api_create_s3_config_route():
         'access_key': data['access_key'],
         'secret_key': data['secret_key'],
         'region': data.get('region', ''),
+        'skip_ssl_verify': data.get('skip_ssl_verify', False),
         'created_at': datetime.now().isoformat(),
         'updated_at': datetime.now().isoformat()
     }
@@ -2075,6 +2085,7 @@ def api_update_s3_config_route(config_id):
     config['bucket'] = data.get('bucket', config['bucket'])
     config['access_key'] = data.get('access_key', config['access_key'])
     config['region'] = data.get('region', config.get('region', ''))
+    config['skip_ssl_verify'] = data.get('skip_ssl_verify', config.get('skip_ssl_verify', False))
 
     # Only update secret_key if provided and not empty
     if data.get('secret_key'):
@@ -2117,6 +2128,7 @@ def api_test_s3_connection():
     access_key = data.get('access_key', '')
     secret_key = data.get('secret_key', '')
     region = data.get('region', 'us-east-1')
+    skip_ssl_verify = data.get('skip_ssl_verify', False)
 
     if not all([endpoint, bucket, access_key, secret_key]):
         return jsonify({'error': 'Missing required fields'}), 400
@@ -2131,8 +2143,13 @@ def api_test_s3_connection():
         env['RCLONE_CONFIG_TEST_ENDPOINT'] = f'https://{endpoint}'
         env['RCLONE_CONFIG_TEST_REGION'] = region
 
+        # Build command with optional SSL skip
+        cmd = ['rclone', 'lsd', f'test:{bucket}', '--max-depth', '1']
+        if skip_ssl_verify:
+            cmd.append('--no-check-certificate')
+
         result = subprocess.run(
-            ['rclone', 'lsd', f'test:{bucket}', '--max-depth', '1'],
+            cmd,
             capture_output=True,
             text=True,
             env=env,

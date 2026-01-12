@@ -183,6 +183,10 @@ def backup_filesystem():
         # Build restic command
         cmd = ['restic', 'backup', '--compression', 'auto', '--tag', 'automated', '--json']
 
+        # Add insecure TLS flag if skip_ssl_verify is enabled
+        if data.get('skip_ssl_verify'):
+            cmd.append('--insecure-tls')
+
         for exclude in excludes:
             cmd.extend(['--exclude', exclude])
 
@@ -331,7 +335,13 @@ def backup_database():
             raise
 
         # Backup to restic
-        restic_cmd = ['restic', 'backup', '--compression', 'auto', '--tag', 'automated', '--tag', 'mysql-backup', '--json', backup_file]
+        restic_cmd = ['restic', 'backup', '--compression', 'auto', '--tag', 'automated', '--tag', 'mysql-backup', '--json']
+
+        # Add insecure TLS flag if skip_ssl_verify is enabled
+        if data.get('skip_ssl_verify'):
+            restic_cmd.append('--insecure-tls')
+
+        restic_cmd.append(backup_file)
 
         restic_result = subprocess.run(
             restic_cmd,
@@ -394,8 +404,12 @@ def list_snapshots():
         env['RESTIC_PASSWORD'] = data['restic_password']
         env['RESTIC_REPOSITORY'] = f"s3:https://{data['s3_endpoint']}/{data['s3_bucket']}/{data['backup_prefix']}"
 
+        cmd = ['restic', 'snapshots', '--json']
+        if data.get('skip_ssl_verify'):
+            cmd.append('--insecure-tls')
+
         result = subprocess.run(
-            ['restic', 'snapshots', '--json'],
+            cmd,
             capture_output=True,
             text=True,
             env=env,
@@ -433,8 +447,12 @@ def repo_stats():
         env['RESTIC_PASSWORD'] = data['restic_password']
         env['RESTIC_REPOSITORY'] = f"s3:https://{data['s3_endpoint']}/{data['s3_bucket']}/{data['backup_prefix']}"
 
+        cmd = ['restic', 'stats', '--json']
+        if data.get('skip_ssl_verify'):
+            cmd.append('--insecure-tls')
+
         result = subprocess.run(
-            ['restic', 'stats', '--json'],
+            cmd,
             capture_output=True,
             text=True,
             env=env,
@@ -472,8 +490,12 @@ def init_repo():
         env['RESTIC_PASSWORD'] = data['restic_password']
         env['RESTIC_REPOSITORY'] = f"s3:https://{data['s3_endpoint']}/{data['s3_bucket']}/{data['backup_prefix']}"
 
+        cmd = ['restic', 'init']
+        if data.get('skip_ssl_verify'):
+            cmd.append('--insecure-tls')
+
         result = subprocess.run(
-            ['restic', 'init'],
+            cmd,
             capture_output=True,
             text=True,
             env=env,

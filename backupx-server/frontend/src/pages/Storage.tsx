@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -44,6 +45,7 @@ const initialFormData: S3ConfigFormData = {
   access_key: "",
   secret_key: "",
   region: "",
+  skip_ssl_verify: false,
 };
 
 export default function Storage() {
@@ -126,6 +128,7 @@ export default function Storage() {
       access_key: config.access_key,
       secret_key: "",
       region: config.region || "",
+      skip_ssl_verify: config.skip_ssl_verify || false,
     });
     setIsDialogOpen(true);
   };
@@ -379,6 +382,21 @@ export default function Storage() {
                   value={formData.secret_key}
                   onChange={handleInputChange}
                   required={!editingConfig}
+                />
+              </div>
+              <div className="flex items-center justify-between rounded-lg border p-3">
+                <div className="space-y-0.5">
+                  <Label htmlFor="skip_ssl_verify">Skip SSL Verification</Label>
+                  <p className="text-xs text-muted-foreground">
+                    Enable for self-signed certificates (less secure)
+                  </p>
+                </div>
+                <Switch
+                  id="skip_ssl_verify"
+                  checked={formData.skip_ssl_verify || false}
+                  onCheckedChange={(checked) =>
+                    setFormData((prev) => ({ ...prev, skip_ssl_verify: checked }))
+                  }
                 />
               </div>
             </div>
