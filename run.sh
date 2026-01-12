@@ -657,14 +657,14 @@ check_docker() {
 choose_runtime() {
     local component=$1
 
-    echo ""
-    echo "How do you want to run the $component?"
-    echo ""
+    echo "" >&2
+    echo "How do you want to run the $component?" >&2
+    echo "" >&2
 
     if check_docker; then
-        echo "  1) Docker (recommended - no dependencies needed)"
-        echo "  2) Native Python (requires Python 3.9+, venv, npm)"
-        echo ""
+        echo "  1) Docker (recommended - no dependencies needed)" >&2
+        echo "  2) Native Python (requires Python 3.9+, venv, npm)" >&2
+        echo "" >&2
         read -p "Enter choice [1/2]: " runtime_choice
 
         if [ "$runtime_choice" = "1" ]; then
@@ -673,7 +673,7 @@ choose_runtime() {
             echo "native"
         fi
     else
-        log_warn "Docker not found. Using native Python."
+        log_warn "Docker not found. Using native Python." >&2
         echo "native"
     fi
 }
