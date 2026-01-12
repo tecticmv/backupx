@@ -644,12 +644,305 @@ tail_logs() {
 }
 
 # =============================================================================
+# Interactive Setup
+# =============================================================================
+
+interactive_setup() {
+    echo ""
+    echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║                                                            ║${NC}"
+    echo -e "${GREEN}║              Welcome to BackupX Setup!                     ║${NC}"
+    echo -e "${GREEN}║                                                            ║${NC}"
+    echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo "What would you like to set up?"
+    echo ""
+    echo "  1) Server    - Web UI + API (for managing backups)"
+    echo "  2) Agent     - Remote backup service (runs on servers to backup)"
+    echo "  3) Both      - Install both server and agent"
+    echo "  4) Help      - Show all available commands"
+    echo "  5) Exit"
+    echo ""
+    read -p "Enter choice [1-5]: " choice
+
+    case $choice in
+        1)
+            setup_server
+            ;;
+        2)
+            setup_agent
+            ;;
+        3)
+            setup_server
+            echo ""
+            setup_agent
+            ;;
+        4)
+            print_usage
+            ;;
+        5)
+            echo "Goodbye!"
+            exit 0
+            ;;
+        *)
+            log_error "Invalid choice. Please enter 1-5."
+            interactive_setup
+            ;;
+    esac
+}
+
+setup_server() {
+    echo ""
+    log_info "Setting up BackupX Server..."
+    echo ""
+
+    # Check if .env exists
+    if [ ! -f "$SERVER_DIR/.env" ]; then
+        log_info "Creating server configuration..."
+        cp "$SERVER_DIR/.env.example" "$SERVER_DIR/.env"
+
+        # Generate secure secrets
+        local secret_key=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+        local admin_pass=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))")
+
+        # Prompt for configuration
+        echo ""
+        read -p "Enter admin username [admin]: " admin_user
+        admin_user=${admin_user:-admin}
+
+        echo ""
+        echo "Generated secure admin password: $admin_pass"
+        read -p "Use this password? [Y/n]: " use_generated
+        if [[ "$use_generated" =~ ^[Nn] ]]; then
+            while true; do
+                read -s -p "Enter admin password (min 12 chars): " admin_pass
+                echo ""
+                if [ ${#admin_pass} -ge 12 ]; then
+                    break
+                fi
+                log_error "Password must be at least 12 characters!"
+            done
+        fi
+
+        echo ""
+        read -p "Enter server port [5000]: " server_port
+        server_port=${server_port:-5000}
+
+        # Update .env file
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS
+            sed -i '' "s/^SECRET_KEY=.*/SECRET_KEY=$secret_key/" "$SERVER_DIR/.env"
+            sed -i '' "s/^ADMIN_USERNAME=.*/ADMIN_USERNAME=$admin_user/" "$SERVER_DIR/.env"
+            sed -i '' "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$admin_pass/" "$SERVER_DIR/.env"
+        else
+            # Linux
+            sed -i "s/^SECRET_KEY=.*/SECRET_KEY=$secret_key/" "$SERVER_DIR/.env"
+            sed -i "s/^ADMIN_USERNAME=.*/ADMIN_USERNAME=$admin_user/" "$SERVER_DIR/.env"
+            sed -i "s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=$admin_pass/" "$SERVER_DIR/.env"
+        fi
+
+        log_info "Configuration saved to $SERVER_DIR/.env"
+    else
+        log_info "Server configuration already exists at $SERVER_DIR/.env"
+    fi
+
+    # Install dependencies
+    echo ""
+    read -p "Install Python dependencies? [Y/n]: " install_deps
+    if [[ ! "$install_deps" =~ ^[Nn] ]]; then
+        log_info "Installing server dependencies..."
+        check_venv "$SERVER_DIR"
+        source "$SERVER_DIR/venv/bin/activate"
+        pip install --upgrade pip -q
+        pip install -r "$SERVER_DIR/requirements.txt" -q
+        deactivate
+        log_info "Dependencies installed!"
+    fi
+
+    # Build frontend
+    if [ -d "$SERVER_DIR/frontend" ]; then
+        echo ""
+        read -p "Build frontend? [Y/n]: " build_fe
+        if [[ ! "$build_fe" =~ ^[Nn] ]]; then
+            if command -v npm &> /dev/null; then
+                log_info "Building frontend..."
+                cd "$SERVER_DIR/frontend"
+                npm install -q 2>/dev/null
+                npm run build -q 2>/dev/null
+                cd - > /dev/null
+                log_info "Frontend built!"
+            else
+                log_warn "npm not found. Skipping frontend build."
+                log_warn "Install Node.js and run: cd backupx-server/frontend && npm install && npm run build"
+            fi
+        fi
+    fi
+
+    # Start server
+    echo ""
+    read -p "Start server now? [Y/n]: " start_now
+    if [[ ! "$start_now" =~ ^[Nn] ]]; then
+        echo ""
+        echo "Start in which mode?"
+        echo "  1) Production (recommended for real use)"
+        echo "  2) Development (hot reload, debug mode)"
+        read -p "Enter choice [1/2]: " mode_choice
+
+        if [ "$mode_choice" = "2" ]; then
+            server_start development
+        else
+            server_start production
+        fi
+    else
+        echo ""
+        log_info "Server setup complete!"
+        echo ""
+        echo "To start the server later, run:"
+        echo "  ./run.sh server:start     # Production mode"
+        echo "  ./run.sh server:dev       # Development mode"
+    fi
+
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "  Server Credentials:"
+    echo -e "  Username: ${YELLOW}$admin_user${NC}"
+    echo -e "  Password: ${YELLOW}$admin_pass${NC}"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+setup_agent() {
+    echo ""
+    log_info "Setting up BackupX Agent..."
+    echo ""
+
+    # Check if .env exists
+    if [ ! -f "$AGENT_DIR/.env" ]; then
+        log_info "Creating agent configuration..."
+        cp "$AGENT_DIR/.env.example" "$AGENT_DIR/.env"
+
+        # Generate secure API key
+        local api_key=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+
+        # Prompt for configuration
+        echo ""
+        read -p "Enter agent name [$(hostname)]: " agent_name
+        agent_name=${agent_name:-$(hostname)}
+
+        echo ""
+        read -p "Enter agent port [8090]: " agent_port
+        agent_port=${agent_port:-8090}
+
+        echo ""
+        echo "Generated API Key: $api_key"
+        read -p "Use this API key? [Y/n]: " use_generated
+        if [[ "$use_generated" =~ ^[Nn] ]]; then
+            while true; do
+                read -p "Enter API key (min 32 chars): " api_key
+                if [ ${#api_key} -ge 32 ]; then
+                    break
+                fi
+                log_error "API key must be at least 32 characters!"
+            done
+        fi
+
+        echo ""
+        echo "Restrict backup paths? (comma-separated, empty for all)"
+        echo "Example: /var/www,/home,/etc"
+        read -p "Allowed paths [all]: " allowed_paths
+
+        # Update .env file
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS
+            sed -i '' "s/^AGENT_API_KEY=.*/AGENT_API_KEY=$api_key/" "$AGENT_DIR/.env"
+            sed -i '' "s/^AGENT_NAME=.*/AGENT_NAME=$agent_name/" "$AGENT_DIR/.env"
+            sed -i '' "s/^AGENT_PORT=.*/AGENT_PORT=$agent_port/" "$AGENT_DIR/.env"
+            if [ -n "$allowed_paths" ]; then
+                sed -i '' "s/^ALLOWED_PATHS=.*/ALLOWED_PATHS=$allowed_paths/" "$AGENT_DIR/.env"
+            fi
+        else
+            # Linux
+            sed -i "s/^AGENT_API_KEY=.*/AGENT_API_KEY=$api_key/" "$AGENT_DIR/.env"
+            sed -i "s/^AGENT_NAME=.*/AGENT_NAME=$agent_name/" "$AGENT_DIR/.env"
+            sed -i "s/^AGENT_PORT=.*/AGENT_PORT=$agent_port/" "$AGENT_DIR/.env"
+            if [ -n "$allowed_paths" ]; then
+                sed -i "s/^ALLOWED_PATHS=.*/ALLOWED_PATHS=$allowed_paths/" "$AGENT_DIR/.env"
+            fi
+        fi
+
+        log_info "Configuration saved to $AGENT_DIR/.env"
+    else
+        log_info "Agent configuration already exists at $AGENT_DIR/.env"
+        # Read existing API key for display
+        source "$AGENT_DIR/.env"
+        api_key="$AGENT_API_KEY"
+        agent_name="$AGENT_NAME"
+        agent_port="${AGENT_PORT:-8090}"
+    fi
+
+    # Install dependencies
+    echo ""
+    read -p "Install Python dependencies? [Y/n]: " install_deps
+    if [[ ! "$install_deps" =~ ^[Nn] ]]; then
+        log_info "Installing agent dependencies..."
+        check_venv "$AGENT_DIR"
+        source "$AGENT_DIR/venv/bin/activate"
+        pip install --upgrade pip -q
+        pip install -r "$AGENT_DIR/requirements.txt" -q
+        deactivate
+        log_info "Dependencies installed!"
+    fi
+
+    # Start agent
+    echo ""
+    read -p "Start agent now? [Y/n]: " start_now
+    if [[ ! "$start_now" =~ ^[Nn] ]]; then
+        echo ""
+        echo "Start in which mode?"
+        echo "  1) Production (background daemon)"
+        echo "  2) Development (foreground with logs)"
+        read -p "Enter choice [1/2]: " mode_choice
+
+        if [ "$mode_choice" = "2" ]; then
+            agent_start development
+        else
+            agent_start production
+        fi
+    else
+        echo ""
+        log_info "Agent setup complete!"
+        echo ""
+        echo "To start the agent later, run:"
+        echo "  ./run.sh agent:start     # Production mode"
+        echo "  ./run.sh agent:dev       # Development mode"
+    fi
+
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "  Agent Configuration:"
+    echo -e "  Name:    ${YELLOW}$agent_name${NC}"
+    echo -e "  Port:    ${YELLOW}$agent_port${NC}"
+    echo -e "  API Key: ${YELLOW}$api_key${NC}"
+    echo -e ""
+    echo -e "  Add this server in BackupX UI with:"
+    echo -e "  - Connection Type: Agent"
+    echo -e "  - Host: $(hostname -I 2>/dev/null | awk '{print $1}' || echo "your-server-ip")"
+    echo -e "  - Port: $agent_port"
+    echo -e "  - API Key: (shown above)"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo ""
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 
 check_python
 
-case "${1:-help}" in
+case "${1:-}" in
+    "")
+        interactive_setup
+        ;;
     server:start)
         server_start production
         ;;
