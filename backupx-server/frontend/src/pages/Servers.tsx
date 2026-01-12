@@ -45,7 +45,15 @@ import {
   Monitor,
   Network,
   Key,
+  CheckCircle2,
+  XCircle,
+  RefreshCw,
 } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 const initialServerFormData: ServerFormData = {
   name: "",
@@ -58,6 +66,15 @@ const initialServerFormData: ServerFormData = {
   agent_api_key: "",
 };
 
+type ConnectionStatus = "online" | "offline" | "checking" | "unknown";
+
+interface ServerStatus {
+  status: ConnectionStatus;
+  message?: string;
+  agentName?: string;
+  version?: string;
+}
+
 export default function Servers() {
   const [servers, setServers] = useState<Server[]>([]);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
@@ -68,10 +85,19 @@ export default function Servers() {
   const [isSaving, setIsSaving] = useState(false);
   const [isTestingConnection, setIsTestingConnection] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [serverStatuses, setServerStatuses] = useState<Record<string, ServerStatus>>({});
+  const [isRefreshingAll, setIsRefreshingAll] = useState(false);
 
   useEffect(() => {
     fetchServers();
   }, []);
+
+  // Check all server connections when servers are loaded
+  useEffect(() => {
+    if (servers.length > 0) {
+      checkAllConnections();
+    }
+  }, [servers.length]);
 
   const fetchServers = async () => {
     setIsLoading(true);
@@ -85,6 +111,47 @@ export default function Servers() {
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const checkServerConnection = async (serverId: string): Promise<ServerStatus> => {
+    setServerStatuses((prev) => ({
+      ...prev,
+      [serverId]: { status: "checking" },
+    }));
+
+    try {
+      const response = await fetch(`/api/servers/${serverId}/test`, {
+        method: "POST",
+      });
+      const data = await response.json();
+
+      const status: ServerStatus = {
+        status: data.success ? "online" : "offline",
+        message: data.message || data.error,
+        agentName: data.agent_name,
+        version: data.version,
+      };
+
+      setServerStatuses((prev) => ({
+        ...prev,
+        [serverId]: status,
+      }));
+
+      return status;
+    } catch {
+      const status: ServerStatus = { status: "offline", message: "Connection failed" };
+      setServerStatuses((prev) => ({
+        ...prev,
+        [serverId]: status,
+      }));
+      return status;
+    }
+  };
+
+  const checkAllConnections = async () => {
+    setIsRefreshingAll(true);
+    await Promise.all(servers.map((server) => checkServerConnection(server.id)));
+    setIsRefreshingAll(false);
   };
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -274,10 +341,21 @@ export default function Servers() {
               Configure remote servers for backup via SSH or BackupX Agent
             </CardDescription>
           </div>
-          <Button onClick={openNewDialog}>
-            <Plus className="h-4 w-4 mr-2" />
-            Add Server
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={checkAllConnections}
+              disabled={isRefreshingAll || servers.length === 0}
+            >
+              <RefreshCw className={`h-4 w-4 mr-2 ${isRefreshingAll ? "animate-spin" : ""}`} />
+              Refresh Status
+            </Button>
+            <Button onClick={openNewDialog}>
+              <Plus className="h-4 w-4 mr-2" />
+              Add Server
+            </Button>
+          </div>
         </CardHeader>
         <CardContent>
           {servers.length === 0 ? (
@@ -296,6 +374,7 @@ export default function Servers() {
             <Table>
               <TableHeader>
                 <TableRow>
+                  <TableHead>Status</TableHead>
                   <TableHead>Name</TableHead>
                   <TableHead>Host</TableHead>
                   <TableHead>Type</TableHead>
@@ -304,8 +383,45 @@ export default function Servers() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {servers.map((server) => (
+                {servers.map((server) => {
+                  const status = serverStatuses[server.id];
+                  return (
                   <TableRow key={server.id}>
+                    <TableCell>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <div className="flex items-center">
+                            {status?.status === "checking" ? (
+                              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                            ) : status?.status === "online" ? (
+                              <CheckCircle2 className="h-4 w-4 text-green-500" />
+                            ) : status?.status === "offline" ? (
+                              <XCircle className="h-4 w-4 text-red-500" />
+                            ) : (
+                              <div className="h-4 w-4 rounded-full bg-muted" />
+                            )}
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          {status?.status === "checking" ? (
+                            "Checking connection..."
+                          ) : status?.status === "online" ? (
+                            <div>
+                              <p className="font-medium text-green-500">Online</p>
+                              {status.agentName && <p className="text-xs">Agent: {status.agentName}</p>}
+                              {status.version && <p className="text-xs">Version: {status.version}</p>}
+                            </div>
+                          ) : status?.status === "offline" ? (
+                            <div>
+                              <p className="font-medium text-red-500">Offline</p>
+                              {status.message && <p className="text-xs">{status.message}</p>}
+                            </div>
+                          ) : (
+                            "Unknown - click refresh to check"
+                          )}
+                        </TooltipContent>
+                      </Tooltip>
+                    </TableCell>
                     <TableCell className="font-medium">{server.name}</TableCell>
                     <TableCell className="text-muted-foreground">
                       {server.host}
@@ -332,6 +448,19 @@ export default function Servers() {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => checkServerConnection(server.id)}
+                              disabled={status?.status === "checking"}
+                            >
+                              <RefreshCw className={`h-4 w-4 ${status?.status === "checking" ? "animate-spin" : ""}`} />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Test connection</TooltipContent>
+                        </Tooltip>
                         <Button
                           variant="ghost"
                           size="icon"
@@ -353,7 +482,8 @@ export default function Servers() {
                       </div>
                     </TableCell>
                   </TableRow>
-                ))}
+                  );
+                })}
               </TableBody>
             </Table>
           )}

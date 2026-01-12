@@ -146,12 +146,19 @@ def backup_filesystem():
     data = request.get_json()
 
     if not data:
+        logger.error("No JSON data provided in request")
         return jsonify({'error': 'No data provided'}), 400
+
+    # Log request details (without sensitive data)
+    logger.info(f"Received filesystem backup request: directories={data.get('directories')}, "
+                f"s3_endpoint={data.get('s3_endpoint')}, s3_bucket={data.get('s3_bucket')}, "
+                f"backup_prefix={data.get('backup_prefix')}")
 
     # Required fields
     required = ['directories', 's3_endpoint', 's3_bucket', 's3_access_key', 's3_secret_key', 'restic_password', 'backup_prefix']
     missing = [f for f in required if not data.get(f)]
     if missing:
+        logger.error(f"Missing required fields: {missing}")
         return jsonify({'error': f'Missing required fields: {", ".join(missing)}'}), 400
 
     directories = data['directories']
@@ -161,8 +168,10 @@ def backup_filesystem():
     # Validate paths
     for directory in directories:
         if not is_path_allowed(directory):
+            logger.error(f"Path not allowed: {directory}. Allowed paths: {ALLOWED_PATHS_LIST or ['*']}")
             return jsonify({'error': f'Path not allowed: {directory}'}), 403
         if not os.path.exists(directory):
+            logger.error(f"Path does not exist in container: {directory}")
             return jsonify({'error': f'Path does not exist: {directory}'}), 400
 
     excludes = data.get('excludes', [])

@@ -399,6 +399,7 @@ def init_db():
             retention_weekly INTEGER DEFAULT 4,
             retention_monthly INTEGER DEFAULT 12,
             timeout INTEGER DEFAULT 7200,
+            skip_ssl_verify INTEGER DEFAULT 0,
             status TEXT DEFAULT 'pending',
             created_at TEXT NOT NULL,
             updated_at TEXT,
@@ -2426,6 +2427,88 @@ def api_test_server_connection():
 
     else:
         return jsonify({'error': 'Invalid connection_type'}), 400
+
+
+@app.route('/api/servers/<server_id>/test', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_test_server_connection_by_id(server_id):
+    """Test connection to a saved server by ID"""
+    server = get_server(server_id)
+    if not server:
+        return jsonify({'error': 'Server not found'}), 404
+
+    connection_type = server.get('connection_type', 'ssh')
+    host = server.get('host', '')
+
+    if connection_type == 'ssh':
+        # Test SSH connection
+        ssh_port = int(server.get('ssh_port', 22))
+        ssh_user = server.get('ssh_user', '')
+        ssh_key = server.get('ssh_key', '/home/backupx/.ssh/id_rsa')
+
+        try:
+            ssh_cmd = [
+                'ssh', '-i', ssh_key,
+                '-p', str(ssh_port),
+                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', 'BatchMode=yes',
+                '-o', 'ConnectTimeout=10',
+                f'{ssh_user}@{host}',
+                'echo "Connection successful"'
+            ]
+
+            result = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+
+            if result.returncode == 0:
+                return jsonify({'success': True, 'status': 'online', 'message': 'SSH connection successful'})
+            else:
+                return jsonify({'success': False, 'status': 'offline', 'error': result.stderr or 'SSH connection failed'})
+
+        except subprocess.TimeoutExpired:
+            return jsonify({'success': False, 'status': 'offline', 'error': 'SSH connection timed out'})
+        except Exception as e:
+            return jsonify({'success': False, 'status': 'error', 'error': str(e)})
+
+    elif connection_type == 'agent':
+        # Test Agent connection
+        agent_port = int(server.get('agent_port', 8090))
+        agent_api_key = server.get('agent_api_key', '')
+
+        try:
+            # Call the agent's /health endpoint (no auth required)
+            health_url = f'http://{host}:{agent_port}/health'
+            health_req = Request(health_url, method='GET')
+            health_req.add_header('Content-Type', 'application/json')
+
+            try:
+                with urlopen(health_req, timeout=10) as response:
+                    if response.status == 200:
+                        health_data = json.loads(response.read().decode('utf-8'))
+                        agent_name = health_data.get('agent', 'Unknown')
+                        version = health_data.get('version', 'Unknown')
+                        return jsonify({
+                            'success': True,
+                            'status': 'online',
+                            'message': f'Agent online',
+                            'agent_name': agent_name,
+                            'version': version
+                        })
+                    else:
+                        return jsonify({'success': False, 'status': 'offline', 'error': 'Agent health check failed'})
+            except (URLError, HTTPError) as e:
+                return jsonify({'success': False, 'status': 'offline', 'error': f'Cannot reach agent: {str(e)}'})
+
+        except Exception as e:
+            return jsonify({'success': False, 'status': 'error', 'error': str(e)})
+
+    else:
+        return jsonify({'success': False, 'status': 'error', 'error': 'Invalid connection_type'})
 
 
 # Database Configuration API Routes
