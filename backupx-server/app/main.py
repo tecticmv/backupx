@@ -61,30 +61,59 @@ logger = setup_logging()
 # Environment Validation
 # =============================================================================
 
+def is_production_mode() -> bool:
+    """Check if running in production mode"""
+    return os.environ.get('FLASK_ENV', 'production').lower() == 'production' and \
+           os.environ.get('ENVIRONMENT', 'production').lower() != 'development'
+
+
 def validate_environment():
     """Validate required environment variables"""
+    errors = []
     warnings = []
+    production = is_production_mode()
 
     # Check SECRET_KEY
     secret_key = os.environ.get('SECRET_KEY', '')
     if not secret_key or secret_key == 'change-this-secret-key':
-        warnings.append("SECRET_KEY is not set or using default value. Set a strong random key in production.")
+        if production:
+            errors.append("CRITICAL: SECRET_KEY must be set in production. Generate with: python -c \"import secrets; print(secrets.token_hex(32))\"")
+        else:
+            warnings.append("SECRET_KEY is not set or using default value. Set a strong random key in production.")
 
     # Check admin credentials
     admin_user = os.environ.get('ADMIN_USERNAME', 'admin')
     admin_pass = os.environ.get('ADMIN_PASSWORD', 'changeme')
 
     if admin_user == 'admin':
-        warnings.append("ADMIN_USERNAME is using default value 'admin'. Consider changing it.")
+        if production:
+            errors.append("CRITICAL: ADMIN_USERNAME must be changed from default 'admin' in production.")
+        else:
+            warnings.append("ADMIN_USERNAME is using default value 'admin'. Consider changing it.")
 
     if admin_pass == 'changeme':
-        warnings.append("ADMIN_PASSWORD is using default value. Set a strong password in production.")
+        if production:
+            errors.append("CRITICAL: ADMIN_PASSWORD must be changed from default in production.")
+        else:
+            warnings.append("ADMIN_PASSWORD is using default value. Set a strong password in production.")
 
-    # Log warnings
+    # Check for minimum password length in production
+    if len(admin_pass) < 12 and production:
+        errors.append("CRITICAL: ADMIN_PASSWORD must be at least 12 characters in production.")
+
+    # Log warnings and errors
     for warning in warnings:
         logger.warning(warning)
+    for error in errors:
+        logger.error(error)
 
-    return len(warnings) == 0
+    # In production, fail startup if critical issues exist
+    if errors and production:
+        logger.critical("Application cannot start with default credentials in production mode.")
+        logger.critical("Set ENVIRONMENT=development to bypass these checks during development.")
+        raise SystemExit(1)
+
+    return len(warnings) == 0 and len(errors) == 0
 
 
 # =============================================================================
@@ -112,9 +141,12 @@ def get_fernet():
         from cryptography.fernet import Fernet
         import base64
         import hashlib
-        # Derive a 32-byte key from SECRET_KEY using SHA-256
+        # Derive a 32-byte key from SECRET_KEY using PBKDF2 (more secure than plain SHA-256)
         secret_key = os.environ.get('SECRET_KEY', 'change-this-secret-key')
-        key = hashlib.sha256(secret_key.encode()).digest()
+        # Use a fixed salt derived from the secret key itself for deterministic key derivation
+        # This ensures the same SECRET_KEY always produces the same encryption key
+        salt = hashlib.sha256(b'backupx-credential-salt:' + secret_key.encode()).digest()[:16]
+        key = hashlib.pbkdf2_hmac('sha256', secret_key.encode(), salt, iterations=100000)
         _fernet = Fernet(base64.urlsafe_b64encode(key))
     return _fernet
 
@@ -154,24 +186,40 @@ def is_encrypted(value: str) -> bool:
 
 # Hash the admin password at startup for secure comparison
 _admin_password_hash = None
+_admin_password_hash_loaded = False
 
 def get_admin_password_hash():
-    """Get hashed admin password - checks database first, then env var"""
-    global _admin_password_hash
-    if _admin_password_hash is None:
-        # Try to get saved hash from database
-        try:
-            saved_hash = get_app_setting('admin_password_hash')
-            if saved_hash:
-                _admin_password_hash = saved_hash
-                return _admin_password_hash
-        except Exception:
-            pass  # Database not ready yet, fall back to env var
+    """Get hashed admin password - checks database first, then env var.
+    Always re-checks database to ensure password changes are picked up."""
+    global _admin_password_hash, _admin_password_hash_loaded
 
-        # Fall back to environment variable
-        admin_pass = os.environ.get('ADMIN_PASSWORD', 'changeme')
-        _admin_password_hash = generate_password_hash(admin_pass)
+    # Try to get saved hash from database (always check on each call for changes)
+    try:
+        saved_hash = get_app_setting('admin_password_hash')
+        if saved_hash:
+            _admin_password_hash = saved_hash
+            _admin_password_hash_loaded = True
+            return _admin_password_hash
+    except Exception:
+        pass  # Database not ready yet, fall back to cached or env var
+
+    # If we already loaded from env, return cached value
+    if _admin_password_hash_loaded and _admin_password_hash:
+        return _admin_password_hash
+
+    # Fall back to environment variable
+    admin_pass = os.environ.get('ADMIN_PASSWORD', 'changeme')
+    _admin_password_hash = generate_password_hash(admin_pass)
+    _admin_password_hash_loaded = True
     return _admin_password_hash
+
+
+def refresh_admin_password_hash():
+    """Force refresh of admin password hash from database."""
+    global _admin_password_hash, _admin_password_hash_loaded
+    _admin_password_hash = None
+    _admin_password_hash_loaded = False
+    return get_admin_password_hash()
 
 # Validate environment on startup
 env_valid = validate_environment()
@@ -191,11 +239,17 @@ csrf = CSRFProtect(app)
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
+# Get rate limit storage URI from environment (default to memory for development)
+# For production, use Redis: redis://localhost:6379 or postgresql://... for DB-backed storage
+rate_limit_storage = os.environ.get('RATE_LIMIT_STORAGE', 'memory://')
+if rate_limit_storage == 'memory://' and is_production_mode():
+    logger.warning("Using in-memory rate limiting storage. For production, set RATE_LIMIT_STORAGE to redis:// or memcached://")
+
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
     default_limits=["200 per day", "50 per hour"],
-    storage_uri="memory://",
+    storage_uri=rate_limit_storage,
 )
 
 # Login Manager
@@ -208,6 +262,14 @@ login_manager.login_view = 'login'
 # Security Headers Middleware
 # =============================================================================
 
+# CSP nonce for inline scripts (regenerated per request for security)
+import secrets
+
+def generate_csp_nonce():
+    """Generate a random nonce for CSP"""
+    return secrets.token_urlsafe(16)
+
+
 @app.after_request
 def add_security_headers(response):
     """Add security headers to all responses"""
@@ -215,22 +277,35 @@ def add_security_headers(response):
     response.headers['X-Frame-Options'] = 'DENY'
     # Prevent MIME type sniffing
     response.headers['X-Content-Type-Options'] = 'nosniff'
-    # Enable XSS filter
+    # Enable XSS filter (legacy, but still useful)
     response.headers['X-XSS-Protection'] = '1; mode=block'
     # Referrer policy
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     # Permissions policy (restrict browser features)
     response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    # HSTS - enforce HTTPS (only in production and when served over HTTPS)
+    if is_production_mode():
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+
     # Content Security Policy
-    response.headers['Content-Security-Policy'] = (
+    # Note: Vite/React apps require 'unsafe-inline' for styles due to CSS-in-JS
+    # In production, we use a stricter policy with nonces for scripts where possible
+    # The unsafe-inline for scripts is required by the Vite bundled React app
+    csp_policy = (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
-        "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data: https:; "
+        "script-src 'self' 'unsafe-inline'; "  # Required for React/Vite
+        "style-src 'self' 'unsafe-inline'; "   # Required for CSS-in-JS
+        "img-src 'self' data: blob: https:; "
         "font-src 'self' data:; "
         "connect-src 'self'; "
-        "frame-ancestors 'none';"
+        "worker-src 'self' blob:; "
+        "frame-ancestors 'none'; "
+        "form-action 'self'; "
+        "base-uri 'self'; "
+        "object-src 'none';"
     )
+    response.headers['Content-Security-Policy'] = csp_policy
+
     return response
 
 # Paths
@@ -2009,33 +2084,63 @@ def api_me():
 @csrf.exempt
 def api_change_password():
     """Change the admin password"""
-    global _admin_password_hash
+    global _admin_password_hash, _admin_password_hash_loaded
 
     data = request.get_json()
     if not data:
         return jsonify({'error': 'No data provided'}), 400
 
-    current_password = data.get('current_password')
-    new_password = data.get('new_password')
+    current_password = data.get('current_password', '').strip()
+    new_password = data.get('new_password', '').strip()
 
     if not current_password or not new_password:
         return jsonify({'error': 'Current password and new password are required'}), 400
 
+    # Validate new password strength
     if len(new_password) < 8:
         return jsonify({'error': 'New password must be at least 8 characters'}), 400
 
+    # In production, require stronger passwords
+    if is_production_mode() and len(new_password) < 12:
+        return jsonify({'error': 'Password must be at least 12 characters in production'}), 400
+
     # Verify current password
     if not check_password_hash(get_admin_password_hash(), current_password):
+        # Log failed attempt
+        logger.warning(f"Failed password change attempt for user: {current_user.id} from {request.remote_addr}")
         return jsonify({'error': 'Current password is incorrect'}), 401
 
-    # Update the password hash in memory
-    _admin_password_hash = generate_password_hash(new_password)
+    # Generate new password hash
+    new_hash = generate_password_hash(new_password)
 
-    # Store new password hash in database settings
-    success, error = set_app_setting('admin_password_hash', _admin_password_hash)
+    # Store new password hash in database settings (primary storage)
+    success, error = set_app_setting('admin_password_hash', new_hash)
     if not success:
         logger.error(f"Failed to save password to database: {error}")
-        # Password is still updated in memory for this session
+        return jsonify({'error': 'Failed to save password. Please try again.'}), 500
+
+    # Update the in-memory cache
+    _admin_password_hash = new_hash
+    _admin_password_hash_loaded = True
+
+    # Audit log the password change
+    try:
+        from .audit.logger import get_audit_logger
+        audit = get_audit_logger()
+        if audit:
+            audit.log(
+                action='UPDATE',
+                resource_type='user',
+                resource_id=current_user.id,
+                resource_name=current_user.id,
+                user_id=current_user.id,
+                user_name=current_user.id,
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent', ''),
+                new_value={'action': 'password_changed'}
+            )
+    except Exception as e:
+        logger.debug(f"Audit logging failed: {e}")
 
     logger.info(f"Password changed for user: {current_user.id}")
     return jsonify({'success': True, 'message': 'Password changed successfully'})
@@ -2075,9 +2180,18 @@ def api_create_job():
     if not job_id:
         return jsonify({'error': 'Job ID is required'}), 400
 
+    # Validate job_id format (alphanumeric, hyphens, underscores only)
+    if not re.match(r'^[a-z0-9][a-z0-9\-_]{0,62}[a-z0-9]$', job_id) and len(job_id) > 1:
+        return jsonify({'error': 'Job ID must be 2-64 alphanumeric characters, hyphens, or underscores'}), 400
+
     # Check if job already exists
     if get_job(job_id):
         return jsonify({'error': 'Job ID already exists'}), 400
+
+    # Validate schedule cron if provided
+    schedule_cron = data.get('schedule_cron', '0 2 * * *')
+    if data.get('schedule_enabled') and not validate_cron(schedule_cron):
+        return jsonify({'error': 'Invalid cron expression format'}), 400
 
     # Resolve server and S3 config
     server_id = data.get('server_id')
@@ -3012,15 +3126,28 @@ def api_create_s3_config_route():
         if not data.get(field):
             return jsonify({'error': f'{field} is required'}), 400
 
+    # Validate endpoint format
+    if not validate_s3_endpoint(data['endpoint']):
+        return jsonify({'error': 'Invalid S3 endpoint format'}), 400
+
+    # Validate bucket name
+    if not validate_bucket_name(data['bucket']):
+        return jsonify({'error': 'Invalid bucket name (3-63 chars, lowercase, alphanumeric, hyphens, periods)'}), 400
+
+    # Sanitize name (prevent XSS)
+    name = data['name'].strip()[:100]  # Limit length
+    if not name:
+        return jsonify({'error': 'name is required'}), 400
+
     new_config = {
         'id': generate_id(),
-        'name': data['name'],
-        'endpoint': data['endpoint'],
-        'bucket': data['bucket'],
-        'access_key': data['access_key'],
+        'name': name,
+        'endpoint': data['endpoint'].strip(),
+        'bucket': data['bucket'].strip().lower(),
+        'access_key': data['access_key'].strip(),
         'secret_key': data['secret_key'],
-        'region': data.get('region', ''),
-        'skip_ssl_verify': data.get('skip_ssl_verify', False),
+        'region': data.get('region', '').strip(),
+        'skip_ssl_verify': bool(data.get('skip_ssl_verify', False)),
         'created_at': utc_isoformat(),
         'updated_at': utc_isoformat()
     }

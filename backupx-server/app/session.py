@@ -26,6 +26,21 @@ def configure_session(app):
     Args:
         app: Flask application instance
     """
+    # Configure secure cookie settings
+    is_production = os.environ.get('FLASK_ENV', 'production').lower() == 'production' and \
+                   os.environ.get('ENVIRONMENT', 'production').lower() != 'development'
+
+    # Session cookie settings
+    app.config['SESSION_COOKIE_SECURE'] = is_production  # HTTPS only in production
+    app.config['SESSION_COOKIE_HTTPONLY'] = True  # Prevent JS access
+    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection
+    app.config['SESSION_COOKIE_NAME'] = 'backupx_session'
+
+    # Remember me cookie settings
+    app.config['REMEMBER_COOKIE_SECURE'] = is_production
+    app.config['REMEMBER_COOKIE_HTTPONLY'] = True
+    app.config['REMEMBER_COOKIE_SAMESITE'] = 'Lax'
+
     session_type = os.environ.get('SESSION_TYPE', 'filesystem').lower()
 
     if session_type == 'redis':
