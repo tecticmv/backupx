@@ -11,6 +11,8 @@ import History from "@/pages/History";
 import Servers from "@/pages/Servers";
 import Databases from "@/pages/Databases";
 import Storage from "@/pages/Storage";
+import S3Explorer from "@/pages/S3Explorer";
+import S3ExplorerList from "@/pages/S3ExplorerList";
 import Notifications from "@/pages/Notifications";
 import AuditLog from "@/pages/AuditLog";
 import { Loader2 } from "lucide-react";
@@ -98,6 +100,22 @@ function AppRoutes() {
           element={
             <ProtectedRoute>
               <Storage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/storage/explorer"
+          element={
+            <ProtectedRoute>
+              <S3ExplorerList />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/storage/:configId/browse"
+          element={
+            <ProtectedRoute>
+              <S3Explorer />
             </ProtectedRoute>
           }
         />

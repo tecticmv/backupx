@@ -20,3 +20,18 @@ export interface S3ConfigFormData {
   region?: string;
   skip_ssl_verify?: boolean;
 }
+
+export interface S3Object {
+  name: string;
+  path: string;
+  size: number;
+  is_dir: boolean;
+  mod_time: string;
+}
+
+export interface S3BrowseResponse {
+  objects: S3Object[];
+  path: string;
+  bucket: string;
+  config_name: string;
+}

@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -36,6 +37,7 @@ import {
   Loader2,
   TestTube,
   HardDrive,
+  FolderSearch,
 } from "lucide-react";
 
 const initialFormData: S3ConfigFormData = {
@@ -277,6 +279,11 @@ export default function Storage() {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
+                        <Link to={`/storage/${config.id}/browse`}>
+                          <Button variant="ghost" size="icon">
+                            <FolderSearch className="h-4 w-4" />
+                          </Button>
+                        </Link>
                         <Button
                           variant="ghost"
                           size="icon"

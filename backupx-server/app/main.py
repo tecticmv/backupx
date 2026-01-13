@@ -2372,6 +2372,83 @@ def api_test_s3_connection():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/s3-configs/<config_id>/browse', methods=['GET'])
+@login_required
+def api_browse_s3_config(config_id):
+    """Browse S3 bucket contents"""
+    config = get_s3_config(config_id)
+    if not config:
+        return jsonify({'error': 'S3 configuration not found'}), 404
+
+    path = request.args.get('path', '')
+
+    # Sanitize path - remove leading/trailing slashes and prevent directory traversal
+    path = path.strip('/')
+    if '..' in path:
+        return jsonify({'error': 'Invalid path'}), 400
+
+    try:
+        # Use rclone to list bucket contents
+        env = os.environ.copy()
+        env['RCLONE_CONFIG_BROWSE_TYPE'] = 's3'
+        env['RCLONE_CONFIG_BROWSE_PROVIDER'] = 'Other'
+        env['RCLONE_CONFIG_BROWSE_ACCESS_KEY_ID'] = config['access_key']
+        env['RCLONE_CONFIG_BROWSE_SECRET_ACCESS_KEY'] = config['secret_key']
+        env['RCLONE_CONFIG_BROWSE_ENDPOINT'] = f"https://{config['endpoint']}"
+        env['RCLONE_CONFIG_BROWSE_REGION'] = config.get('region', 'us-east-1')
+
+        # Build the remote path
+        remote_path = f"browse:{config['bucket']}"
+        if path:
+            remote_path = f"{remote_path}/{path}"
+
+        # Use lsjson for structured output
+        cmd = ['rclone', 'lsjson', remote_path, '--max-depth', '1']
+        if config.get('skip_ssl_verify'):
+            cmd.append('--no-check-certificate')
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            return jsonify({'error': result.stderr or 'Failed to list bucket contents'}), 400
+
+        # Parse rclone lsjson output
+        import json as json_module
+        items = json_module.loads(result.stdout) if result.stdout.strip() else []
+
+        # Transform to our format
+        objects = []
+        for item in items:
+            objects.append({
+                'name': item.get('Name', ''),
+                'path': f"{path}/{item.get('Name', '')}" if path else item.get('Name', ''),
+                'size': item.get('Size', 0),
+                'is_dir': item.get('IsDir', False),
+                'mod_time': item.get('ModTime', '')
+            })
+
+        # Sort: directories first, then by name
+        objects.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+
+        return jsonify({
+            'objects': objects,
+            'path': path,
+            'bucket': config['bucket'],
+            'config_name': config['name']
+        })
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Request timed out'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # Server API Routes
 @app.route('/api/servers', methods=['GET'])
 @login_required
