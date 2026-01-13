@@ -2820,6 +2820,121 @@ def api_history():
     return jsonify(history)
 
 
+@app.route('/api/dashboard/stats')
+@login_required
+def api_dashboard_stats():
+    """Get dashboard statistics"""
+    from datetime import datetime, timedelta
+
+    jobs = load_jobs()
+    history = load_history()
+
+    # Basic job stats
+    total_jobs = len(jobs)
+    jobs_list = list(jobs.values())
+    success_jobs = sum(1 for j in jobs_list if j.get('status') == 'success')
+    failed_jobs = sum(1 for j in jobs_list if j.get('status') == 'failed')
+    running_jobs = sum(1 for j in jobs_list if j.get('status') == 'running')
+    scheduled_jobs = sum(1 for j in jobs_list if j.get('schedule_enabled'))
+
+    # Calculate success rate from last 7 days history
+    now = datetime.now()
+    seven_days_ago = now - timedelta(days=7)
+    recent_history = []
+    for entry in history:
+        try:
+            entry_time = datetime.fromisoformat(entry.get('timestamp', '').replace('Z', '+00:00'))
+            if entry_time.replace(tzinfo=None) >= seven_days_ago:
+                recent_history.append(entry)
+        except (ValueError, TypeError):
+            pass
+
+    total_recent = len(recent_history)
+    successful_recent = sum(1 for e in recent_history if e.get('status') == 'success')
+    success_rate = round((successful_recent / total_recent * 100) if total_recent > 0 else 0, 1)
+
+    # Last 24 hours summary
+    twenty_four_hours_ago = now - timedelta(hours=24)
+    last_24h = []
+    for entry in history:
+        try:
+            entry_time = datetime.fromisoformat(entry.get('timestamp', '').replace('Z', '+00:00'))
+            if entry_time.replace(tzinfo=None) >= twenty_four_hours_ago:
+                last_24h.append(entry)
+        except (ValueError, TypeError):
+            pass
+
+    last_24h_success = sum(1 for e in last_24h if e.get('status') == 'success')
+    last_24h_failed = sum(1 for e in last_24h if e.get('status') == 'failed')
+
+    # Daily breakdown for last 7 days (for chart)
+    daily_stats = []
+    for i in range(6, -1, -1):
+        day = now - timedelta(days=i)
+        day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+
+        day_entries = []
+        for entry in history:
+            try:
+                entry_time = datetime.fromisoformat(entry.get('timestamp', '').replace('Z', '+00:00'))
+                entry_time_naive = entry_time.replace(tzinfo=None)
+                if day_start <= entry_time_naive < day_end:
+                    day_entries.append(entry)
+            except (ValueError, TypeError):
+                pass
+
+        daily_stats.append({
+            'date': day_start.strftime('%Y-%m-%d'),
+            'day': day_start.strftime('%a'),
+            'success': sum(1 for e in day_entries if e.get('status') == 'success'),
+            'failed': sum(1 for e in day_entries if e.get('status') == 'failed'),
+            'total': len(day_entries)
+        })
+
+    # Next scheduled backup
+    next_backup = None
+    next_backup_job = None
+    for job_id, job in jobs.items():
+        if job.get('schedule_enabled') and job.get('schedule_cron'):
+            try:
+                from croniter import croniter
+                cron = croniter(job['schedule_cron'], now)
+                job_next = cron.get_next(datetime)
+                if next_backup is None or job_next < next_backup:
+                    next_backup = job_next
+                    next_backup_job = job.get('name', job_id)
+            except Exception:
+                pass
+
+    # Average backup duration (from successful backups)
+    durations = [e.get('duration', 0) for e in recent_history if e.get('status') == 'success' and e.get('duration')]
+    avg_duration = round(sum(durations) / len(durations)) if durations else 0
+
+    # Total snapshots count (sum from all jobs' last known count)
+    total_snapshots = sum(j.get('snapshot_count', 0) for j in jobs_list)
+
+    return jsonify({
+        'total_jobs': total_jobs,
+        'success_jobs': success_jobs,
+        'failed_jobs': failed_jobs,
+        'running_jobs': running_jobs,
+        'scheduled_jobs': scheduled_jobs,
+        'success_rate': success_rate,
+        'success_rate_period': '7 days',
+        'last_24h': {
+            'success': last_24h_success,
+            'failed': last_24h_failed,
+            'total': len(last_24h)
+        },
+        'daily_stats': daily_stats,
+        'next_backup': next_backup.isoformat() if next_backup else None,
+        'next_backup_job': next_backup_job,
+        'avg_duration': avg_duration,
+        'total_snapshots': total_snapshots
+    })
+
+
 # S3 Configuration API Routes
 @app.route('/api/s3-configs', methods=['GET'])
 @login_required
