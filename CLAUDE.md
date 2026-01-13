@@ -48,9 +48,9 @@ npm run lint     # ESLint
 
 ### Server Structure (`backupx-server/`)
 - `app/main.py` - Monolithic Flask app containing all REST API routes (~40 endpoints under `/api/*`)
-- `app/db/` - Database abstraction layer (SQLite default, PostgreSQL optional)
+- `app/db/` - Database abstraction layer (PostgreSQL)
   - `base.py` - Abstract `DatabaseBackend` interface
-  - `sqlite.py` / `postgres.py` - Implementations
+  - `postgres.py` - PostgreSQL implementation with connection pooling
   - `factory.py` - `create_database_backend()` factory function
   - `migrate.py` - Schema migrations
 - `app/audit/` - Audit logging with `@audit_log` decorator
@@ -78,7 +78,7 @@ npm run lint     # ESLint
 
 ## Tech Stack
 
-**Backend**: Flask 3.0, APScheduler, SQLite/PostgreSQL, Redis (optional), Gunicorn
+**Backend**: Flask 3.0, APScheduler, PostgreSQL, Redis (optional), Gunicorn
 **Frontend**: React 19, TypeScript, Vite, Radix UI, Tailwind CSS, React Hook Form + Zod
 **Backup Engine**: Restic with S3-compatible storage
 **External Tools**: mysqldump, pg_dump (for database backups)
@@ -90,6 +90,6 @@ Agent config: `backupx-agent/.env` (see `.env.example`)
 
 Key variables:
 - `SECRET_KEY` - Encryption key (min 32 chars, required)
-- `DATABASE_TYPE` - `sqlite` or `postgresql`
+- `DATABASE_HOST`, `DATABASE_USER`, `DATABASE_PASSWORD` - PostgreSQL connection
 - `SESSION_TYPE` - `filesystem` or `redis`
 - `AGENT_API_KEY` - Agent authentication key (min 32 chars)

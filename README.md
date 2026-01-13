@@ -151,8 +151,11 @@ docker compose up -d
 | `SECRET_KEY` | Encryption key (min 32 chars) | **Required** |
 | `ADMIN_USERNAME` | Admin login username | `admin` |
 | `ADMIN_PASSWORD` | Admin login password | **Required** |
-| `DATABASE_TYPE` | `sqlite` or `postgresql` | `sqlite` |
-| `DATABASE_PATH` | SQLite database path | `data/backupx.db` |
+| `DATABASE_HOST` | PostgreSQL host | `localhost` |
+| `DATABASE_PORT` | PostgreSQL port | `5432` |
+| `DATABASE_NAME` | PostgreSQL database name | `backupx` |
+| `DATABASE_USER` | PostgreSQL username | **Required** |
+| `DATABASE_PASSWORD` | PostgreSQL password | **Required** |
 | `AUDIT_ENABLED` | Enable audit logging | `true` |
 | `SESSION_TYPE` | `filesystem` or `redis` | `filesystem` |
 | `REDIS_HOST` | Redis host (if using Redis) | `localhost` |
@@ -254,16 +257,16 @@ server {
 For enterprise deployments:
 
 ```bash
-# Use PostgreSQL
-DATABASE_TYPE=postgresql
+# PostgreSQL configuration
 DATABASE_HOST=postgres.example.com
 DATABASE_NAME=backupx
 DATABASE_USER=backupx
 DATABASE_PASSWORD=secure-password
 
-# Use Redis for sessions
+# Use Redis for sessions and rate limiting
 SESSION_TYPE=redis
 REDIS_HOST=redis.example.com
+RATE_LIMIT_STORAGE=redis://redis.example.com:6379
 
 # Enable distributed scheduler
 SCHEDULER_MODE=distributed
