@@ -1268,6 +1268,13 @@ def run_backup(job_id):
     if not job:
         return False, "Job not found"
 
+    # Get S3 config to get skip_ssl_verify setting
+    s3_config_id = job.get('s3_config_id')
+    if s3_config_id:
+        s3_config = get_s3_config(s3_config_id)
+        if s3_config:
+            job['skip_ssl_verify'] = s3_config.get('skip_ssl_verify', False)
+
     # Get server to determine connection type
     server_id = job.get('server_id')
     server = get_server(server_id) if server_id else None
