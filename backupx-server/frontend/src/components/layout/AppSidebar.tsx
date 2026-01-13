@@ -1,4 +1,5 @@
 import { Link, useLocation } from "react-router-dom";
+import { useState, useEffect } from "react";
 import {
   Sidebar,
   SidebarContent,
@@ -24,6 +25,7 @@ import {
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { useAuth } from "@/hooks/useAuth";
 import { useTheme } from "@/hooks/useTheme";
+import { toast } from "sonner";
 import {
   Database,
   LayoutDashboard,
@@ -40,6 +42,7 @@ import {
   HardDrive,
   Bell,
   Shield,
+  Globe,
 } from "lucide-react";
 
 const navItems = [
@@ -60,6 +63,45 @@ export function AppSidebar() {
   const location = useLocation();
   const { user, logout } = useAuth();
   const { theme, setTheme } = useTheme();
+  const [timezone, setTimezone] = useState("UTC");
+  const [availableTimezones, setAvailableTimezones] = useState<string[]>([]);
+
+  useEffect(() => {
+    fetchTimezone();
+  }, []);
+
+  const fetchTimezone = async () => {
+    try {
+      const response = await fetch("/api/settings/timezone");
+      if (response.ok) {
+        const data = await response.json();
+        setTimezone(data.timezone);
+        setAvailableTimezones(data.available_timezones || []);
+      }
+    } catch (err) {
+      console.error("Failed to fetch timezone:", err);
+    }
+  };
+
+  const handleTimezoneChange = async (newTimezone: string) => {
+    try {
+      const response = await fetch("/api/settings/timezone", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ timezone: newTimezone }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error || "Failed to save timezone");
+      }
+
+      setTimezone(newTimezone);
+      toast.success("Timezone updated");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "An error occurred");
+    }
+  };
 
   const isActive = (path: string) => {
     if (path === "/") return location.pathname === "/";
@@ -134,6 +176,34 @@ export function AppSidebar() {
 
       <SidebarFooter>
         <SidebarMenu>
+          {/* Timezone Selector */}
+          <SidebarMenuItem>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <SidebarMenuButton className="text-muted-foreground hover:text-foreground">
+                  <Globe className="size-4" />
+                  <span className="truncate text-xs">{timezone}</span>
+                </SidebarMenuButton>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                className="max-h-64 overflow-y-auto"
+                side="top"
+                align="start"
+              >
+                {availableTimezones.map((tz) => (
+                  <DropdownMenuItem
+                    key={tz}
+                    onClick={() => handleTimezoneChange(tz)}
+                  >
+                    {tz}
+                    {tz === timezone && <Check className="ml-auto size-4" />}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </SidebarMenuItem>
+
+          {/* User Menu */}
           <SidebarMenuItem>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
