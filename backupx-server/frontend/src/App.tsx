@@ -12,6 +12,7 @@ import Servers from "@/pages/Servers";
 import Databases from "@/pages/Databases";
 import Storage from "@/pages/Storage";
 import S3Explorer from "@/pages/S3Explorer";
+import SnapshotBrowser from "@/pages/SnapshotBrowser";
 import Notifications from "@/pages/Notifications";
 import AuditLog from "@/pages/AuditLog";
 import { Loader2 } from "lucide-react";
@@ -67,6 +68,14 @@ function AppRoutes() {
           element={
             <ProtectedRoute>
               <Snapshots />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/jobs/:jobId/snapshots/:snapshotId/files"
+          element={
+            <ProtectedRoute>
+              <SnapshotBrowser />
             </ProtectedRoute>
           }
         />

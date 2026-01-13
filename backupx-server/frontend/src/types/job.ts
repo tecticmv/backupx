@@ -60,6 +60,20 @@ export interface RepoStats {
   total_file_count: number;
 }
 
+export interface SnapshotFile {
+  name: string;
+  path: string;
+  type: "file" | "dir";
+  size: number;
+  mtime: string;
+}
+
+export interface SnapshotFilesResponse {
+  files: SnapshotFile[];
+  path: string;
+  snapshot_id: string;
+}
+
 export interface JobFormData {
   job_id: string;
   name: string;

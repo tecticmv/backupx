@@ -2204,6 +2204,199 @@ def api_job_snapshots(job_id):
     })
 
 
+@app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/files')
+@login_required
+def api_snapshot_files(job_id, snapshot_id):
+    """List files in a snapshot"""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+
+    path = request.args.get('path', '/')
+
+    # Sanitize path
+    if '..' in path:
+        return jsonify({'error': 'Invalid path'}), 400
+
+    # Get skip_ssl_verify from S3 config
+    s3_config_id = job.get('s3_config_id')
+    skip_ssl_verify = False
+    if s3_config_id:
+        s3_config = get_s3_config(s3_config_id)
+        if s3_config:
+            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+
+    try:
+        env = os.environ.copy()
+        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
+        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
+        env['RESTIC_PASSWORD'] = job['restic_password']
+        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+
+        # Use restic ls to list files in the snapshot at the given path
+        cmd = ['restic', 'ls', '--json', snapshot_id, path]
+        if skip_ssl_verify:
+            cmd.append('--insecure-tls')
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60
+        )
+
+        if result.returncode != 0:
+            return jsonify({'error': result.stderr or 'Failed to list files'}), 400
+
+        # Parse JSON lines output from restic ls
+        files = []
+        seen_paths = set()
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                item_path = item.get('path', '')
+
+                # Filter to only direct children of the requested path
+                if path == '/':
+                    # Root level - get top-level items
+                    rel_path = item_path.lstrip('/')
+                    if '/' in rel_path:
+                        # This is nested, extract the top-level directory
+                        top_dir = rel_path.split('/')[0]
+                        if top_dir and top_dir not in seen_paths:
+                            seen_paths.add(top_dir)
+                            files.append({
+                                'name': top_dir,
+                                'path': '/' + top_dir,
+                                'type': 'dir',
+                                'size': 0,
+                                'mtime': ''
+                            })
+                    elif rel_path and rel_path not in seen_paths:
+                        seen_paths.add(rel_path)
+                        files.append({
+                            'name': item.get('name', rel_path),
+                            'path': '/' + rel_path,
+                            'type': 'dir' if item.get('type') == 'dir' else 'file',
+                            'size': item.get('size', 0),
+                            'mtime': item.get('mtime', '')
+                        })
+                else:
+                    # Non-root path
+                    norm_path = path.rstrip('/')
+                    if item_path.startswith(norm_path + '/'):
+                        rel = item_path[len(norm_path) + 1:]
+                        if '/' in rel:
+                            # Nested item, extract immediate child directory
+                            child_dir = rel.split('/')[0]
+                            child_path = norm_path + '/' + child_dir
+                            if child_path not in seen_paths:
+                                seen_paths.add(child_path)
+                                files.append({
+                                    'name': child_dir,
+                                    'path': child_path,
+                                    'type': 'dir',
+                                    'size': 0,
+                                    'mtime': ''
+                                })
+                        elif rel and item_path not in seen_paths:
+                            seen_paths.add(item_path)
+                            files.append({
+                                'name': item.get('name', rel),
+                                'path': item_path,
+                                'type': 'dir' if item.get('type') == 'dir' else 'file',
+                                'size': item.get('size', 0),
+                                'mtime': item.get('mtime', '')
+                            })
+            except json.JSONDecodeError:
+                continue
+
+        # Sort: directories first, then by name
+        files.sort(key=lambda x: (x['type'] != 'dir', x['name'].lower()))
+
+        return jsonify({
+            'files': files,
+            'path': path,
+            'snapshot_id': snapshot_id
+        })
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Request timed out'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/download')
+@login_required
+def api_snapshot_download(job_id, snapshot_id):
+    """Download a file from a snapshot"""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+
+    file_path = request.args.get('path', '')
+    if not file_path:
+        return jsonify({'error': 'File path is required'}), 400
+
+    # Sanitize path
+    if '..' in file_path:
+        return jsonify({'error': 'Invalid path'}), 400
+
+    # Get skip_ssl_verify from S3 config
+    s3_config_id = job.get('s3_config_id')
+    skip_ssl_verify = False
+    if s3_config_id:
+        s3_config = get_s3_config(s3_config_id)
+        if s3_config:
+            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+
+    try:
+        import tempfile
+        env = os.environ.copy()
+        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
+        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
+        env['RESTIC_PASSWORD'] = job['restic_password']
+        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+
+        # Use restic dump to get file contents
+        cmd = ['restic', 'dump', snapshot_id, file_path]
+        if skip_ssl_verify:
+            cmd.append('--insecure-tls')
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            env=env,
+            timeout=300  # 5 minute timeout for downloads
+        )
+
+        if result.returncode != 0:
+            error_msg = result.stderr.decode('utf-8', errors='replace') if result.stderr else 'Failed to download file'
+            return jsonify({'error': error_msg}), 400
+
+        # Get filename from path
+        filename = os.path.basename(file_path)
+
+        # Return file as attachment
+        from flask import Response
+        return Response(
+            result.stdout,
+            mimetype='application/octet-stream',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Length': len(result.stdout)
+            }
+        )
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Download timed out'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/history')
 @login_required
 def api_history():

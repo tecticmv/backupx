@@ -30,6 +30,7 @@ import {
   Loader2,
   Info,
   RefreshCw,
+  FolderOpen,
 } from "lucide-react";
 
 export default function Snapshots() {
@@ -254,6 +255,7 @@ export default function Snapshots() {
                   <TableHead>Hostname</TableHead>
                   <TableHead>Paths</TableHead>
                   <TableHead>Tags</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -291,6 +293,16 @@ export default function Snapshots() {
                           <span className="text-muted-foreground text-sm">-</span>
                         )}
                       </div>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => navigate(`/jobs/${jobId}/snapshots/${snapshot.id}/files`)}
+                        title="Browse files"
+                      >
+                        <FolderOpen className="h-4 w-4" />
+                      </Button>
                     </TableCell>
                   </TableRow>
                 ))}
