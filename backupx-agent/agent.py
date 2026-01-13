@@ -273,15 +273,18 @@ def test_database():
             '-P', str(db_port),
             '-u', db_user,
             f'-p{db_password}',
-            '--ssl-mode=DISABLED',
             '-e', 'SELECT 1'
         ]
+        # Set environment to disable SSL (works across MySQL versions)
+        env = os.environ.copy()
+        env['MYSQL_SSL_MODE'] = 'DISABLED'
 
         result = subprocess.run(
             test_cmd,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
+            env=env
         )
 
         if result.returncode == 0:
@@ -342,7 +345,6 @@ def backup_database():
             '-P', str(db_port),
             '-u', db_user,
             f'-p{db_password}',
-            '--ssl-mode=DISABLED',
             '--single-transaction',
             '--routines',
             '--triggers'
@@ -355,13 +357,18 @@ def backup_database():
             mysqldump_cmd.append('--databases')
             mysqldump_cmd.extend(db_list)
 
+        # Set environment to disable SSL (works across MySQL versions)
+        dump_env = os.environ.copy()
+        dump_env['MYSQL_SSL_MODE'] = 'DISABLED'
+
         # Run mysqldump and gzip separately (no shell=True)
         # First run mysqldump, pipe stdout to gzip
         try:
             mysqldump_proc = subprocess.Popen(
                 mysqldump_cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stderr=subprocess.PIPE,
+                env=dump_env
             )
 
             gzip_proc = subprocess.Popen(
