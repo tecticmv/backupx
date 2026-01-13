@@ -4044,6 +4044,11 @@ def set_app_setting(key: str, value: str) -> tuple[bool, str]:
     try:
         from .db import get_database
         db = get_database()
+        # Rollback any aborted transaction first
+        try:
+            db.get_connection().rollback()
+        except Exception:
+            pass
         # Upsert the setting
         db.execute('''
             INSERT INTO app_settings (key, value, updated_at)
@@ -4055,6 +4060,12 @@ def set_app_setting(key: str, value: str) -> tuple[bool, str]:
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Error setting app setting {key}: {error_msg}")
+        # Try to rollback on error
+        try:
+            from .db import get_database
+            get_database().get_connection().rollback()
+        except Exception:
+            pass
         return False, error_msg
 
 
