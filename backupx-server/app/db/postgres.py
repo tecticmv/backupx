@@ -340,6 +340,13 @@ class PostgresBackend(DatabaseBackend):
                 is_active BOOLEAN DEFAULT TRUE
             );
 
+            -- Application settings table (key-value store)
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_history_job_id ON history(job_id);

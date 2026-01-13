@@ -37,7 +37,15 @@ import {
   TestTube,
   Server as ServerIcon,
   Monitor,
+  Globe,
 } from "lucide-react";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 const initialS3FormData: S3ConfigFormData = {
   name: "",
@@ -83,6 +91,11 @@ export default function Settings() {
   // Loading State
   const [isLoading, setIsLoading] = useState(true);
 
+  // Timezone State
+  const [timezone, setTimezone] = useState("UTC");
+  const [availableTimezones, setAvailableTimezones] = useState<string[]>([]);
+  const [isSavingTimezone, setIsSavingTimezone] = useState(false);
+
   useEffect(() => {
     fetchAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -90,8 +103,45 @@ export default function Settings() {
 
   const fetchAll = async () => {
     setIsLoading(true);
-    await Promise.all([fetchS3Configs(), fetchServers()]);
+    await Promise.all([fetchS3Configs(), fetchServers(), fetchTimezone()]);
     setIsLoading(false);
+  };
+
+  // Timezone Functions
+  const fetchTimezone = async () => {
+    try {
+      const response = await fetch("/api/settings/timezone");
+      if (response.ok) {
+        const data = await response.json();
+        setTimezone(data.timezone);
+        setAvailableTimezones(data.available_timezones || []);
+      }
+    } catch (err) {
+      console.error("Failed to fetch timezone:", err);
+    }
+  };
+
+  const handleTimezoneChange = async (newTimezone: string) => {
+    setIsSavingTimezone(true);
+    try {
+      const response = await fetch("/api/settings/timezone", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ timezone: newTimezone }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error || "Failed to save timezone");
+      }
+
+      setTimezone(newTimezone);
+      toast.success("Timezone updated successfully");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "An error occurred");
+    } finally {
+      setIsSavingTimezone(false);
+    }
   };
 
   // S3 Functions
@@ -392,6 +442,50 @@ export default function Settings() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Application Settings Section */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Globe className="h-5 w-5" />
+            Application Settings
+          </CardTitle>
+          <CardDescription>
+            Configure global application settings
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-4 max-w-md">
+            <div className="grid gap-2">
+              <Label htmlFor="timezone">Scheduler Timezone</Label>
+              <div className="flex gap-2">
+                <Select
+                  value={timezone}
+                  onValueChange={handleTimezoneChange}
+                  disabled={isSavingTimezone}
+                >
+                  <SelectTrigger id="timezone" className="flex-1">
+                    <SelectValue placeholder="Select timezone" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availableTimezones.map((tz) => (
+                      <SelectItem key={tz} value={tz}>
+                        {tz}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {isSavingTimezone && (
+                  <Loader2 className="h-4 w-4 animate-spin self-center" />
+                )}
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Timezone used for scheduling backup jobs. All cron schedules will be interpreted in this timezone.
+              </p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Servers Section */}
       <Card>

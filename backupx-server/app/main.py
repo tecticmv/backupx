@@ -305,9 +305,28 @@ def validate_bucket_name(name: str) -> bool:
     bucket_pattern = re.compile(r'^[a-z0-9][a-z0-9\-\.]*[a-z0-9]$')
     return bool(bucket_pattern.match(name))
 
-# Scheduler - uses system timezone (TZ environment variable)
+# Scheduler - initialized with TZ env var, will be reconfigured with DB setting in init_app()
 scheduler = BackgroundScheduler(timezone=os.environ.get('TZ', 'UTC'))
 scheduler.start()
+
+
+def reinit_scheduler_with_db_timezone():
+    """Re-initialize scheduler with timezone from database (called after DB is ready)"""
+    global scheduler
+    try:
+        from .db import get_database
+        db = get_database()
+        result = db.fetchone('SELECT value FROM app_settings WHERE key = %s', ('timezone',))
+        db_tz = result['value'] if result else None
+        timezone = db_tz or os.environ.get('TZ', 'UTC')
+
+        if timezone != scheduler.timezone.zone:
+            logger.info(f"Reinitializing scheduler with timezone: {timezone}")
+            scheduler.shutdown(wait=False)
+            scheduler = BackgroundScheduler(timezone=timezone)
+            scheduler.start()
+    except Exception as e:
+        logger.debug(f"Could not reinit scheduler timezone from DB: {e}")
 
 
 # =============================================================================
@@ -3945,6 +3964,121 @@ def api_audit_stats():
         return jsonify({'error': 'Failed to get audit statistics'}), 500
 
 
+# =============================================================================
+# Application Settings API Endpoints
+# =============================================================================
+
+# Common timezone list for UI selection
+COMMON_TIMEZONES = [
+    'UTC',
+    'America/New_York',
+    'America/Chicago',
+    'America/Denver',
+    'America/Los_Angeles',
+    'America/Toronto',
+    'America/Vancouver',
+    'America/Sao_Paulo',
+    'Europe/London',
+    'Europe/Paris',
+    'Europe/Berlin',
+    'Europe/Amsterdam',
+    'Europe/Moscow',
+    'Asia/Dubai',
+    'Asia/Kolkata',
+    'Asia/Singapore',
+    'Asia/Hong_Kong',
+    'Asia/Tokyo',
+    'Asia/Seoul',
+    'Asia/Shanghai',
+    'Australia/Sydney',
+    'Australia/Melbourne',
+    'Pacific/Auckland',
+]
+
+
+def get_app_setting(key: str, default: str = '') -> str:
+    """Get an application setting from the database"""
+    try:
+        from .db import get_database
+        db = get_database()
+        result = db.fetchone('SELECT value FROM app_settings WHERE key = %s', (key,))
+        return result['value'] if result else default
+    except Exception as e:
+        logger.error(f"Error getting app setting {key}: {e}")
+        return default
+
+
+def set_app_setting(key: str, value: str) -> bool:
+    """Set an application setting in the database"""
+    try:
+        from .db import get_database
+        db = get_database()
+        # Upsert the setting
+        db.execute('''
+            INSERT INTO app_settings (key, value, updated_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+        ''', (key, value))
+        db.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Error setting app setting {key}: {e}")
+        return False
+
+
+def get_scheduler_timezone() -> str:
+    """Get the scheduler timezone from database, falling back to TZ env var or UTC"""
+    db_tz = get_app_setting('timezone')
+    if db_tz:
+        return db_tz
+    return os.environ.get('TZ', 'UTC')
+
+
+@app.route('/api/settings/timezone', methods=['GET'])
+@login_required
+def api_get_timezone():
+    """Get current timezone setting"""
+    timezone = get_scheduler_timezone()
+    return jsonify({
+        'timezone': timezone,
+        'available_timezones': COMMON_TIMEZONES
+    })
+
+
+@app.route('/api/settings/timezone', methods=['PUT'])
+@login_required
+@csrf.exempt
+def api_set_timezone():
+    """Set timezone for scheduler"""
+    data = request.get_json()
+    if not data or 'timezone' not in data:
+        return jsonify({'error': 'Timezone is required'}), 400
+
+    timezone = data['timezone']
+
+    # Validate timezone
+    try:
+        import pytz
+        pytz.timezone(timezone)
+    except Exception:
+        return jsonify({'error': f'Invalid timezone: {timezone}'}), 400
+
+    if set_app_setting('timezone', timezone):
+        # Update scheduler timezone
+        global scheduler
+        scheduler.shutdown(wait=False)
+        scheduler = BackgroundScheduler(timezone=timezone)
+        scheduler.start()
+
+        # Re-schedule all jobs with new timezone
+        init_schedules()
+
+        logger.info(f"Timezone updated to {timezone}, scheduler restarted")
+        return jsonify({'success': True, 'timezone': timezone})
+    else:
+        return jsonify({'error': 'Failed to save timezone setting'}), 500
+
+
 # Serve React frontend
 @app.route('/assets/<path:filename>')
 def serve_assets(filename):
@@ -3993,6 +4127,9 @@ def init_app():
     # Initialize database
     init_db()
     migrate_json_to_sqlite()
+
+    # Re-initialize scheduler with timezone from database
+    reinit_scheduler_with_db_timezone()
 
     # Initialize audit logging
     try:
