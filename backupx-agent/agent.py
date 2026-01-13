@@ -346,7 +346,7 @@ def backup_database():
             '--single-transaction',
             '--routines',
             '--triggers',
-            '--skip-comments'
+            '--compact'
         ]
 
         if databases == '*':
