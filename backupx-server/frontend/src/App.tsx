@@ -15,6 +15,7 @@ import S3Explorer from "@/pages/S3Explorer";
 import SnapshotBrowser from "@/pages/SnapshotBrowser";
 import Notifications from "@/pages/Notifications";
 import AuditLog from "@/pages/AuditLog";
+import Settings from "@/pages/Settings";
 import { Loader2 } from "lucide-react";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -132,6 +133,14 @@ function AppRoutes() {
           element={
             <ProtectedRoute>
               <AuditLog />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/settings"
+          element={
+            <ProtectedRoute>
+              <Settings />
             </ProtectedRoute>
           }
         />
