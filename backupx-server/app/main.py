@@ -2040,8 +2040,8 @@ def api_create_job():
         's3_config_id': s3_config_id,
         # Store resolved values for backup execution
         'remote_host': f"{server['ssh_user']}@{server['host']}" if server else data.get('remote_host'),
-        'ssh_port': server['ssh_port'] if server else int(data.get('ssh_port', 22)),
-        'ssh_key': server['ssh_key'] if server else data.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
+        'ssh_port': (server.get('ssh_port') or 22) if server else int(data.get('ssh_port', 22)),
+        'ssh_key': (server.get('ssh_key') or '/home/backupx/.ssh/id_rsa') if server else data.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
         's3_endpoint': s3_config['endpoint'] if s3_config else data.get('s3_endpoint'),
         's3_bucket': s3_config['bucket'] if s3_config else data.get('s3_bucket'),
         's3_access_key': s3_config['access_key'] if s3_config else data.get('s3_access_key'),
@@ -2130,8 +2130,8 @@ def api_update_job(job_id):
         's3_config_id': s3_config_id,
         # Store resolved values for backup execution
         'remote_host': f"{server['ssh_user']}@{server['host']}" if server else job.get('remote_host'),
-        'ssh_port': server['ssh_port'] if server else job.get('ssh_port', 22),
-        'ssh_key': server['ssh_key'] if server else job.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
+        'ssh_port': (server.get('ssh_port') or 22) if server else job.get('ssh_port', 22),
+        'ssh_key': (server.get('ssh_key') or '/home/backupx/.ssh/id_rsa') if server else job.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
         's3_endpoint': s3_config['endpoint'] if s3_config else job.get('s3_endpoint'),
         's3_bucket': s3_config['bucket'] if s3_config else job.get('s3_bucket'),
         's3_access_key': s3_config['access_key'] if s3_config else job.get('s3_access_key'),
@@ -2644,7 +2644,7 @@ export RESTIC_REPOSITORY='{repo}'
         else:
             # Use SSH to run the restore
             ssh_host = server.get('host')
-            ssh_port = server.get('port', 22)
+            ssh_port = server.get('ssh_port') or 22
             ssh_key = server.get('ssh_key')
 
             if not ssh_host or not ssh_key:
@@ -3395,9 +3395,9 @@ def api_test_server_connection_by_id(server_id):
 
     if connection_type == 'ssh':
         # Test SSH connection
-        ssh_port = int(server.get('ssh_port', 22))
-        ssh_user = server.get('ssh_user', '')
-        ssh_key = server.get('ssh_key', '/home/backupx/.ssh/id_rsa')
+        ssh_port = int(server.get('ssh_port') or 22)
+        ssh_user = server.get('ssh_user') or ''
+        ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
 
         try:
             ssh_cmd = [
@@ -3600,9 +3600,10 @@ def api_test_db_connection():
         escaped_pass = shlex.quote(db_pass)
 
         # Build SSH command to test MySQL connection
+        ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
         ssh_cmd = [
-            'ssh', '-i', server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
-            '-p', str(server.get('ssh_port', 22)),
+            'ssh', '-i', ssh_key,
+            '-p', str(server.get('ssh_port') or 22),
             '-o', 'StrictHostKeyChecking=accept-new',
             '-o', 'BatchMode=yes',
             '-o', 'ConnectTimeout=10',
