@@ -2009,6 +2009,94 @@ def api_run_job(job_id):
     return jsonify({'success': True, 'message': 'Backup started'})
 
 
+@app.route('/api/jobs/<job_id>/init', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_init_job_repo(job_id):
+    """Initialize restic repository for a job"""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'success': False, 'error': 'Job not found'}), 404
+
+    # Get S3 config to get skip_ssl_verify setting
+    s3_config_id = job.get('s3_config_id')
+    if s3_config_id:
+        s3_config = get_s3_config(s3_config_id)
+        if s3_config:
+            job['skip_ssl_verify'] = s3_config.get('skip_ssl_verify', False)
+
+    # Get server to determine connection type
+    server_id = job.get('server_id')
+    server = get_server(server_id) if server_id else None
+
+    if server and server.get('connection_type') == 'agent':
+        # Use agent to initialize
+        try:
+            agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/init"
+
+            payload = {
+                's3_endpoint': job['s3_endpoint'],
+                's3_bucket': job['s3_bucket'],
+                's3_access_key': job['s3_access_key'],
+                's3_secret_key': job['s3_secret_key'],
+                'restic_password': job['restic_password'],
+                'backup_prefix': job.get('backup_prefix', job_id),
+                'skip_ssl_verify': job.get('skip_ssl_verify', False)
+            }
+
+            data = json.dumps(payload).encode('utf-8')
+            req = Request(agent_url, data=data, method='POST')
+            req.add_header('Content-Type', 'application/json')
+            req.add_header('X-API-Key', server['agent_api_key'])
+
+            with urlopen(req, timeout=60) as response:
+                result = json.loads(response.read().decode('utf-8'))
+
+            if result.get('success'):
+                return jsonify({'success': True, 'message': result.get('message', 'Repository initialized')})
+            else:
+                return jsonify({'success': False, 'error': result.get('error', 'Failed to initialize repository')}), 400
+
+        except (URLError, HTTPError) as e:
+            if hasattr(e, 'code') and hasattr(e, 'read'):
+                try:
+                    error_response = json.loads(e.read().decode('utf-8'))
+                    error_msg = error_response.get('error', str(e))
+                except:
+                    error_msg = str(e)
+            else:
+                error_msg = str(e)
+            return jsonify({'success': False, 'error': error_msg}), 400
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+    else:
+        # SSH-based init
+        try:
+            env = os.environ.copy()
+            env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
+            env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
+            env['RESTIC_PASSWORD'] = job['restic_password']
+            env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job.get('backup_prefix', job_id)}"
+
+            cmd = ['restic', 'init']
+            if job.get('skip_ssl_verify'):
+                cmd.append('--insecure-tls')
+
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
+
+            if result.returncode == 0:
+                return jsonify({'success': True, 'message': 'Repository initialized'})
+            elif 'already initialized' in result.stderr.lower() or 'already exists' in result.stderr.lower():
+                return jsonify({'success': True, 'message': 'Repository already initialized'})
+            else:
+                return jsonify({'success': False, 'error': result.stderr or 'Failed to initialize repository'}), 400
+
+        except subprocess.TimeoutExpired:
+            return jsonify({'success': False, 'error': 'Initialization timed out'}), 400
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/jobs/<job_id>/snapshots')
 @login_required
 def api_job_snapshots(job_id):

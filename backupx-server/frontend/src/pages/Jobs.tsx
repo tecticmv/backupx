@@ -44,13 +44,20 @@ import {
   TrendingUp,
   TrendingDown,
   Database,
+  FolderPlus,
 } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 export default function Jobs() {
   const [jobs, setJobs] = useState<JobsType>({});
   const [isLoading, setIsLoading] = useState(true);
   const [deleteJobId, setDeleteJobId] = useState<string | null>(null);
   const [runningJobs, setRunningJobs] = useState<Set<string>>(new Set());
+  const [initializingJobs, setInitializingJobs] = useState<Set<string>>(new Set());
   const [jobModalOpen, setJobModalOpen] = useState(false);
   const [editingJobId, setEditingJobId] = useState<string | undefined>(undefined);
 
@@ -88,6 +95,29 @@ export default function Jobs() {
       toast.error("Failed to start backup");
     } finally {
       setRunningJobs((prev) => {
+        const next = new Set(prev);
+        next.delete(jobId);
+        return next;
+      });
+    }
+  };
+
+  const initializeRepo = async (jobId: string) => {
+    setInitializingJobs((prev) => new Set(prev).add(jobId));
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/init`, {
+        method: "POST",
+      });
+      const data = await response.json();
+      if (data.success) {
+        toast.success(data.message || "Repository initialized");
+      } else {
+        toast.error(data.error || "Failed to initialize repository");
+      }
+    } catch {
+      toast.error("Failed to initialize repository");
+    } finally {
+      setInitializingJobs((prev) => {
         const next = new Set(prev);
         next.delete(jobId);
         return next;
@@ -318,41 +348,75 @@ export default function Jobs() {
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          onClick={() => runBackup(jobId)}
-                          disabled={runningJobs.has(jobId) || job.status === "running"}
-                          title="Run backup"
-                        >
-                          {runningJobs.has(jobId) || job.status === "running" ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                          ) : (
-                            <Play className="h-4 w-4" />
-                          )}
-                        </Button>
-                        <Link to={`/jobs/${jobId}/snapshots`}>
-                          <Button size="icon" variant="ghost" title="View snapshots">
-                            <Camera className="h-4 w-4" />
-                          </Button>
-                        </Link>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          title="Edit job"
-                          onClick={() => openEditJobModal(jobId)}
-                        >
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          onClick={() => setDeleteJobId(jobId)}
-                          title="Delete job"
-                          className="text-destructive hover:text-destructive"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              onClick={() => initializeRepo(jobId)}
+                              disabled={initializingJobs.has(jobId)}
+                            >
+                              {initializingJobs.has(jobId) ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <FolderPlus className="h-4 w-4" />
+                              )}
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Initialize repository</TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              onClick={() => runBackup(jobId)}
+                              disabled={runningJobs.has(jobId) || job.status === "running"}
+                            >
+                              {runningJobs.has(jobId) || job.status === "running" ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <Play className="h-4 w-4" />
+                              )}
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Run backup</TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Link to={`/jobs/${jobId}/snapshots`}>
+                              <Button size="icon" variant="ghost">
+                                <Camera className="h-4 w-4" />
+                              </Button>
+                            </Link>
+                          </TooltipTrigger>
+                          <TooltipContent>View snapshots</TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              onClick={() => openEditJobModal(jobId)}
+                            >
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Edit job</TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              onClick={() => setDeleteJobId(jobId)}
+                              className="text-destructive hover:text-destructive"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Delete job</TooltipContent>
+                        </Tooltip>
                       </div>
                     </TableCell>
                   </TableRow>
