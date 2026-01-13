@@ -248,6 +248,56 @@ def backup_filesystem():
         return jsonify({'success': False, 'error': sanitize_error(str(e))}), 500
 
 
+@app.route('/test/database', methods=['POST'])
+@verify_api_key
+def test_database():
+    """Test MySQL database connection"""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({'success': False, 'error': 'No data provided'}), 400
+
+    db_host = data.get('db_host', '')
+    db_port = int(data.get('db_port', 3306))
+    db_user = data.get('db_user', '')
+    db_password = data.get('db_password', '')
+
+    if not all([db_host, db_user, db_password]):
+        return jsonify({'success': False, 'error': 'Missing required database fields'}), 400
+
+    try:
+        # Test MySQL connection using mysql client
+        test_cmd = [
+            'mysql',
+            '-h', db_host,
+            '-P', str(db_port),
+            '-u', db_user,
+            f'-p{db_password}',
+            '-e', 'SELECT 1'
+        ]
+
+        result = subprocess.run(
+            test_cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode == 0:
+            logger.info(f"Database connection test successful: {db_host}:{db_port}")
+            return jsonify({'success': True, 'message': 'Database connection successful'})
+        else:
+            error_msg = sanitize_error(result.stderr or result.stdout or 'Connection failed')
+            logger.warning(f"Database connection test failed: {error_msg}")
+            return jsonify({'success': False, 'error': error_msg}), 400
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'Connection timed out'}), 400
+    except Exception as e:
+        logger.exception("Database test error")
+        return jsonify({'success': False, 'error': sanitize_error(str(e))}), 500
+
+
 @app.route('/backup/database', methods=['POST'])
 @verify_api_key
 def backup_database():

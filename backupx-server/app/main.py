@@ -3566,7 +3566,7 @@ def api_delete_db_config_route(config_id):
 @login_required
 @csrf.exempt
 def api_test_db_connection():
-    """Test MySQL database connection via SSH"""
+    """Test MySQL database connection via SSH or Agent"""
     data = request.get_json()
 
     if not data:
@@ -3578,7 +3578,7 @@ def api_test_db_connection():
     db_user = data.get('username', '')
     db_pass = data.get('password', '')
 
-    # Server config (SSH connection)
+    # Server config
     server_id = data.get('server_id', '')
 
     if not all([db_host, db_user, db_pass]):
@@ -3588,11 +3588,45 @@ def api_test_db_connection():
         return jsonify({'error': 'Server selection required to test connection'}), 400
 
     # Get server details
-    servers = load_servers()
-    server = next((s for s in servers if s['id'] == server_id), None)
+    server = get_server(server_id)
     if not server:
         return jsonify({'error': 'Server not found'}), 400
 
+    connection_type = server.get('connection_type', 'ssh')
+
+    # Use agent for testing if server is agent-based
+    if connection_type == 'agent':
+        try:
+            agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/test/database"
+
+            payload = {
+                'db_host': db_host,
+                'db_port': db_port,
+                'db_user': db_user,
+                'db_password': db_pass
+            }
+
+            req_data = json.dumps(payload).encode('utf-8')
+            req = Request(agent_url, data=req_data, method='POST')
+            req.add_header('Content-Type', 'application/json')
+            req.add_header('X-API-Key', server.get('agent_api_key', ''))
+
+            with urlopen(req, timeout=30) as response:
+                result = json.loads(response.read().decode('utf-8'))
+
+            if result.get('success'):
+                return jsonify({'success': True, 'message': 'Database connection successful'})
+            else:
+                return jsonify({'error': result.get('error', 'Connection failed')}), 400
+
+        except (URLError, HTTPError) as e:
+            if hasattr(e, 'code') and e.code == 401:
+                return jsonify({'error': 'Agent authentication failed - check API key'}), 400
+            return jsonify({'error': sanitize_error_message(str(e))}), 400
+        except Exception as e:
+            return jsonify({'error': sanitize_error_message(str(e))}), 500
+
+    # SSH-based testing
     try:
         # Escape all values for shell to prevent command injection
         escaped_host = shlex.quote(db_host)
