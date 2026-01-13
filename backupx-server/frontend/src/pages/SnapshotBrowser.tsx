@@ -24,6 +24,22 @@ import {
   BreadcrumbPage,
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import type { SnapshotFile, SnapshotFilesResponse } from "@/types/job";
@@ -37,6 +53,9 @@ import {
   FileText,
   Download,
   Camera,
+  MoreHorizontal,
+  RotateCcw,
+  Archive,
 } from "lucide-react";
 
 export default function SnapshotBrowser() {
@@ -47,6 +66,13 @@ export default function SnapshotBrowser() {
   const [files, setFiles] = useState<SnapshotFile[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [downloadingFiles, setDownloadingFiles] = useState<Set<string>>(new Set());
+  const [downloadingZip, setDownloadingZip] = useState<Set<string>>(new Set());
+
+  // Restore dialog state
+  const [restoreDialogOpen, setRestoreDialogOpen] = useState(false);
+  const [restoreItem, setRestoreItem] = useState<SnapshotFile | null>(null);
+  const [targetPath, setTargetPath] = useState("");
+  const [isRestoring, setIsRestoring] = useState(false);
 
   const currentPath = searchParams.get("path") || "/";
 
@@ -117,6 +143,79 @@ export default function SnapshotBrowser() {
         next.delete(item.path);
         return next;
       });
+    }
+  };
+
+  const handleDownloadZip = async (item: SnapshotFile, e: React.MouseEvent) => {
+    e.stopPropagation();
+
+    setDownloadingZip((prev) => new Set(prev).add(item.path));
+
+    try {
+      const url = `/api/jobs/${jobId}/snapshots/${snapshotId}/download-zip?path=${encodeURIComponent(item.path)}`;
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || "Download failed");
+      }
+
+      const blob = await response.blob();
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = `${item.name}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(downloadUrl);
+
+      toast.success(`Downloaded ${item.name}.zip`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Download failed");
+    } finally {
+      setDownloadingZip((prev) => {
+        const next = new Set(prev);
+        next.delete(item.path);
+        return next;
+      });
+    }
+  };
+
+  const openRestoreDialog = (item: SnapshotFile, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setRestoreItem(item);
+    // Default target path based on item type
+    setTargetPath(item.type === "dir" ? item.path : item.path.substring(0, item.path.lastIndexOf("/")));
+    setRestoreDialogOpen(true);
+  };
+
+  const handleRestore = async () => {
+    if (!restoreItem || !targetPath) return;
+
+    setIsRestoring(true);
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/snapshots/${snapshotId}/restore`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source_path: restoreItem.path,
+          target_path: targetPath,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        toast.success(data.message || "Restore completed successfully");
+        setRestoreDialogOpen(false);
+      } else {
+        toast.error(data.error || "Restore failed");
+      }
+    } catch {
+      toast.error("Restore failed");
+    } finally {
+      setIsRestoring(false);
     }
   };
 
@@ -310,20 +409,49 @@ export default function SnapshotBrowser() {
                       {formatTime(item.mtime)}
                     </TableCell>
                     <TableCell className="text-right">
-                      {item.type === "file" && (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={(e) => handleDownload(item, e)}
-                          disabled={downloadingFiles.has(item.path)}
-                        >
-                          {downloadingFiles.has(item.path) ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                          ) : (
-                            <Download className="h-4 w-4" />
-                          )}
-                        </Button>
-                      )}
+                      <div className="flex items-center justify-end gap-1">
+                        {item.type === "file" && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            onClick={(e) => handleDownload(item, e)}
+                            disabled={downloadingFiles.has(item.path)}
+                            title="Download file"
+                          >
+                            {downloadingFiles.has(item.path) ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <Download className="h-4 w-4" />
+                            )}
+                          </Button>
+                        )}
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
+                            <Button variant="ghost" size="icon">
+                              <MoreHorizontal className="h-4 w-4" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                              onClick={(e) => openRestoreDialog(item, e as unknown as React.MouseEvent)}
+                            >
+                              <RotateCcw className="h-4 w-4 mr-2" />
+                              Restore to server
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={(e) => handleDownloadZip(item, e as unknown as React.MouseEvent)}
+                              disabled={downloadingZip.has(item.path)}
+                            >
+                              {downloadingZip.has(item.path) ? (
+                                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                              ) : (
+                                <Archive className="h-4 w-4 mr-2" />
+                              )}
+                              Download as ZIP
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}
@@ -332,6 +460,54 @@ export default function SnapshotBrowser() {
           )}
         </CardContent>
       </Card>
+
+      {/* Restore Dialog */}
+      <Dialog open={restoreDialogOpen} onOpenChange={setRestoreDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Restore to Server</DialogTitle>
+            <DialogDescription>
+              Restore {restoreItem?.type === "dir" ? "folder" : "file"} "{restoreItem?.name}" to the original server.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label>Source Path</Label>
+              <Input value={restoreItem?.path || ""} disabled />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="target-path">Target Path</Label>
+              <Input
+                id="target-path"
+                value={targetPath}
+                onChange={(e) => setTargetPath(e.target.value)}
+                placeholder="/path/to/restore"
+              />
+              <p className="text-xs text-muted-foreground">
+                The path on the server where files will be restored
+              </p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRestoreDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={handleRestore} disabled={isRestoring || !targetPath}>
+              {isRestoring ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Restoring...
+                </>
+              ) : (
+                <>
+                  <RotateCcw className="h-4 w-4 mr-2" />
+                  Restore
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

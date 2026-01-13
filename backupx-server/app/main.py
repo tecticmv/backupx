@@ -2397,6 +2397,242 @@ def api_snapshot_download(job_id, snapshot_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/restore', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_snapshot_restore(job_id, snapshot_id):
+    """Restore files from a snapshot to the server"""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+
+    source_path = data.get('source_path', '')
+    target_path = data.get('target_path', '')
+
+    if not source_path:
+        return jsonify({'error': 'Source path is required'}), 400
+    if not target_path:
+        return jsonify({'error': 'Target path is required'}), 400
+
+    # Sanitize paths
+    if '..' in source_path or '..' in target_path:
+        return jsonify({'error': 'Invalid path'}), 400
+
+    # Get server info for SSH connection
+    server_id = job.get('server_id')
+    if not server_id:
+        return jsonify({'error': 'Job has no associated server'}), 400
+
+    server = get_server(server_id)
+    if not server:
+        return jsonify({'error': 'Server not found'}), 404
+
+    # Get skip_ssl_verify from S3 config
+    s3_config_id = job.get('s3_config_id')
+    skip_ssl_verify = False
+    if s3_config_id:
+        s3_config = get_s3_config(s3_config_id)
+        if s3_config:
+            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+
+    try:
+        # Build restic restore command
+        repo = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+
+        # Create the restic restore command - restore specific path to target
+        restic_cmd = f"restic restore {snapshot_id} --target {target_path} --include {source_path}"
+        if skip_ssl_verify:
+            restic_cmd += " --insecure-tls"
+
+        # Environment variables for restic
+        env_exports = f"""
+export AWS_ACCESS_KEY_ID='{job['s3_access_key']}'
+export AWS_SECRET_ACCESS_KEY='{job['s3_secret_key']}'
+export RESTIC_PASSWORD='{job['restic_password']}'
+export RESTIC_REPOSITORY='{repo}'
+"""
+        full_cmd = env_exports + restic_cmd
+
+        # Check if this is an agent-based server
+        if server.get('agent_url'):
+            # Use agent to run the restore
+            agent_url = server['agent_url'].rstrip('/')
+            try:
+                agent_response = requests.post(
+                    f"{agent_url}/execute",
+                    json={'command': full_cmd},
+                    timeout=600,
+                    verify=not server.get('skip_ssl_verify', False)
+                )
+                if agent_response.status_code == 200:
+                    result = agent_response.json()
+                    if result.get('exit_code', 1) != 0:
+                        return jsonify({'error': result.get('stderr', 'Restore failed')}), 400
+                    return jsonify({
+                        'success': True,
+                        'message': f"Restored {source_path} to {target_path}",
+                        'output': result.get('stdout', '')
+                    })
+                else:
+                    return jsonify({'error': 'Agent request failed'}), 400
+            except requests.exceptions.RequestException as e:
+                return jsonify({'error': f'Agent connection failed: {str(e)}'}), 400
+        else:
+            # Use SSH to run the restore
+            ssh_host = server.get('host')
+            ssh_port = server.get('port', 22)
+            ssh_key = server.get('ssh_key')
+
+            if not ssh_host or not ssh_key:
+                return jsonify({'error': 'Server SSH configuration incomplete'}), 400
+
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as key_file:
+                key_file.write(ssh_key)
+                key_file_path = key_file.name
+
+            try:
+                os.chmod(key_file_path, 0o600)
+
+                ssh_cmd = [
+                    'ssh', '-o', 'StrictHostKeyChecking=no',
+                    '-o', 'BatchMode=yes',
+                    '-i', key_file_path,
+                    '-p', str(ssh_port),
+                    f'root@{ssh_host}',
+                    full_cmd
+                ]
+
+                result = subprocess.run(
+                    ssh_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+
+                if result.returncode != 0:
+                    return jsonify({'error': result.stderr or 'Restore failed'}), 400
+
+                return jsonify({
+                    'success': True,
+                    'message': f"Restored {source_path} to {target_path}",
+                    'output': result.stdout
+                })
+
+            finally:
+                os.unlink(key_file_path)
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Restore timed out'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/download-zip')
+@login_required
+def api_snapshot_download_zip(job_id, snapshot_id):
+    """Download files/folders from a snapshot as a ZIP archive"""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+
+    file_path = request.args.get('path', '')
+    if not file_path:
+        return jsonify({'error': 'Path is required'}), 400
+
+    # Sanitize path
+    if '..' in file_path:
+        return jsonify({'error': 'Invalid path'}), 400
+
+    # Get skip_ssl_verify from S3 config
+    s3_config_id = job.get('s3_config_id')
+    skip_ssl_verify = False
+    if s3_config_id:
+        s3_config = get_s3_config(s3_config_id)
+        if s3_config:
+            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+
+    try:
+        import tempfile
+        import zipfile
+        import shutil
+
+        env = os.environ.copy()
+        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
+        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
+        env['RESTIC_PASSWORD'] = job['restic_password']
+        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+
+        # Create a temporary directory for restore
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Use restic restore to extract files to temp directory
+            cmd = ['restic', 'restore', snapshot_id, '--target', temp_dir, '--include', file_path]
+            if skip_ssl_verify:
+                cmd.append('--insecure-tls')
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=600  # 10 minute timeout
+            )
+
+            if result.returncode != 0:
+                error_msg = result.stderr or 'Failed to extract files'
+                return jsonify({'error': error_msg}), 400
+
+            # Create ZIP file
+            zip_path = tempfile.mktemp(suffix='.zip')
+            archive_name = os.path.basename(file_path.rstrip('/')) or 'snapshot'
+
+            # Find the extracted content
+            extracted_path = os.path.join(temp_dir, file_path.lstrip('/'))
+
+            if not os.path.exists(extracted_path):
+                # Try without leading slash
+                extracted_path = os.path.join(temp_dir, file_path.strip('/'))
+
+            if not os.path.exists(extracted_path):
+                return jsonify({'error': 'Failed to locate extracted files'}), 400
+
+            # Create ZIP archive
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                if os.path.isfile(extracted_path):
+                    zipf.write(extracted_path, os.path.basename(extracted_path))
+                else:
+                    for root, dirs, files in os.walk(extracted_path):
+                        for file in files:
+                            file_full_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_full_path, extracted_path)
+                            zipf.write(file_full_path, os.path.join(archive_name, arcname))
+
+            # Read ZIP file and return as response
+            with open(zip_path, 'rb') as f:
+                zip_data = f.read()
+
+            os.unlink(zip_path)
+
+            from flask import Response
+            return Response(
+                zip_data,
+                mimetype='application/zip',
+                headers={
+                    'Content-Disposition': f'attachment; filename="{archive_name}.zip"',
+                    'Content-Length': len(zip_data)
+                }
+            )
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Download timed out'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/history')
 @login_required
 def api_history():

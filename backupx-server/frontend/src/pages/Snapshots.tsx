@@ -17,6 +17,22 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { toast } from "sonner";
 import type { Job, Snapshot, RepoStats } from "@/types/job";
@@ -31,6 +47,9 @@ import {
   Info,
   RefreshCw,
   FolderOpen,
+  MoreHorizontal,
+  RotateCcw,
+  Archive,
 } from "lucide-react";
 
 export default function Snapshots() {
@@ -42,6 +61,15 @@ export default function Snapshots() {
   const [stats, setStats] = useState<RepoStats | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
+
+  // Restore dialog state
+  const [restoreDialogOpen, setRestoreDialogOpen] = useState(false);
+  const [restoreSnapshot, setRestoreSnapshot] = useState<Snapshot | null>(null);
+  const [targetPath, setTargetPath] = useState("/");
+  const [isRestoring, setIsRestoring] = useState(false);
+
+  // Download ZIP state
+  const [downloadingZip, setDownloadingZip] = useState<string | null>(null);
 
   useEffect(() => {
     fetchData();
@@ -91,6 +119,72 @@ export default function Snapshots() {
       toast.error("Failed to start backup");
     } finally {
       setIsRunning(false);
+    }
+  };
+
+  const openRestoreDialog = (snapshot: Snapshot) => {
+    setRestoreSnapshot(snapshot);
+    setTargetPath("/");
+    setRestoreDialogOpen(true);
+  };
+
+  const handleRestore = async () => {
+    if (!restoreSnapshot || !targetPath) return;
+
+    setIsRestoring(true);
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/snapshots/${restoreSnapshot.id}/restore`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source_path: "/",
+          target_path: targetPath,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (response.ok) {
+        toast.success(data.message || "Restore completed successfully");
+        setRestoreDialogOpen(false);
+      } else {
+        toast.error(data.error || "Restore failed");
+      }
+    } catch {
+      toast.error("Restore failed");
+    } finally {
+      setIsRestoring(false);
+    }
+  };
+
+  const handleDownloadZip = async (snapshot: Snapshot) => {
+    setDownloadingZip(snapshot.id);
+
+    try {
+      // Download the root path of the snapshot as ZIP
+      const url = `/api/jobs/${jobId}/snapshots/${snapshot.id}/download-zip?path=/`;
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || "Download failed");
+      }
+
+      const blob = await response.blob();
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = `snapshot-${snapshot.id.slice(0, 8)}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(downloadUrl);
+
+      toast.success("Snapshot downloaded as ZIP");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Download failed");
+    } finally {
+      setDownloadingZip(null);
     }
   };
 
@@ -295,14 +389,40 @@ export default function Snapshots() {
                       </div>
                     </TableCell>
                     <TableCell className="text-right">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => navigate(`/jobs/${jobId}/snapshots/${snapshot.id}/files`)}
-                        title="Browse files"
-                      >
-                        <FolderOpen className="h-4 w-4" />
-                      </Button>
+                      <div className="flex items-center justify-end gap-1">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => navigate(`/jobs/${jobId}/snapshots/${snapshot.id}/files`)}
+                          title="Browse files"
+                        >
+                          <FolderOpen className="h-4 w-4" />
+                        </Button>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button variant="ghost" size="icon">
+                              <MoreHorizontal className="h-4 w-4" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem onClick={() => openRestoreDialog(snapshot)}>
+                              <RotateCcw className="h-4 w-4 mr-2" />
+                              Restore to server
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={() => handleDownloadZip(snapshot)}
+                              disabled={downloadingZip === snapshot.id}
+                            >
+                              {downloadingZip === snapshot.id ? (
+                                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                              ) : (
+                                <Archive className="h-4 w-4 mr-2" />
+                              )}
+                              Download as ZIP
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}
@@ -333,6 +453,58 @@ restic restore SNAPSHOT_ID --target /restore/path`}
           </pre>
         </AlertDescription>
       </Alert>
+
+      {/* Restore Dialog */}
+      <Dialog open={restoreDialogOpen} onOpenChange={setRestoreDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Restore Snapshot to Server</DialogTitle>
+            <DialogDescription>
+              Restore the entire snapshot "{restoreSnapshot?.id.slice(0, 8)}" to the original server.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label>Snapshot</Label>
+              <Input value={restoreSnapshot?.id || ""} disabled />
+            </div>
+            <div className="space-y-2">
+              <Label>Paths in Snapshot</Label>
+              <Input value={restoreSnapshot?.paths.join(", ") || ""} disabled />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="target-path">Target Path</Label>
+              <Input
+                id="target-path"
+                value={targetPath}
+                onChange={(e) => setTargetPath(e.target.value)}
+                placeholder="/path/to/restore"
+              />
+              <p className="text-xs text-muted-foreground">
+                The base path on the server where files will be restored. The original directory structure will be preserved.
+              </p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRestoreDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={handleRestore} disabled={isRestoring || !targetPath}>
+              {isRestoring ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Restoring...
+                </>
+              ) : (
+                <>
+                  <RotateCcw className="h-4 w-4 mr-2" />
+                  Restore
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
