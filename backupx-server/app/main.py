@@ -1531,6 +1531,11 @@ def run_agent_filesystem_backup(job_id, job, server):
             'skip_ssl_verify': job.get('skip_ssl_verify', False)
         }
 
+        # Log payload details (without secrets) for debugging
+        logger.debug(f"Agent backup payload: directories={payload['directories']}, "
+                    f"s3_endpoint={payload['s3_endpoint']}, s3_bucket={payload['s3_bucket']}, "
+                    f"backup_prefix={payload['backup_prefix']}, skip_ssl_verify={payload['skip_ssl_verify']}")
+
         data = json.dumps(payload).encode('utf-8')
         req = Request(agent_url, data=data, method='POST')
         req.add_header('Content-Type', 'application/json')
@@ -1561,6 +1566,13 @@ def run_agent_filesystem_backup(job_id, job, server):
         duration = (datetime.now() - start_time).total_seconds()
         if hasattr(e, 'code') and e.code == 401:
             error_msg = "Agent authentication failed - check API key"
+        elif hasattr(e, 'code') and hasattr(e, 'read'):
+            # Read the error response from agent
+            try:
+                error_response = json.loads(e.read().decode('utf-8'))
+                error_msg = error_response.get('error', str(e))
+            except:
+                error_msg = sanitize_error_message(str(e))
         else:
             error_msg = sanitize_error_message(str(e))
         update_job_status(job_id, 'error')
