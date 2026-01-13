@@ -305,8 +305,8 @@ def validate_bucket_name(name: str) -> bool:
     bucket_pattern = re.compile(r'^[a-z0-9][a-z0-9\-\.]*[a-z0-9]$')
     return bool(bucket_pattern.match(name))
 
-# Scheduler
-scheduler = BackgroundScheduler()
+# Scheduler - uses system timezone (TZ environment variable)
+scheduler = BackgroundScheduler(timezone=os.environ.get('TZ', 'UTC'))
 scheduler.start()
 
 
@@ -3974,10 +3974,15 @@ def serve_frontend(path):
 
 # Initialize scheduled jobs on startup
 def init_schedules():
+    logger.info("Initializing scheduled jobs...")
     jobs = load_jobs()
+    scheduled_count = 0
     for job_id, job in jobs.items():
         if job.get('schedule_enabled'):
             schedule_job(job_id, job)
+            scheduled_count += 1
+            logger.info(f"Scheduled job: {job['name']} ({job_id}) - cron: {job.get('schedule_cron', '0 2 * * *')}")
+    logger.info(f"Initialized {scheduled_count} scheduled jobs")
 
 
 # Initialize database and migrate data on startup
