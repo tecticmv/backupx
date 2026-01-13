@@ -5,8 +5,10 @@ services:
     build: .
     container_name: backupx-agent
     restart: unless-stopped
-    ports:
-      - "8090:8090"
+    # Use host network to access host services (MySQL, etc.) via localhost
+    network_mode: host
+    # Note: ports mapping is ignored when using network_mode: host
+    # The agent will listen on AGENT_PORT (default 8090) on the host
     volumes:
       # Mount directories you want to backup (read-only for safety)
       - /var/www:/var/www:ro
