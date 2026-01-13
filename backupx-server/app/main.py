@@ -156,9 +156,19 @@ def is_encrypted(value: str) -> bool:
 _admin_password_hash = None
 
 def get_admin_password_hash():
-    """Get hashed admin password"""
+    """Get hashed admin password - checks database first, then env var"""
     global _admin_password_hash
     if _admin_password_hash is None:
+        # Try to get saved hash from database
+        try:
+            saved_hash = get_app_setting('admin_password_hash')
+            if saved_hash:
+                _admin_password_hash = saved_hash
+                return _admin_password_hash
+        except Exception:
+            pass  # Database not ready yet, fall back to env var
+
+        # Fall back to environment variable
         admin_pass = os.environ.get('ADMIN_PASSWORD', 'changeme')
         _admin_password_hash = generate_password_hash(admin_pass)
     return _admin_password_hash
@@ -1992,6 +2002,43 @@ def api_me():
     if current_user.is_authenticated:
         return jsonify({'id': current_user.id, 'username': current_user.id})
     return jsonify({'error': 'Not authenticated'}), 401
+
+
+@app.route('/api/auth/change-password', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_change_password():
+    """Change the admin password"""
+    global _admin_password_hash
+
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+
+    current_password = data.get('current_password')
+    new_password = data.get('new_password')
+
+    if not current_password or not new_password:
+        return jsonify({'error': 'Current password and new password are required'}), 400
+
+    if len(new_password) < 8:
+        return jsonify({'error': 'New password must be at least 8 characters'}), 400
+
+    # Verify current password
+    if not check_password_hash(get_admin_password_hash(), current_password):
+        return jsonify({'error': 'Current password is incorrect'}), 401
+
+    # Update the password hash in memory
+    _admin_password_hash = generate_password_hash(new_password)
+
+    # Store new password hash in database settings
+    success, error = set_app_setting('admin_password_hash', _admin_password_hash)
+    if not success:
+        logger.error(f"Failed to save password to database: {error}")
+        # Password is still updated in memory for this session
+
+    logger.info(f"Password changed for user: {current_user.id}")
+    return jsonify({'success': True, 'message': 'Password changed successfully'})
 
 
 # API Routes
