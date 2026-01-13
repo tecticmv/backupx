@@ -3649,7 +3649,7 @@ def api_create_notification():
         return jsonify({'error': f'Missing required fields: {", ".join(missing)}'}), 400
 
     # Validate type
-    valid_types = ['email', 'slack', 'discord', 'webhook']
+    valid_types = ['email', 'slack', 'discord', 'telegram', 'webhook']
     if data['type'] not in valid_types:
         return jsonify({'error': f'Invalid type. Must be one of: {", ".join(valid_types)}'}), 400
 
