@@ -40,25 +40,24 @@ import {
   HardDrive,
   Bell,
   Shield,
-  Globe,
 } from "lucide-react";
 
-const navItems = [
+const mainItems = [
   { path: "/", label: "Dashboard", icon: LayoutDashboard },
   { path: "/jobs", label: "Backup Jobs", icon: FolderSync },
-  { path: "/history", label: "History", icon: History },
+  { path: "/history", label: "Run History", icon: History },
 ];
 
-const configItems = [
+const resourceItems = [
   { path: "/servers", label: "Servers", icon: Server },
   { path: "/databases", label: "Databases", icon: Database },
-  { path: "/storage", label: "S3 Storage", icon: HardDrive },
-  { path: "/notifications", label: "Notifications", icon: Bell },
-  { path: "/audit", label: "Audit Log", icon: Shield },
+  { path: "/storage", label: "Storage", icon: HardDrive },
 ];
 
-const settingsItems = [
-  { path: "/settings", label: "Timezone", icon: Globe },
+const systemItems = [
+  { path: "/notifications", label: "Notifications", icon: Bell },
+  { path: "/audit", label: "Audit Log", icon: Shield },
+  { path: "/settings", label: "Settings", icon: Settings },
 ];
 
 export function AppSidebar() {
@@ -95,10 +94,10 @@ export function AppSidebar() {
 
       <SidebarContent>
         <SidebarGroup>
-          <SidebarGroupLabel>Navigation</SidebarGroupLabel>
+          <SidebarGroupLabel>Main</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {navItems.map((item) => {
+              {mainItems.map((item) => {
                 const Icon = item.icon;
                 return (
                   <SidebarMenuItem key={item.path}>
@@ -116,10 +115,10 @@ export function AppSidebar() {
         </SidebarGroup>
 
         <SidebarGroup>
-          <SidebarGroupLabel>Configuration</SidebarGroupLabel>
+          <SidebarGroupLabel>Resources</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {configItems.map((item) => {
+              {resourceItems.map((item) => {
                 const Icon = item.icon;
                 return (
                   <SidebarMenuItem key={item.path}>
@@ -137,10 +136,10 @@ export function AppSidebar() {
         </SidebarGroup>
 
         <SidebarGroup>
-          <SidebarGroupLabel>Settings</SidebarGroupLabel>
+          <SidebarGroupLabel>System</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {settingsItems.map((item) => {
+              {systemItems.map((item) => {
                 const Icon = item.icon;
                 return (
                   <SidebarMenuItem key={item.path}>
