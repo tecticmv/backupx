@@ -4172,6 +4172,14 @@ def init_app():
     init_db()
     migrate_json_to_sqlite()
 
+    # Initialize PostgreSQL database and run migrations
+    try:
+        from .db import init_database
+        init_database()
+        logger.info("PostgreSQL database initialized and migrations applied")
+    except Exception as e:
+        logger.warning(f"PostgreSQL initialization skipped: {e}")
+
     # Re-initialize scheduler with timezone from database
     reinit_scheduler_with_db_timezone()
 
