@@ -371,4 +371,14 @@ class PostgresBackend(DatabaseBackend):
         if 'agent_api_key' not in columns:
             self.add_column('servers', 'agent_api_key', 'TEXT')
 
+        # Create app_settings table if it doesn't exist
+        self.executescript('''
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        ''')
+        self.commit()
+
         logger.info("PostgreSQL schema migration completed")
