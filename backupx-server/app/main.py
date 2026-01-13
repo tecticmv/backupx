@@ -19,7 +19,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_from_directory, g
@@ -93,6 +93,17 @@ def validate_environment():
 
 # Encryption key derived from SECRET_KEY (for encrypting stored credentials)
 _fernet = None
+
+
+def utc_now():
+    """Get current UTC time with timezone info"""
+    return datetime.now(timezone.utc)
+
+
+def utc_isoformat():
+    """Get current UTC time as ISO format string"""
+    return utc_now().isoformat()
+
 
 def get_fernet():
     """Get Fernet instance for encryption/decryption"""
@@ -534,7 +545,7 @@ def migrate_json_to_sqlite():
                 ''', (s['id'], s['name'], s['host'], s.get('connection_type', 'ssh'),
                       s.get('ssh_port', 22), s.get('ssh_user'), s.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
                       s.get('agent_port', 8090), s.get('agent_api_key'),
-                      s.get('created_at', datetime.now().isoformat()), s.get('updated_at')))
+                      s.get('created_at', utc_isoformat()), s.get('updated_at')))
             logger.info(f"  Migrated {len(servers)} servers")
         except Exception as e:
             logger.error(f"  Error migrating servers: {e}")
@@ -549,7 +560,7 @@ def migrate_json_to_sqlite():
                     INSERT INTO s3_configs (id, name, endpoint, bucket, access_key, secret_key, region, skip_ssl_verify, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (c['id'], c['name'], c['endpoint'], c['bucket'], c['access_key'], c['secret_key'],
-                      c.get('region', ''), c.get('skip_ssl_verify', 0), c.get('created_at', datetime.now().isoformat()), c.get('updated_at')))
+                      c.get('region', ''), c.get('skip_ssl_verify', 0), c.get('created_at', utc_isoformat()), c.get('updated_at')))
             logger.info(f"  Migrated {len(configs)} S3 configs")
         except Exception as e:
             logger.error(f"  Error migrating S3 configs: {e}")
@@ -565,7 +576,7 @@ def migrate_json_to_sqlite():
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (c['id'], c['name'], c.get('type', 'mysql'), c['host'], c.get('port', 3306),
                       c['username'], c['password'], c.get('databases', '*'),
-                      c.get('created_at', datetime.now().isoformat()), c.get('updated_at')))
+                      c.get('created_at', utc_isoformat()), c.get('updated_at')))
             logger.info(f"  Migrated {len(configs)} database configs")
         except Exception as e:
             logger.error(f"  Error migrating database configs: {e}")
@@ -589,7 +600,7 @@ def migrate_json_to_sqlite():
                       j.get('restic_password'), j.get('backup_prefix'), 1 if j.get('schedule_enabled') else 0,
                       j.get('schedule_cron', '0 2 * * *'), j.get('retention_hourly', 24), j.get('retention_daily', 7),
                       j.get('retention_weekly', 4), j.get('retention_monthly', 12), j.get('timeout', 7200),
-                      j.get('status', 'pending'), j.get('created_at', datetime.now().isoformat()), j.get('updated_at'),
+                      j.get('status', 'pending'), j.get('created_at', utc_isoformat()), j.get('updated_at'),
                       j.get('last_run'), j.get('last_success')))
             logger.info(f"  Migrated {len(jobs)} jobs")
         except Exception as e:
@@ -725,7 +736,7 @@ def save_job(job_id, job):
               encrypted_restic_password, job.get('backup_prefix'), 1 if job.get('schedule_enabled') else 0,
               job.get('schedule_cron', '0 2 * * *'), job.get('retention_hourly', 24), job.get('retention_daily', 7),
               job.get('retention_weekly', 4), job.get('retention_monthly', 12), job.get('timeout', 7200),
-              job.get('status', 'pending'), job.get('created_at', datetime.now().isoformat()), job.get('updated_at'),
+              job.get('status', 'pending'), job.get('created_at', utc_isoformat()), job.get('updated_at'),
               job.get('last_run'), job.get('last_success')))
 
     conn.commit()
@@ -745,13 +756,13 @@ def update_job_status(job_id, status, last_run=None, last_success=None):
     conn = get_db_connection()
     if last_success:
         conn.execute('UPDATE jobs SET status=?, last_run=?, last_success=?, updated_at=? WHERE id=?',
-                     (status, last_run, last_success, datetime.now().isoformat(), job_id))
+                     (status, last_run, last_success, utc_isoformat(), job_id))
     elif last_run:
         conn.execute('UPDATE jobs SET status=?, last_run=?, updated_at=? WHERE id=?',
-                     (status, last_run, datetime.now().isoformat(), job_id))
+                     (status, last_run, utc_isoformat(), job_id))
     else:
         conn.execute('UPDATE jobs SET status=?, updated_at=? WHERE id=?',
-                     (status, datetime.now().isoformat(), job_id))
+                     (status, utc_isoformat(), job_id))
     conn.commit()
     conn.close()
 
@@ -772,7 +783,7 @@ def add_history(job_id, job_name, status, message, duration=0):
     conn.execute('''
         INSERT INTO history (timestamp, job_id, job_name, status, message, duration)
         VALUES (?, ?, ?, ?, ?, ?)
-    ''', (datetime.now().isoformat(), job_id, job_name, status, message, duration))
+    ''', (utc_isoformat(), job_id, job_name, status, message, duration))
 
     # Keep only last 100 entries
     conn.execute('''
@@ -820,7 +831,7 @@ def create_s3_config(config):
     ''', (config['id'], config['name'], config['endpoint'], config['bucket'],
           encrypt_credential(config['access_key']), encrypt_credential(config['secret_key']),
           config.get('region', ''), 1 if config.get('skip_ssl_verify') else 0,
-          config.get('created_at', datetime.now().isoformat()), config.get('updated_at')))
+          config.get('created_at', utc_isoformat()), config.get('updated_at')))
     conn.commit()
     conn.close()
 
@@ -834,7 +845,7 @@ def update_s3_config(config_id, config):
     ''', (config['name'], config['endpoint'], config['bucket'],
           encrypt_credential(config['access_key']), encrypt_credential(config['secret_key']),
           config.get('region', ''), 1 if config.get('skip_ssl_verify') else 0,
-          datetime.now().isoformat(), config_id))
+          utc_isoformat(), config_id))
     conn.commit()
     conn.close()
 
@@ -881,7 +892,7 @@ def create_server(server):
     ''', (server['id'], server['name'], server['host'], server.get('connection_type', 'ssh'),
           server.get('ssh_port', 22), server.get('ssh_user'), server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
           server.get('agent_port', 8090), encrypt_credential(server.get('agent_api_key', '') or ''),
-          server.get('created_at', datetime.now().isoformat()), server.get('updated_at')))
+          server.get('created_at', utc_isoformat()), server.get('updated_at')))
     conn.commit()
     conn.close()
 
@@ -895,7 +906,7 @@ def update_server_in_db(server_id, server):
     ''', (server['name'], server['host'], server.get('connection_type', 'ssh'),
           server.get('ssh_port', 22), server.get('ssh_user'), server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
           server.get('agent_port', 8090), encrypt_credential(server.get('agent_api_key', '') or ''),
-          datetime.now().isoformat(), server_id))
+          utc_isoformat(), server_id))
     conn.commit()
     conn.close()
 
@@ -941,7 +952,7 @@ def create_db_config(config):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (config['id'], config['name'], config.get('type', 'mysql'), config['host'], config.get('port', 3306),
           config['username'], encrypt_credential(config['password']), config.get('databases', '*'),
-          config.get('created_at', datetime.now().isoformat()), config.get('updated_at')))
+          config.get('created_at', utc_isoformat()), config.get('updated_at')))
     conn.commit()
     conn.close()
 
@@ -954,7 +965,7 @@ def update_db_config_in_db(config_id, config):
         WHERE id=?
     ''', (config['name'], config.get('type', 'mysql'), config['host'], config.get('port', 3306),
           config['username'], encrypt_credential(config['password']), config.get('databases', '*'),
-          datetime.now().isoformat(), config_id))
+          utc_isoformat(), config_id))
     conn.commit()
     conn.close()
 
@@ -1008,7 +1019,7 @@ def create_notification_channel(channel):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (channel['id'], channel['name'], channel['type'], 1 if channel.get('enabled', True) else 0,
           json.dumps(channel.get('config', {})), 1 if channel.get('notify_on_success', True) else 0,
-          1 if channel.get('notify_on_failure', True) else 0, channel.get('created_at', datetime.now().isoformat()),
+          1 if channel.get('notify_on_failure', True) else 0, channel.get('created_at', utc_isoformat()),
           channel.get('updated_at')))
     conn.commit()
     conn.close()
@@ -1022,7 +1033,7 @@ def update_notification_channel(channel_id, channel):
         WHERE id=?
     ''', (channel['name'], channel['type'], 1 if channel.get('enabled', True) else 0,
           json.dumps(channel.get('config', {})), 1 if channel.get('notify_on_success', True) else 0,
-          1 if channel.get('notify_on_failure', True) else 0, datetime.now().isoformat(), channel_id))
+          1 if channel.get('notify_on_failure', True) else 0, utc_isoformat(), channel_id))
     conn.commit()
     conn.close()
 
@@ -1089,7 +1100,7 @@ def send_email_notification(channel, job_name, status, message, duration):
     text_body = f"""Backup Job: {job_name}
 Status: {status.upper()}
 Duration: {format_duration(duration)}
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Time: {utc_now().strftime('%Y-%m-%d %H:%M:%S')} UTC
 
 {message}
 """
@@ -1184,7 +1195,7 @@ def send_discord_notification(channel, job_name, status, message, duration):
                 {"name": "Duration", "value": format_duration(duration), "inline": True}
             ],
             "description": f"```{message[:1000]}```" if message else "_No additional details_",
-            "timestamp": datetime.now().isoformat()
+            "timestamp": utc_isoformat()
         }]
     }
 
@@ -1261,7 +1272,7 @@ def send_webhook_notification(channel, job_name, status, message, duration):
         "status": status,
         "message": message,
         "duration": duration,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": utc_isoformat()
     }
 
     data = json.dumps(payload).encode('utf-8')
@@ -1355,7 +1366,7 @@ def sanitize_error_message(error: str, max_length: int = 500) -> str:
 
 def run_filesystem_backup(job_id, job):
     """Execute a filesystem backup job"""
-    start_time = datetime.now()
+    start_time = utc_now()
     logger.info(f"Starting filesystem backup job: {job_id} ({job['name']})")
 
     # Update job status
@@ -1406,10 +1417,10 @@ restic backup --compression auto --tag automated {insecure_flag} {' '.join(exclu
             timeout=job.get('timeout', 7200)  # 2 hour default timeout
         )
 
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (utc_now() - start_time).total_seconds()
 
         if result.returncode == 0:
-            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=datetime.now().isoformat())
+            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
             add_history(job_id, job['name'], 'success', 'Backup completed successfully', duration)
             send_notification(job_id, job['name'], 'success', 'Backup completed successfully', duration)
             logger.info(f"Filesystem backup completed successfully: {job_id} (duration: {duration:.1f}s)")
@@ -1439,7 +1450,7 @@ restic backup --compression auto --tag automated {insecure_flag} {' '.join(exclu
 
 def run_database_backup(job_id, job):
     """Execute a MySQL database backup job"""
-    start_time = datetime.now()
+    start_time = utc_now()
     logger.info(f"Starting database backup job: {job_id} ({job['name']})")
 
     # Update job status
@@ -1476,7 +1487,7 @@ def run_database_backup(job_id, job):
             db_flag = '--databases ' + ' '.join(db_list)
 
         # Generate backup filename with timestamp
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        timestamp = utc_now().strftime('%Y%m%d_%H%M%S')
         backup_filename = f"mysql_backup_{timestamp}.sql.gz"
 
         # Escape all values for shell
@@ -1527,10 +1538,10 @@ exit $RESTIC_EXIT
             timeout=job.get('timeout', 7200)  # 2 hour default timeout
         )
 
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (utc_now() - start_time).total_seconds()
 
         if result.returncode == 0:
-            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=datetime.now().isoformat())
+            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
             message = f'MySQL backup completed successfully ({databases})'
             add_history(job_id, job['name'], 'success', message, duration)
             send_notification(job_id, job['name'], 'success', message, duration)
@@ -1561,7 +1572,7 @@ exit $RESTIC_EXIT
 
 def run_agent_filesystem_backup(job_id, job, server):
     """Execute a filesystem backup job via agent"""
-    start_time = datetime.now()
+    start_time = utc_now()
     logger.info(f"Starting agent-based filesystem backup job: {job_id} ({job['name']})")
 
     # Update job status
@@ -1598,10 +1609,10 @@ def run_agent_filesystem_backup(job_id, job, server):
         with urlopen(req, timeout=timeout) as response:
             result = json.loads(response.read().decode('utf-8'))
 
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (utc_now() - start_time).total_seconds()
 
         if result.get('success'):
-            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=datetime.now().isoformat())
+            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
             add_history(job_id, job['name'], 'success', 'Backup completed successfully via agent', duration)
             send_notification(job_id, job['name'], 'success', 'Backup completed successfully via agent', duration)
             logger.info(f"Agent filesystem backup completed successfully: {job_id} (duration: {duration:.1f}s)")
@@ -1615,7 +1626,7 @@ def run_agent_filesystem_backup(job_id, job, server):
             return False, error_msg
 
     except (URLError, HTTPError) as e:
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (utc_now() - start_time).total_seconds()
         if hasattr(e, 'code') and e.code == 401:
             error_msg = "Agent authentication failed - check API key"
         elif hasattr(e, 'code') and hasattr(e, 'read'):
@@ -1633,7 +1644,7 @@ def run_agent_filesystem_backup(job_id, job, server):
         logger.error(f"Agent filesystem backup error: {job_id} - {error_msg}")
         return False, error_msg
     except Exception as e:
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (utc_now() - start_time).total_seconds()
         error_msg = sanitize_error_message(str(e))
         update_job_status(job_id, 'error')
         add_history(job_id, job['name'], 'error', error_msg, duration)
@@ -1644,7 +1655,7 @@ def run_agent_filesystem_backup(job_id, job, server):
 
 def run_agent_database_backup(job_id, job, server):
     """Execute a MySQL database backup job via agent"""
-    start_time = datetime.now()
+    start_time = utc_now()
     logger.info(f"Starting agent-based database backup job: {job_id} ({job['name']})")
 
     # Update job status
@@ -1689,12 +1700,12 @@ def run_agent_database_backup(job_id, job, server):
         with urlopen(req, timeout=timeout) as response:
             result = json.loads(response.read().decode('utf-8'))
 
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (utc_now() - start_time).total_seconds()
 
         if result.get('success'):
             databases = db_config.get('databases', '*')
             message = f'MySQL backup completed successfully via agent ({databases})'
-            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=datetime.now().isoformat())
+            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
             add_history(job_id, job['name'], 'success', message, duration)
             send_notification(job_id, job['name'], 'success', message, duration)
             logger.info(f"Agent database backup completed successfully: {job_id} (duration: {duration:.1f}s)")
@@ -1708,7 +1719,7 @@ def run_agent_database_backup(job_id, job, server):
             return False, error_msg
 
     except (URLError, HTTPError) as e:
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (utc_now() - start_time).total_seconds()
         if hasattr(e, 'code') and e.code == 401:
             error_msg = "Agent authentication failed - check API key"
         else:
@@ -1719,7 +1730,7 @@ def run_agent_database_backup(job_id, job, server):
         logger.error(f"Agent database backup error: {job_id} - {error_msg}")
         return False, error_msg
     except Exception as e:
-        duration = (datetime.now() - start_time).total_seconds()
+        duration = (utc_now() - start_time).total_seconds()
         error_msg = sanitize_error_message(str(e))
         update_job_status(job_id, 'error')
         add_history(job_id, job['name'], 'error', error_msg, duration)
@@ -2052,7 +2063,7 @@ def api_create_job():
         'retention_monthly': int(data.get('retention_monthly', 12)),
         'timeout': int(data.get('timeout', 7200)),
         'status': 'pending',
-        'created_at': datetime.now().isoformat()
+        'created_at': utc_isoformat()
     }
 
     save_job(job_id, job)
@@ -2139,7 +2150,7 @@ def api_update_job(job_id):
         'retention_weekly': int(data.get('retention_weekly', job.get('retention_weekly', 4))),
         'retention_monthly': int(data.get('retention_monthly', job.get('retention_monthly', 12))),
         'timeout': int(data.get('timeout', job.get('timeout', 7200))),
-        'updated_at': datetime.now().isoformat()
+        'updated_at': utc_isoformat()
     })
 
     # Only update secrets if provided
@@ -2829,8 +2840,8 @@ def api_create_s3_config_route():
         'secret_key': data['secret_key'],
         'region': data.get('region', ''),
         'skip_ssl_verify': data.get('skip_ssl_verify', False),
-        'created_at': datetime.now().isoformat(),
-        'updated_at': datetime.now().isoformat()
+        'created_at': utc_isoformat(),
+        'updated_at': utc_isoformat()
     }
 
     create_s3_config(new_config)
@@ -3170,8 +3181,8 @@ def api_create_server_route():
             'ssh_key': ssh_key,
             'agent_port': None,
             'agent_api_key': None,
-            'created_at': datetime.now().isoformat(),
-            'updated_at': datetime.now().isoformat()
+            'created_at': utc_isoformat(),
+            'updated_at': utc_isoformat()
         }
     elif connection_type == 'agent':
         # Agent-specific validation
@@ -3192,8 +3203,8 @@ def api_create_server_route():
             'ssh_key': None,
             'agent_port': agent_port,
             'agent_api_key': data['agent_api_key'],
-            'created_at': datetime.now().isoformat(),
-            'updated_at': datetime.now().isoformat()
+            'created_at': utc_isoformat(),
+            'updated_at': utc_isoformat()
         }
     else:
         return jsonify({'error': 'Invalid connection_type. Must be "ssh" or "agent"'}), 400
@@ -3491,8 +3502,8 @@ def api_create_db_config_route():
         'username': data['username'],
         'password': data['password'],
         'databases': data.get('databases', '*'),
-        'created_at': datetime.now().isoformat(),
-        'updated_at': datetime.now().isoformat()
+        'created_at': utc_isoformat(),
+        'updated_at': utc_isoformat()
     }
 
     create_db_config(new_config)
@@ -3662,7 +3673,7 @@ def api_create_notification():
         'config': data['config'],
         'notify_on_success': data.get('notify_on_success', True),
         'notify_on_failure': data.get('notify_on_failure', True),
-        'created_at': datetime.now().isoformat()
+        'created_at': utc_isoformat()
     }
 
     create_notification_channel(channel)
