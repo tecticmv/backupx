@@ -1683,8 +1683,47 @@ def run_agent_database_backup(job_id, job, server):
         return False, error_msg
 
 
-def get_snapshots(job):
+def get_snapshots(job, server=None):
     """Get list of snapshots for a job"""
+    # Get skip_ssl_verify from S3 config
+    s3_config_id = job.get('s3_config_id')
+    skip_ssl_verify = False
+    if s3_config_id:
+        s3_config = get_s3_config(s3_config_id)
+        if s3_config:
+            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+
+    # If using agent, call agent's /snapshots endpoint
+    if server and server.get('connection_type') == 'agent':
+        try:
+            agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/snapshots"
+
+            payload = {
+                's3_endpoint': job['s3_endpoint'],
+                's3_bucket': job['s3_bucket'],
+                's3_access_key': job['s3_access_key'],
+                's3_secret_key': job['s3_secret_key'],
+                'restic_password': job['restic_password'],
+                'backup_prefix': job.get('backup_prefix', job.get('id', '')),
+                'skip_ssl_verify': skip_ssl_verify
+            }
+
+            data = json.dumps(payload).encode('utf-8')
+            req = Request(agent_url, data=data, method='POST')
+            req.add_header('Content-Type', 'application/json')
+            req.add_header('X-API-Key', server['agent_api_key'])
+
+            with urlopen(req, timeout=60) as response:
+                result = json.loads(response.read().decode('utf-8'))
+
+            if result.get('success'):
+                return result.get('snapshots', [])
+            return []
+        except Exception as e:
+            logger.error(f"Failed to get snapshots via agent: {e}")
+            return []
+
+    # Local restic command
     try:
         env = os.environ.copy()
         env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
@@ -1692,8 +1731,12 @@ def get_snapshots(job):
         env['RESTIC_PASSWORD'] = job['restic_password']
         env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
 
+        cmd = ['restic', 'snapshots', '--json']
+        if skip_ssl_verify:
+            cmd.append('--insecure-tls')
+
         result = subprocess.run(
-            ['restic', 'snapshots', '--json'],
+            cmd,
             capture_output=True,
             text=True,
             env=env,
@@ -1707,8 +1750,47 @@ def get_snapshots(job):
         return []
 
 
-def get_repo_stats(job):
+def get_repo_stats(job, server=None):
     """Get repository statistics"""
+    # Get skip_ssl_verify from S3 config
+    s3_config_id = job.get('s3_config_id')
+    skip_ssl_verify = False
+    if s3_config_id:
+        s3_config = get_s3_config(s3_config_id)
+        if s3_config:
+            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+
+    # If using agent, call agent's /stats endpoint
+    if server and server.get('connection_type') == 'agent':
+        try:
+            agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/stats"
+
+            payload = {
+                's3_endpoint': job['s3_endpoint'],
+                's3_bucket': job['s3_bucket'],
+                's3_access_key': job['s3_access_key'],
+                's3_secret_key': job['s3_secret_key'],
+                'restic_password': job['restic_password'],
+                'backup_prefix': job.get('backup_prefix', job.get('id', '')),
+                'skip_ssl_verify': skip_ssl_verify
+            }
+
+            data = json.dumps(payload).encode('utf-8')
+            req = Request(agent_url, data=data, method='POST')
+            req.add_header('Content-Type', 'application/json')
+            req.add_header('X-API-Key', server['agent_api_key'])
+
+            with urlopen(req, timeout=120) as response:
+                result = json.loads(response.read().decode('utf-8'))
+
+            if result.get('success'):
+                return result.get('stats')
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get stats via agent: {e}")
+            return None
+
+    # Local restic command
     try:
         env = os.environ.copy()
         env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
@@ -1716,8 +1798,12 @@ def get_repo_stats(job):
         env['RESTIC_PASSWORD'] = job['restic_password']
         env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
 
+        cmd = ['restic', 'stats', '--json']
+        if skip_ssl_verify:
+            cmd.append('--insecure-tls')
+
         result = subprocess.run(
-            ['restic', 'stats', '--json'],
+            cmd,
             capture_output=True,
             text=True,
             env=env,
@@ -2105,8 +2191,12 @@ def api_job_snapshots(job_id):
     if not job:
         return jsonify({'error': 'Job not found'}), 404
 
-    snapshots = get_snapshots(job)
-    stats = get_repo_stats(job)
+    # Get server for agent-based jobs
+    server_id = job.get('server_id')
+    server = get_server(server_id) if server_id else None
+
+    snapshots = get_snapshots(job, server)
+    stats = get_repo_stats(job, server)
 
     return jsonify({
         'snapshots': snapshots,
