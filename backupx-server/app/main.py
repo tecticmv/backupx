@@ -1717,7 +1717,10 @@ def get_snapshots(job, server=None):
                 result = json.loads(response.read().decode('utf-8'))
 
             if result.get('success'):
-                return result.get('snapshots', [])
+                snapshots = result.get('snapshots', [])
+                # Sort by time, newest first
+                snapshots.sort(key=lambda x: x.get('time', ''), reverse=True)
+                return snapshots
             return []
         except Exception as e:
             logger.error(f"Failed to get snapshots via agent: {e}")
@@ -1744,7 +1747,10 @@ def get_snapshots(job, server=None):
         )
 
         if result.returncode == 0:
-            return json.loads(result.stdout)
+            snapshots = json.loads(result.stdout)
+            # Sort by time, newest first
+            snapshots.sort(key=lambda x: x.get('time', ''), reverse=True)
+            return snapshots
         return []
     except:
         return []
