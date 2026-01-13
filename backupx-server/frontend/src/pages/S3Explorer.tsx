@@ -35,6 +35,7 @@ import {
   HardDrive,
   FolderOpen,
   FileText,
+  Download,
 } from "lucide-react";
 
 export default function S3Explorer() {
@@ -46,6 +47,7 @@ export default function S3Explorer() {
   const [isLoading, setIsLoading] = useState(true);
   const [bucket, setBucket] = useState("");
   const [configName, setConfigName] = useState("");
+  const [downloadingFiles, setDownloadingFiles] = useState<Set<string>>(new Set());
 
   const currentPath = searchParams.get("path") || "";
 
@@ -89,6 +91,43 @@ export default function S3Explorer() {
   const handleRowClick = (item: S3Object) => {
     if (item.is_dir) {
       navigateToPath(item.path);
+    }
+  };
+
+  const handleDownload = async (item: S3Object, e: React.MouseEvent) => {
+    e.stopPropagation(); // Prevent row click
+
+    setDownloadingFiles((prev) => new Set(prev).add(item.path));
+
+    try {
+      const url = `/api/s3-configs/${configId}/download?path=${encodeURIComponent(item.path)}`;
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || "Download failed");
+      }
+
+      // Get the blob and create download link
+      const blob = await response.blob();
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = item.name;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(downloadUrl);
+
+      toast.success(`Downloaded ${item.name}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Download failed");
+    } finally {
+      setDownloadingFiles((prev) => {
+        const next = new Set(prev);
+        next.delete(item.path);
+        return next;
+      });
     }
   };
 
@@ -250,6 +289,7 @@ export default function S3Explorer() {
                   <TableHead>Type</TableHead>
                   <TableHead>Size</TableHead>
                   <TableHead>Last Modified</TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -279,6 +319,22 @@ export default function S3Explorer() {
                     </TableCell>
                     <TableCell className="text-muted-foreground">
                       {formatTime(item.mod_time)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {!item.is_dir && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={(e) => handleDownload(item, e)}
+                          disabled={downloadingFiles.has(item.path)}
+                        >
+                          {downloadingFiles.has(item.path) ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Download className="h-4 w-4" />
+                          )}
+                        </Button>
+                      )}
                     </TableCell>
                   </TableRow>
                 ))}

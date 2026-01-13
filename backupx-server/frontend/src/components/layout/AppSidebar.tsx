@@ -40,7 +40,6 @@ import {
   HardDrive,
   Bell,
   Shield,
-  FolderSearch,
 } from "lucide-react";
 
 const navItems = [
@@ -53,7 +52,6 @@ const configItems = [
   { path: "/servers", label: "Servers", icon: Server },
   { path: "/databases", label: "Databases", icon: Database },
   { path: "/storage", label: "S3 Storage", icon: HardDrive },
-  { path: "/storage/explorer", label: "S3 Explorer", icon: FolderSearch },
   { path: "/notifications", label: "Notifications", icon: Bell },
   { path: "/audit", label: "Audit Log", icon: Shield },
 ];

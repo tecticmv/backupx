@@ -2449,6 +2449,88 @@ def api_browse_s3_config(config_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/s3-configs/<config_id>/download', methods=['GET'])
+@login_required
+def api_download_s3_file(config_id):
+    """Download a file from S3 bucket"""
+    config = get_s3_config(config_id)
+    if not config:
+        return jsonify({'error': 'S3 configuration not found'}), 404
+
+    file_path = request.args.get('path', '')
+
+    if not file_path:
+        return jsonify({'error': 'File path is required'}), 400
+
+    # Sanitize path - prevent directory traversal
+    file_path = file_path.strip('/')
+    if '..' in file_path:
+        return jsonify({'error': 'Invalid path'}), 400
+
+    try:
+        # Use rclone to download file to a temp location
+        import tempfile
+        env = os.environ.copy()
+        env['RCLONE_CONFIG_DL_TYPE'] = 's3'
+        env['RCLONE_CONFIG_DL_PROVIDER'] = 'Other'
+        env['RCLONE_CONFIG_DL_ACCESS_KEY_ID'] = config['access_key']
+        env['RCLONE_CONFIG_DL_SECRET_ACCESS_KEY'] = config['secret_key']
+        env['RCLONE_CONFIG_DL_ENDPOINT'] = f"https://{config['endpoint']}"
+        env['RCLONE_CONFIG_DL_REGION'] = config.get('region', 'us-east-1')
+
+        # Create temp file for download
+        filename = os.path.basename(file_path)
+        temp_dir = tempfile.mkdtemp()
+        temp_file = os.path.join(temp_dir, filename)
+
+        # Build the remote path
+        remote_path = f"dl:{config['bucket']}/{file_path}"
+
+        # Download file using rclone
+        cmd = ['rclone', 'copy', remote_path, temp_dir]
+        if config.get('skip_ssl_verify'):
+            cmd.append('--no-check-certificate')
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300  # 5 minute timeout for downloads
+        )
+
+        if result.returncode != 0:
+            # Clean up temp dir
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({'error': result.stderr or 'Failed to download file'}), 400
+
+        if not os.path.exists(temp_file):
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return jsonify({'error': 'File not found'}), 404
+
+        # Send file and clean up after
+        from flask import send_file, after_this_request
+
+        @after_this_request
+        def cleanup(response):
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return response
+
+        return send_file(
+            temp_file,
+            as_attachment=True,
+            download_name=filename
+        )
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Download timed out'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # Server API Routes
 @app.route('/api/servers', methods=['GET'])
 @login_required
