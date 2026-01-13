@@ -4039,8 +4039,8 @@ def get_app_setting(key: str, default: str = '') -> str:
         return default
 
 
-def set_app_setting(key: str, value: str) -> bool:
-    """Set an application setting in the database"""
+def set_app_setting(key: str, value: str) -> tuple[bool, str]:
+    """Set an application setting in the database. Returns (success, error_message)."""
     try:
         from .db import get_database
         db = get_database()
@@ -4051,10 +4051,11 @@ def set_app_setting(key: str, value: str) -> bool:
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
         ''', (key, value))
         db.commit()
-        return True
+        return True, ''
     except Exception as e:
-        logger.error(f"Error setting app setting {key}: {e}")
-        return False
+        error_msg = str(e)
+        logger.error(f"Error setting app setting {key}: {error_msg}")
+        return False, error_msg
 
 
 def get_scheduler_timezone() -> str:
@@ -4094,7 +4095,8 @@ def api_set_timezone():
     except Exception:
         return jsonify({'error': f'Invalid timezone: {timezone}'}), 400
 
-    if set_app_setting('timezone', timezone):
+    success, error_msg = set_app_setting('timezone', timezone)
+    if success:
         # Update scheduler timezone
         global scheduler
         scheduler.shutdown(wait=False)
@@ -4107,7 +4109,7 @@ def api_set_timezone():
         logger.info(f"Timezone updated to {timezone}, scheduler restarted")
         return jsonify({'success': True, 'timezone': timezone})
     else:
-        return jsonify({'error': 'Failed to save timezone setting'}), 500
+        return jsonify({'error': error_msg or 'Failed to save timezone setting'}), 500
 
 
 # Serve React frontend
