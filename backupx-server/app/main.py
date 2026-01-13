@@ -3971,28 +3971,59 @@ def api_audit_stats():
 # Common timezone list for UI selection
 COMMON_TIMEZONES = [
     'UTC',
+    # Americas
     'America/New_York',
     'America/Chicago',
     'America/Denver',
     'America/Los_Angeles',
     'America/Toronto',
     'America/Vancouver',
+    'America/Mexico_City',
     'America/Sao_Paulo',
+    'America/Buenos_Aires',
+    # Europe
     'Europe/London',
     'Europe/Paris',
     'Europe/Berlin',
     'Europe/Amsterdam',
+    'Europe/Rome',
+    'Europe/Madrid',
     'Europe/Moscow',
+    'Europe/Istanbul',
+    # Africa
+    'Africa/Cairo',
+    'Africa/Johannesburg',
+    'Africa/Lagos',
+    # Middle East
     'Asia/Dubai',
+    'Asia/Riyadh',
+    'Asia/Jerusalem',
+    # South Asia
     'Asia/Kolkata',
+    'Asia/Colombo',
+    'Asia/Dhaka',
+    'Asia/Karachi',
+    'Indian/Maldives',
+    # Southeast Asia
     'Asia/Singapore',
+    'Asia/Bangkok',
+    'Asia/Jakarta',
+    'Asia/Kuala_Lumpur',
+    'Asia/Manila',
+    'Asia/Ho_Chi_Minh',
+    # East Asia
     'Asia/Hong_Kong',
     'Asia/Tokyo',
     'Asia/Seoul',
     'Asia/Shanghai',
+    'Asia/Taipei',
+    # Australia & Pacific
     'Australia/Sydney',
     'Australia/Melbourne',
+    'Australia/Perth',
     'Pacific/Auckland',
+    'Pacific/Fiji',
+    'Pacific/Honolulu',
 ]
 
 
