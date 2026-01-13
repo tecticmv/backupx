@@ -1867,21 +1867,47 @@ def api_login():
     password = data.get('password')
 
     admin_user = os.environ.get('ADMIN_USERNAME', 'admin')
+    ip_address = request.remote_addr
+    user_agent = request.headers.get('User-Agent', '')
 
     # Use secure password hash comparison
     if username == admin_user and check_password_hash(get_admin_password_hash(), password):
         user = User(username)
         login_user(user)
         logger.info(f"Successful login for user: {username}")
+        # Log successful login
+        try:
+            from .audit.decorator import audit_login
+            audit_login(username, username, True, ip_address, user_agent)
+        except Exception as e:
+            logger.debug(f"Audit logging failed: {e}")
         return jsonify({'user': {'id': username, 'username': username}})
 
     logger.warning(f"Failed login attempt for user: {username} from {request.remote_addr}")
+    # Log failed login
+    try:
+        from .audit.decorator import audit_login
+        audit_login(username or 'unknown', username or 'unknown', False, ip_address, user_agent)
+    except Exception as e:
+        logger.debug(f"Audit logging failed: {e}")
     return jsonify({'error': 'Invalid credentials'}), 401
 
 
 @app.route('/api/auth/logout', methods=['POST'])
 @csrf.exempt
 def api_logout():
+    # Log logout before actually logging out
+    if current_user.is_authenticated:
+        try:
+            from .audit.decorator import audit_logout
+            audit_logout(
+                current_user.id,
+                current_user.id,
+                request.remote_addr,
+                request.headers.get('User-Agent', '')
+            )
+        except Exception as e:
+            logger.debug(f"Audit logging failed: {e}")
     logout_user()
     return jsonify({'success': True})
 
@@ -1989,6 +2015,25 @@ def api_create_job():
     if job['schedule_enabled']:
         schedule_job(job_id, job)
 
+    # Audit log
+    try:
+        from .audit.logger import get_audit_logger, AuditLogger
+        audit_logger = get_audit_logger()
+        if audit_logger:
+            audit_logger.log(
+                action=AuditLogger.ACTION_CREATE,
+                resource_type=AuditLogger.RESOURCE_JOB,
+                resource_id=job_id,
+                resource_name=job.get('name', job_id),
+                new_value=job,
+                user_id=current_user.id if current_user.is_authenticated else None,
+                user_name=current_user.id if current_user.is_authenticated else None,
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent', '')
+            )
+    except Exception as e:
+        logger.debug(f"Audit logging failed: {e}")
+
     return jsonify({'success': True, 'job_id': job_id}), 201
 
 
@@ -2063,6 +2108,25 @@ def api_update_job(job_id):
     save_job(job_id, job)
     schedule_job(job_id, job)
 
+    # Audit log
+    try:
+        from .audit.logger import get_audit_logger, AuditLogger
+        audit_logger = get_audit_logger()
+        if audit_logger:
+            audit_logger.log(
+                action=AuditLogger.ACTION_UPDATE,
+                resource_type=AuditLogger.RESOURCE_JOB,
+                resource_id=job_id,
+                resource_name=job.get('name', job_id),
+                new_value=job,
+                user_id=current_user.id if current_user.is_authenticated else None,
+                user_name=current_user.id if current_user.is_authenticated else None,
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent', '')
+            )
+    except Exception as e:
+        logger.debug(f"Audit logging failed: {e}")
+
     return jsonify({'success': True})
 
 
@@ -2075,12 +2139,32 @@ def api_delete_job(job_id):
     if not job:
         return jsonify({'error': 'Job not found'}), 404
 
+    job_name = job.get('name', job_id)
     delete_job_from_db(job_id)
 
     try:
         scheduler.remove_job(job_id)
     except:
         pass
+
+    # Audit log
+    try:
+        from .audit.logger import get_audit_logger, AuditLogger
+        audit_logger = get_audit_logger()
+        if audit_logger:
+            audit_logger.log(
+                action=AuditLogger.ACTION_DELETE,
+                resource_type=AuditLogger.RESOURCE_JOB,
+                resource_id=job_id,
+                resource_name=job_name,
+                old_value=job,
+                user_id=current_user.id if current_user.is_authenticated else None,
+                user_name=current_user.id if current_user.is_authenticated else None,
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent', '')
+            )
+    except Exception as e:
+        logger.debug(f"Audit logging failed: {e}")
 
     return jsonify({'success': True})
 
@@ -2093,6 +2177,20 @@ def api_run_job(job_id):
     job = get_job(job_id)
     if not job:
         return jsonify({'success': False, 'error': 'Job not found'}), 404
+
+    # Audit log
+    try:
+        from .audit.decorator import audit_backup_run
+        audit_backup_run(
+            job_id,
+            job.get('name', job_id),
+            user_id=current_user.id if current_user.is_authenticated else None,
+            user_name=current_user.id if current_user.is_authenticated else None,
+            ip_address=request.remote_addr,
+            triggered_by='manual'
+        )
+    except Exception as e:
+        logger.debug(f"Audit logging failed: {e}")
 
     # Run in background
     thread = threading.Thread(target=run_backup, args=[job_id])
