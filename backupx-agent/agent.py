@@ -273,6 +273,7 @@ def test_database():
             '-P', str(db_port),
             '-u', db_user,
             f'-p{db_password}',
+            '--ssl-mode=DISABLED',
             '-e', 'SELECT 1'
         ]
 
@@ -341,6 +342,7 @@ def backup_database():
             '-P', str(db_port),
             '-u', db_user,
             f'-p{db_password}',
+            '--ssl-mode=DISABLED',
             '--single-transaction',
             '--routines',
             '--triggers'
