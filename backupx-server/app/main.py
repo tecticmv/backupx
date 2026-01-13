@@ -2149,6 +2149,13 @@ def api_test_s3_connection():
     secret_key = data.get('secret_key', '')
     region = data.get('region', 'us-east-1')
     skip_ssl_verify = data.get('skip_ssl_verify', False)
+    config_id = data.get('id', '')
+
+    # If editing existing config and secret_key is empty, look up the stored one
+    if config_id and not secret_key:
+        existing_config = get_s3_config(config_id)
+        if existing_config:
+            secret_key = existing_config.get('secret_key', '')
 
     if not all([endpoint, bucket, access_key, secret_key]):
         return jsonify({'error': 'Missing required fields'}), 400

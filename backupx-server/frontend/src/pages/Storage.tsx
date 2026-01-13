@@ -155,10 +155,15 @@ export default function Storage() {
   const handleTestConnection = async () => {
     setIsTestingConnection(true);
     try {
+      // Include config ID when editing so backend can look up stored secret_key
+      const testData = editingConfig
+        ? { ...formData, id: editingConfig.id }
+        : formData;
+
       const response = await fetch("/api/s3-configs/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(formData),
+        body: JSON.stringify(testData),
       });
 
       const data = await response.json();
