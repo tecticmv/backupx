@@ -41,6 +41,7 @@ import type {
   EmailConfig,
   SlackConfig,
   DiscordConfig,
+  TelegramConfig,
   WebhookConfig,
 } from "@/types/notification";
 import {
@@ -55,6 +56,7 @@ import {
   Webhook,
   CheckCircle2,
   XCircle,
+  Send,
 } from "lucide-react";
 
 interface NotificationFormData {
@@ -73,6 +75,9 @@ interface NotificationFormData {
   to_addresses: string;
   // Slack/Discord/Webhook config
   webhook_url: string;
+  // Telegram config
+  telegram_bot_token: string;
+  telegram_chat_id: string;
   // Generic webhook config
   webhook_method: "GET" | "POST" | "PUT";
 }
@@ -91,6 +96,8 @@ const initialFormData: NotificationFormData = {
   from_address: "",
   to_addresses: "",
   webhook_url: "",
+  telegram_bot_token: "",
+  telegram_chat_id: "",
   webhook_method: "POST",
 };
 
@@ -138,7 +145,7 @@ export default function Notifications() {
     setFormData((prev) => ({ ...prev, type: value }));
   };
 
-  const buildConfig = (): EmailConfig | SlackConfig | DiscordConfig | WebhookConfig => {
+  const buildConfig = (): EmailConfig | SlackConfig | DiscordConfig | TelegramConfig | WebhookConfig => {
     switch (formData.type) {
       case "email":
         return {
@@ -154,6 +161,11 @@ export default function Notifications() {
       case "discord":
         return {
           webhook_url: formData.webhook_url,
+        };
+      case "telegram":
+        return {
+          bot_token: formData.telegram_bot_token,
+          chat_id: formData.telegram_chat_id,
         };
       case "webhook":
         return {
@@ -235,6 +247,10 @@ export default function Notifications() {
     } else if (channel.type === "slack" || channel.type === "discord") {
       const webhookConfig = config as SlackConfig | DiscordConfig;
       newFormData.webhook_url = webhookConfig.webhook_url || "";
+    } else if (channel.type === "telegram") {
+      const telegramConfig = config as TelegramConfig;
+      newFormData.telegram_bot_token = telegramConfig.bot_token || "";
+      newFormData.telegram_chat_id = telegramConfig.chat_id || "";
     } else if (channel.type === "webhook") {
       const webhookConfig = config as WebhookConfig;
       newFormData.webhook_url = webhookConfig.url || "";
@@ -303,6 +319,8 @@ export default function Notifications() {
       case "slack":
       case "discord":
         return <MessageSquare className="h-4 w-4" />;
+      case "telegram":
+        return <Send className="h-4 w-4" />;
       case "webhook":
         return <Webhook className="h-4 w-4" />;
     }
@@ -313,6 +331,7 @@ export default function Notifications() {
       email: "Email",
       slack: "Slack",
       discord: "Discord",
+      telegram: "Telegram",
       webhook: "Webhook",
     };
     return (
@@ -538,6 +557,12 @@ export default function Notifications() {
                         Discord
                       </div>
                     </SelectItem>
+                    <SelectItem value="telegram">
+                      <div className="flex items-center gap-2">
+                        <Send className="h-4 w-4" />
+                        Telegram
+                      </div>
+                    </SelectItem>
                     <SelectItem value="webhook">
                       <div className="flex items-center gap-2">
                         <Webhook className="h-4 w-4" />
@@ -663,6 +688,40 @@ export default function Notifications() {
                       : "Create a webhook in your Discord server settings (Server Settings > Integrations > Webhooks)"}
                   </p>
                 </div>
+              )}
+
+              {/* Telegram Config */}
+              {formData.type === "telegram" && (
+                <>
+                  <div className="grid gap-2">
+                    <Label htmlFor="telegram_bot_token">Bot Token</Label>
+                    <Input
+                      id="telegram_bot_token"
+                      name="telegram_bot_token"
+                      placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+                      value={formData.telegram_bot_token}
+                      onChange={handleInputChange}
+                      required
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Create a bot via @BotFather and get the token
+                    </p>
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="telegram_chat_id">Chat ID</Label>
+                    <Input
+                      id="telegram_chat_id"
+                      name="telegram_chat_id"
+                      placeholder="-1001234567890"
+                      value={formData.telegram_chat_id}
+                      onChange={handleInputChange}
+                      required
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Your user ID, group ID, or channel ID (use @userinfobot to find your ID)
+                    </p>
+                  </div>
+                </>
               )}
 
               {/* Generic Webhook Config */}

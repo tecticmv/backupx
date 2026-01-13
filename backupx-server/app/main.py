@@ -1202,6 +1202,49 @@ def send_discord_notification(channel, job_name, status, message, duration):
         raise
 
 
+def send_telegram_notification(channel, job_name, status, message, duration):
+    """Send notification to Telegram via Bot API"""
+    config = channel['config']
+    bot_token = config.get('bot_token', '')
+    chat_id = config.get('chat_id', '')
+
+    if not bot_token or not chat_id:
+        logger.warning("Telegram bot_token or chat_id not configured")
+        return
+
+    emoji = get_status_emoji(status)
+
+    # Format message for Telegram (using HTML parse mode)
+    text = f"""<b>{emoji} Backup Job: {job_name}</b>
+
+<b>Status:</b> {status.upper()}
+<b>Duration:</b> {format_duration(duration)}
+
+<pre>{message[:3000] if message else 'No additional details'}</pre>"""
+
+    api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+
+    data = json.dumps(payload).encode('utf-8')
+    req = Request(api_url, data=data, headers={'Content-Type': 'application/json'})
+
+    try:
+        with urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            if result.get('ok'):
+                logger.info(f"Telegram notification sent for job {job_name}")
+            else:
+                logger.warning(f"Telegram API error: {result.get('description', 'Unknown error')}")
+    except (URLError, HTTPError) as e:
+        logger.error(f"Failed to send Telegram notification: {e}")
+        raise
+
+
 def send_webhook_notification(channel, job_name, status, message, duration):
     """Send notification to generic webhook"""
     config = channel['config']
@@ -1256,6 +1299,8 @@ def send_notification(job_id, job_name, status, message, duration):
                 send_slack_notification(channel, job_name, status, message, duration)
             elif channel['type'] == 'discord':
                 send_discord_notification(channel, job_name, status, message, duration)
+            elif channel['type'] == 'telegram':
+                send_telegram_notification(channel, job_name, status, message, duration)
             elif channel['type'] == 'webhook':
                 send_webhook_notification(channel, job_name, status, message, duration)
         except Exception as e:
@@ -3698,6 +3743,8 @@ def api_test_notification():
             send_slack_notification(channel, 'Test Job', 'success', 'This is a test notification from BackupX', 0)
         elif channel_type == 'discord':
             send_discord_notification(channel, 'Test Job', 'success', 'This is a test notification from BackupX', 0)
+        elif channel_type == 'telegram':
+            send_telegram_notification(channel, 'Test Job', 'success', 'This is a test notification from BackupX', 0)
         elif channel_type == 'webhook':
             send_webhook_notification(channel, 'Test Job', 'success', 'This is a test notification from BackupX', 0)
         else:

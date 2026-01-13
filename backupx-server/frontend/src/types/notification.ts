@@ -16,15 +16,20 @@ export interface DiscordConfig {
   webhook_url: string;
 }
 
+export interface TelegramConfig {
+  bot_token: string;
+  chat_id: string;
+}
+
 export interface WebhookConfig {
   url: string;
   method: 'GET' | 'POST' | 'PUT';
   headers: Record<string, string>;
 }
 
-export type NotificationChannelType = 'email' | 'slack' | 'discord' | 'webhook';
+export type NotificationChannelType = 'email' | 'slack' | 'discord' | 'telegram' | 'webhook';
 
-export type NotificationConfig = EmailConfig | SlackConfig | DiscordConfig | WebhookConfig;
+export type NotificationConfig = EmailConfig | SlackConfig | DiscordConfig | TelegramConfig | WebhookConfig;
 
 export interface NotificationChannel {
   id: string;
