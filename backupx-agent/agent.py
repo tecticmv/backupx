@@ -352,8 +352,14 @@ def backup_database():
             mysqldump_cmd.append('--all-databases')
         else:
             db_list = [db.strip() for db in databases.split(',') if db.strip()]
-            mysqldump_cmd.append('--databases')
-            mysqldump_cmd.extend(db_list)
+            if len(db_list) == 1:
+                # Single database - don't use --databases flag for cleaner dump
+                # (no CREATE DATABASE or USE statements)
+                mysqldump_cmd.append(db_list[0])
+            else:
+                # Multiple databases - need --databases flag
+                mysqldump_cmd.append('--databases')
+                mysqldump_cmd.extend(db_list)
 
         # Run mysqldump and gzip separately (no shell=True)
         # First run mysqldump, pipe stdout to gzip
