@@ -346,7 +346,8 @@ def backup_database():
             '--single-transaction',
             '--routines',
             '--triggers',
-            '--compact'
+            '--set-charset',
+            '--default-character-set=utf8mb4'
         ]
 
         if databases == '*':
