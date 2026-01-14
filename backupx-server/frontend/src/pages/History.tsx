@@ -44,7 +44,7 @@ export default function History() {
       const response = await fetch("/api/history");
       if (response.ok) {
         const data = await response.json();
-        setHistory([...data].reverse());
+        setHistory(data);
       }
     } catch {
       toast.error("Failed to fetch history");
