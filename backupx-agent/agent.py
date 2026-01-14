@@ -346,6 +346,7 @@ def backup_database():
             '--single-transaction',
             '--routines',
             '--triggers',
+            '--add-drop-table',
             '--set-charset',
             '--default-character-set=utf8mb4'
         ]
