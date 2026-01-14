@@ -347,7 +347,6 @@ def backup_database():
             '--routines',
             '--triggers',
             '--add-drop-table',
-            '--set-charset',
             '--default-character-set=utf8mb4'
         ]
 
@@ -364,8 +363,8 @@ def backup_database():
                 mysqldump_cmd.append('--databases')
                 mysqldump_cmd.extend(db_list)
 
-        # Run mysqldump and gzip separately (no shell=True)
-        # First run mysqldump, pipe stdout to gzip
+        # Run mysqldump, filter MariaDB-specific comments, then gzip
+        # MariaDB's mysqldump adds /*M!999999\- enable the sandbox mode */ which MySQL can't parse
         try:
             mysqldump_proc = subprocess.Popen(
                 mysqldump_cmd,
@@ -373,19 +372,29 @@ def backup_database():
                 stderr=subprocess.PIPE
             )
 
+            # Filter out MariaDB-specific sandbox mode comment for MySQL compatibility
+            sed_proc = subprocess.Popen(
+                ['sed', r'/^\/\*M!999999/d'],
+                stdin=mysqldump_proc.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
             gzip_proc = subprocess.Popen(
                 ['gzip'],
-                stdin=mysqldump_proc.stdout,
+                stdin=sed_proc.stdout,
                 stdout=open(backup_file, 'wb'),
                 stderr=subprocess.PIPE
             )
 
-            # Allow mysqldump to receive SIGPIPE if gzip exits
+            # Allow processes to receive SIGPIPE if downstream exits
             mysqldump_proc.stdout.close()
+            sed_proc.stdout.close()
 
-            # Wait for both processes with timeout
+            # Wait for all processes with timeout
             timeout_seconds = data.get('timeout', 3600)
             gzip_proc.wait(timeout=timeout_seconds)
+            sed_proc.wait(timeout=10)  # Should already be done
             mysqldump_proc.wait(timeout=10)  # Should already be done
 
             if mysqldump_proc.returncode != 0:
@@ -399,8 +408,9 @@ def backup_database():
                 return jsonify({'success': False, 'error': f'gzip failed: {error_msg}'}), 500
 
         except subprocess.TimeoutExpired:
-            # Kill both processes on timeout
+            # Kill all processes on timeout
             mysqldump_proc.kill()
+            sed_proc.kill()
             gzip_proc.kill()
             raise
 
