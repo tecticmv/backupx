@@ -370,9 +370,9 @@ def backup_database():
                 stderr=subprocess.PIPE
             )
 
-            # Filter out MariaDB-specific sandbox mode comment for MySQL compatibility
+            # Filter out MariaDB-specific comments (/*M!...*/) for MySQL compatibility
             sed_proc = subprocess.Popen(
-                ['sed', r'/^\/\*M!999999/d'],
+                ['sed', r'/\/\*M!/d'],
                 stdin=mysqldump_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
