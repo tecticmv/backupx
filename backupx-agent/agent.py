@@ -343,11 +343,9 @@ def backup_database():
             '-u', db_user,
             f'-p{db_password}',
             '--skip-ssl',
-            '--single-transaction',
+            '--compress',
             '--routines',
-            '--triggers',
-            '--add-drop-table',
-            '--default-character-set=utf8mb4'
+            '--lock-tables=false'
         ]
 
         if databases == '*':
