@@ -64,6 +64,7 @@ const initialServerFormData: ServerFormData = {
   ssh_key: "/home/backupx/.ssh/id_rsa",
   agent_port: 8090,
   agent_api_key: "",
+  status: "active",
 };
 
 type ConnectionStatus = "online" | "offline" | "checking" | "unknown";
@@ -213,6 +214,7 @@ export default function Servers() {
       ssh_key: server.ssh_key || '/home/backupx/.ssh/id_rsa',
       agent_port: server.agent_port || 8090,
       agent_api_key: server.agent_api_key || '',
+      status: server.status || 'active',
     });
     setIsDialogOpen(true);
   };
@@ -379,6 +381,7 @@ export default function Servers() {
                   <TableHead>Host</TableHead>
                   <TableHead>Type</TableHead>
                   <TableHead>Connection</TableHead>
+                  <TableHead>Enabled</TableHead>
                   <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
@@ -445,6 +448,15 @@ export default function Servers() {
                       {server.connection_type === 'agent'
                         ? `Port ${server.agent_port}`
                         : `${server.ssh_user}@:${server.ssh_port}`}
+                    </TableCell>
+                    <TableCell>
+                      <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
+                        server.status === "active"
+                          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400"
+                          : "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-400"
+                      }`}>
+                        {server.status === "active" ? "Active" : "Inactive"}
+                      </span>
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
@@ -636,6 +648,27 @@ export default function Servers() {
                   </div>
                 </>
               )}
+
+              <div className="grid gap-2">
+                <Label htmlFor="status">Status</Label>
+                <Select
+                  value={formData.status}
+                  onValueChange={(value: "active" | "inactive") =>
+                    setFormData((prev) => ({ ...prev, status: value }))
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="active">Active</SelectItem>
+                    <SelectItem value="inactive">Inactive</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Inactive servers are skipped in backup jobs
+                </p>
+              </div>
             </div>
             <DialogFooter className="gap-2">
               <Button

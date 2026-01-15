@@ -7,6 +7,7 @@ export interface S3Config {
   secret_key: string;
   region?: string;
   skip_ssl_verify?: boolean;
+  status: 'active' | 'inactive';
   created_at: string;
   updated_at: string;
 }
@@ -19,6 +20,7 @@ export interface S3ConfigFormData {
   secret_key: string;
   region?: string;
   skip_ssl_verify?: boolean;
+  status: 'active' | 'inactive';
 }
 
 export interface S3Object {

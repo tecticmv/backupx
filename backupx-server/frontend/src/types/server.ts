@@ -12,6 +12,7 @@ export interface Server {
   // Agent fields
   agent_port?: number;
   agent_api_key?: string;
+  status: 'active' | 'inactive';
   created_at: string;
   updated_at: string;
 }
@@ -27,4 +28,5 @@ export interface ServerFormData {
   // Agent fields
   agent_port: number;
   agent_api_key: string;
+  status: 'active' | 'inactive';
 }

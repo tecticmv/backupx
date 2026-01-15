@@ -12,6 +12,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Table,
   TableBody,
   TableCell,
@@ -48,6 +55,7 @@ const initialFormData: S3ConfigFormData = {
   secret_key: "",
   region: "",
   skip_ssl_verify: false,
+  status: "active",
 };
 
 export default function Storage() {
@@ -131,6 +139,7 @@ export default function Storage() {
       secret_key: "",
       region: config.region || "",
       skip_ssl_verify: config.skip_ssl_verify || false,
+      status: config.status || "active",
     });
     setIsDialogOpen(true);
   };
@@ -263,6 +272,7 @@ export default function Storage() {
                   <TableHead>Endpoint</TableHead>
                   <TableHead>Bucket</TableHead>
                   <TableHead>Region</TableHead>
+                  <TableHead>Status</TableHead>
                   <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
@@ -276,6 +286,15 @@ export default function Storage() {
                     <TableCell>{config.bucket}</TableCell>
                     <TableCell className="text-muted-foreground">
                       {config.region || "-"}
+                    </TableCell>
+                    <TableCell>
+                      <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
+                        config.status === "active"
+                          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400"
+                          : "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-400"
+                      }`}>
+                        {config.status === "active" ? "Active" : "Inactive"}
+                      </span>
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
@@ -396,20 +415,42 @@ export default function Storage() {
                   required={!editingConfig}
                 />
               </div>
-              <div className="flex items-center justify-between rounded-lg border p-3">
-                <div className="space-y-0.5">
-                  <Label htmlFor="skip_ssl_verify">Skip SSL Verification</Label>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="flex items-center justify-between rounded-lg border p-3">
+                  <div className="space-y-0.5">
+                    <Label htmlFor="skip_ssl_verify">Skip SSL</Label>
+                    <p className="text-xs text-muted-foreground">
+                      For self-signed certs
+                    </p>
+                  </div>
+                  <Switch
+                    id="skip_ssl_verify"
+                    checked={formData.skip_ssl_verify || false}
+                    onCheckedChange={(checked) =>
+                      setFormData((prev) => ({ ...prev, skip_ssl_verify: checked }))
+                    }
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="status">Status</Label>
+                  <Select
+                    value={formData.status}
+                    onValueChange={(value: "active" | "inactive") =>
+                      setFormData((prev) => ({ ...prev, status: value }))
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="active">Active</SelectItem>
+                      <SelectItem value="inactive">Inactive</SelectItem>
+                    </SelectContent>
+                  </Select>
                   <p className="text-xs text-muted-foreground">
-                    Enable for self-signed certificates (less secure)
+                    Inactive storage is skipped
                   </p>
                 </div>
-                <Switch
-                  id="skip_ssl_verify"
-                  checked={formData.skip_ssl_verify || false}
-                  onCheckedChange={(checked) =>
-                    setFormData((prev) => ({ ...prev, skip_ssl_verify: checked }))
-                  }
-                />
               </div>
             </div>
             <DialogFooter className="gap-2">

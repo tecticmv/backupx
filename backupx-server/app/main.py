@@ -456,6 +456,7 @@ def init_db():
             ssh_key TEXT DEFAULT '/home/backupx/.ssh/id_rsa',
             agent_port INTEGER DEFAULT 8090,
             agent_api_key TEXT,
+            status TEXT DEFAULT 'active',
             created_at TEXT NOT NULL,
             updated_at TEXT
         );
@@ -470,6 +471,7 @@ def init_db():
             secret_key TEXT NOT NULL,
             region TEXT DEFAULT '',
             skip_ssl_verify INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
             created_at TEXT NOT NULL,
             updated_at TEXT
         );
@@ -619,6 +621,19 @@ def init_db():
         if 'status' not in db_columns:
             conn.execute("ALTER TABLE db_configs ADD COLUMN status TEXT DEFAULT 'active'")
             logger.info("Added status column to db_configs table")
+
+        # Check and add status column to servers
+        if 'status' not in columns:
+            conn.execute("ALTER TABLE servers ADD COLUMN status TEXT DEFAULT 'active'")
+            logger.info("Added status column to servers table")
+
+        # Check and add status column to s3_configs
+        cursor = conn.execute("PRAGMA table_info(s3_configs)")
+        s3_columns = [col[1] for col in cursor.fetchall()]
+
+        if 'status' not in s3_columns:
+            conn.execute("ALTER TABLE s3_configs ADD COLUMN status TEXT DEFAULT 'active'")
+            logger.info("Added status column to s3_configs table")
 
         conn.commit()
         conn.close()
@@ -939,12 +954,12 @@ def create_s3_config(config):
     """Create a new S3 config"""
     conn = get_db_connection()
     conn.execute('''
-        INSERT INTO s3_configs (id, name, endpoint, bucket, access_key, secret_key, region, skip_ssl_verify, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO s3_configs (id, name, endpoint, bucket, access_key, secret_key, region, skip_ssl_verify, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (config['id'], config['name'], config['endpoint'], config['bucket'],
           encrypt_credential(config['access_key']), encrypt_credential(config['secret_key']),
           config.get('region', ''), 1 if config.get('skip_ssl_verify') else 0,
-          config.get('created_at', utc_isoformat()), config.get('updated_at')))
+          config.get('status', 'active'), config.get('created_at', utc_isoformat()), config.get('updated_at')))
     conn.commit()
     conn.close()
 
@@ -953,12 +968,12 @@ def update_s3_config(config_id, config):
     """Update an S3 config"""
     conn = get_db_connection()
     conn.execute('''
-        UPDATE s3_configs SET name=?, endpoint=?, bucket=?, access_key=?, secret_key=?, region=?, skip_ssl_verify=?, updated_at=?
+        UPDATE s3_configs SET name=?, endpoint=?, bucket=?, access_key=?, secret_key=?, region=?, skip_ssl_verify=?, status=?, updated_at=?
         WHERE id=?
     ''', (config['name'], config['endpoint'], config['bucket'],
           encrypt_credential(config['access_key']), encrypt_credential(config['secret_key']),
           config.get('region', ''), 1 if config.get('skip_ssl_verify') else 0,
-          utc_isoformat(), config_id))
+          config.get('status', 'active'), utc_isoformat(), config_id))
     conn.commit()
     conn.close()
 
@@ -1000,12 +1015,12 @@ def create_server(server):
     """Create a new server"""
     conn = get_db_connection()
     conn.execute('''
-        INSERT INTO servers (id, name, host, connection_type, ssh_port, ssh_user, ssh_key, agent_port, agent_api_key, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO servers (id, name, host, connection_type, ssh_port, ssh_user, ssh_key, agent_port, agent_api_key, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (server['id'], server['name'], server['host'], server.get('connection_type', 'ssh'),
           server.get('ssh_port', 22), server.get('ssh_user'), server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
           server.get('agent_port', 8090), encrypt_credential(server.get('agent_api_key', '') or ''),
-          server.get('created_at', utc_isoformat()), server.get('updated_at')))
+          server.get('status', 'active'), server.get('created_at', utc_isoformat()), server.get('updated_at')))
     conn.commit()
     conn.close()
 
@@ -1014,12 +1029,12 @@ def update_server_in_db(server_id, server):
     """Update a server"""
     conn = get_db_connection()
     conn.execute('''
-        UPDATE servers SET name=?, host=?, connection_type=?, ssh_port=?, ssh_user=?, ssh_key=?, agent_port=?, agent_api_key=?, updated_at=?
+        UPDATE servers SET name=?, host=?, connection_type=?, ssh_port=?, ssh_user=?, ssh_key=?, agent_port=?, agent_api_key=?, status=?, updated_at=?
         WHERE id=?
     ''', (server['name'], server['host'], server.get('connection_type', 'ssh'),
           server.get('ssh_port', 22), server.get('ssh_user'), server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
           server.get('agent_port', 8090), encrypt_credential(server.get('agent_api_key', '') or ''),
-          utc_isoformat(), server_id))
+          server.get('status', 'active'), utc_isoformat(), server_id))
     conn.commit()
     conn.close()
 
@@ -3157,6 +3172,7 @@ def api_create_s3_config_route():
         'secret_key': data['secret_key'],
         'region': data.get('region', '').strip(),
         'skip_ssl_verify': bool(data.get('skip_ssl_verify', False)),
+        'status': data.get('status', 'active'),
         'created_at': utc_isoformat(),
         'updated_at': utc_isoformat()
     }
@@ -3190,6 +3206,7 @@ def api_update_s3_config_route(config_id):
     config['access_key'] = data.get('access_key', config['access_key'])
     config['region'] = data.get('region', config.get('region', ''))
     config['skip_ssl_verify'] = data.get('skip_ssl_verify', config.get('skip_ssl_verify', False))
+    config['status'] = data.get('status', config.get('status', 'active'))
 
     # Only update secret_key if provided and not empty
     if data.get('secret_key'):
@@ -3498,6 +3515,7 @@ def api_create_server_route():
             'ssh_key': ssh_key,
             'agent_port': None,
             'agent_api_key': None,
+            'status': data.get('status', 'active'),
             'created_at': utc_isoformat(),
             'updated_at': utc_isoformat()
         }
@@ -3520,6 +3538,7 @@ def api_create_server_route():
             'ssh_key': None,
             'agent_port': agent_port,
             'agent_api_key': data['agent_api_key'],
+            'status': data.get('status', 'active'),
             'created_at': utc_isoformat(),
             'updated_at': utc_isoformat()
         }
@@ -3554,6 +3573,7 @@ def api_update_server_route(server_id):
     server['name'] = data.get('name', server['name'])
     server['host'] = data.get('host', server['host'])
     server['connection_type'] = data.get('connection_type', server.get('connection_type', 'ssh'))
+    server['status'] = data.get('status', server.get('status', 'active'))
 
     # Update type-specific fields
     if server['connection_type'] == 'ssh':
