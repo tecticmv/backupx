@@ -648,8 +648,10 @@ def migrate_json_to_sqlite():
     conn = get_db_connection()
 
     # Check if migration is needed (check if any data exists)
+    # Use allowlisted table names to prevent SQL injection
+    allowed_tables = {'servers', 's3_configs', 'db_configs', 'jobs', 'history'}
     has_data = False
-    for table in ['servers', 's3_configs', 'db_configs', 'jobs', 'history']:
+    for table in allowed_tables:
         count = conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
         if count > 0:
             has_data = True
@@ -1762,7 +1764,7 @@ def run_agent_filesystem_backup(job_id, job, server):
             try:
                 error_response = json.loads(e.read().decode('utf-8'))
                 error_msg = error_response.get('error', str(e))
-            except:
+            except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
                 error_msg = sanitize_error_message(str(e))
         else:
             error_msg = sanitize_error_message(str(e))
@@ -1936,7 +1938,8 @@ def get_snapshots(job, server=None):
             snapshots.sort(key=lambda x: x.get('time', ''), reverse=True)
             return snapshots
         return []
-    except:
+    except Exception as e:
+        logger.error(f"Failed to get snapshots: {e}")
         return []
 
 
@@ -2003,7 +2006,8 @@ def get_repo_stats(job, server=None):
         if result.returncode == 0:
             return json.loads(result.stdout)
         return None
-    except:
+    except Exception as e:
+        logger.error(f"Failed to get repo stats: {e}")
         return None
 
 
@@ -2012,8 +2016,8 @@ def schedule_job(job_id, job):
     # Remove existing job if any
     try:
         scheduler.remove_job(job_id)
-    except:
-        pass
+    except Exception:
+        pass  # Job may not exist, which is fine
 
     if job.get('schedule_enabled'):
         cron = job.get('schedule_cron', '0 2 * * *')
@@ -2404,8 +2408,8 @@ def api_delete_job(job_id):
 
     try:
         scheduler.remove_job(job_id)
-    except:
-        pass
+    except Exception:
+        pass  # Job may not be scheduled
 
     # Audit log
     try:
@@ -2512,7 +2516,7 @@ def api_init_job_repo(job_id):
                 try:
                     error_response = json.loads(e.read().decode('utf-8'))
                     error_msg = error_response.get('error', str(e))
-                except:
+                except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
                     error_msg = str(e)
             else:
                 error_msg = str(e)
@@ -2578,8 +2582,9 @@ def api_snapshot_files(job_id, snapshot_id):
 
     path = request.args.get('path', '/')
 
-    # Sanitize path
-    if '..' in path:
+    # Sanitize path - prevent path traversal attacks
+    normalized_path = os.path.normpath(path)
+    if '..' in normalized_path or normalized_path.startswith('/etc') or normalized_path.startswith('/root'):
         return jsonify({'error': 'Invalid path'}), 400
 
     # Get skip_ssl_verify from S3 config
@@ -2705,8 +2710,10 @@ def api_snapshot_download(job_id, snapshot_id):
     if not file_path:
         return jsonify({'error': 'File path is required'}), 400
 
-    # Sanitize path
-    if '..' in file_path:
+    # Sanitize path - prevent path traversal attacks
+    # Normalize and ensure path doesn't escape intended directory
+    normalized_path = os.path.normpath(file_path)
+    if '..' in normalized_path or normalized_path.startswith('/etc') or normalized_path.startswith('/root'):
         return jsonify({'error': 'Invalid path'}), 400
 
     # Get skip_ssl_verify from S3 config
@@ -2908,8 +2915,9 @@ def api_snapshot_download_zip(job_id, snapshot_id):
     if not file_path:
         return jsonify({'error': 'Path is required'}), 400
 
-    # Sanitize path
-    if '..' in file_path:
+    # Sanitize path - prevent path traversal attacks
+    normalized_path = os.path.normpath(file_path)
+    if '..' in normalized_path or normalized_path.startswith('/etc') or normalized_path.startswith('/root'):
         return jsonify({'error': 'Invalid path'}), 400
 
     # Get skip_ssl_verify from S3 config

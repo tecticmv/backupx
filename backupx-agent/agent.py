@@ -117,16 +117,16 @@ def info():
         result = subprocess.run(['restic', 'version'], capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             restic_version = result.stdout.strip().split('\n')[0]
-    except:
-        pass
+    except Exception:
+        pass  # restic not available
 
     # Check for mysqldump
     mysqldump_available = False
     try:
         result = subprocess.run(['which', 'mysqldump'], capture_output=True, timeout=10)
         mysqldump_available = result.returncode == 0
-    except:
-        pass
+    except Exception:
+        pass  # mysqldump not available
 
     return jsonify({
         'agent': AGENT_NAME,
@@ -222,8 +222,8 @@ def backup_filesystem():
                     parsed = json.loads(line)
                     if parsed.get('message_type') == 'summary':
                         summary = parsed
-                except:
-                    pass
+                except json.JSONDecodeError:
+                    pass  # Line is not JSON, skip
 
             return jsonify({
                 'success': True,
@@ -432,8 +432,8 @@ def backup_database():
         # Cleanup temp file
         try:
             os.remove(backup_file)
-        except:
-            pass
+        except OSError:
+            pass  # File may already be removed
 
         duration = (datetime.now() - start_time).total_seconds()
 
