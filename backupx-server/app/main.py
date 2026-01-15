@@ -3096,8 +3096,9 @@ def api_dashboard_stats():
     durations = [e.get('duration', 0) for e in recent_history if e.get('status') == 'success' and e.get('duration')]
     avg_duration = round(sum(durations) / len(durations)) if durations else 0
 
-    # Total snapshots count (sum from all jobs' last known count)
-    total_snapshots = sum(j.get('snapshot_count', 0) for j in jobs_list)
+    # Total snapshots count - count all successful backups in history
+    # Each successful backup creates one snapshot
+    total_snapshots = sum(1 for e in history if e.get('status') == 'success')
 
     return jsonify({
         'total_jobs': total_jobs,
