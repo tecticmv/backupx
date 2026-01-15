@@ -22,7 +22,7 @@ from urllib.error import URLError, HTTPError
 from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_from_directory, g
+from flask import Flask, request, redirect, url_for, jsonify, send_from_directory, g
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -229,7 +229,7 @@ if not env_valid:
 
 # Initialize Flask app
 FRONTEND_DIST = Path(__file__).parent.parent / 'frontend' / 'dist'
-app = Flask(__name__, template_folder='../templates', static_folder='../static')
+app = Flask(__name__, static_folder='../static')
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'change-this-secret-key')
 
 # CSRF Protection
