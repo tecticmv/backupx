@@ -53,6 +53,7 @@ interface DatabaseFormData {
   username: string;
   password: string;
   databases: string;
+  status: "active" | "inactive";
 }
 
 const initialFormData: DatabaseFormData = {
@@ -63,6 +64,7 @@ const initialFormData: DatabaseFormData = {
   username: "",
   password: "",
   databases: "*",
+  status: "active",
 };
 
 export default function Databases() {
@@ -163,6 +165,7 @@ export default function Databases() {
       username: config.username,
       password: "",
       databases: config.databases,
+      status: config.status || "active",
     });
     setIsDialogOpen(true);
   };
@@ -300,6 +303,7 @@ export default function Databases() {
                   <TableHead>Port</TableHead>
                   <TableHead>Username</TableHead>
                   <TableHead>Databases</TableHead>
+                  <TableHead>Status</TableHead>
                   <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
@@ -320,6 +324,15 @@ export default function Databases() {
                       ) : (
                         config.databases
                       )}
+                    </TableCell>
+                    <TableCell>
+                      <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
+                        config.status === "active"
+                          ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400"
+                          : "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-400"
+                      }`}>
+                        {config.status === "active" ? "Active" : "Inactive"}
+                      </span>
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
@@ -428,19 +441,41 @@ export default function Databases() {
                   />
                 </div>
               </div>
-              <div className="grid gap-2">
-                <Label htmlFor="databases">Databases to Backup</Label>
-                <Input
-                  id="databases"
-                  name="databases"
-                  placeholder="* for all, or comma-separated: db1, db2, db3"
-                  value={formData.databases}
-                  onChange={handleInputChange}
-                  required
-                />
-                <p className="text-xs text-muted-foreground">
-                  Use * to backup all databases, or specify database names separated by commas
-                </p>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="grid gap-2">
+                  <Label htmlFor="databases">Databases to Backup</Label>
+                  <Input
+                    id="databases"
+                    name="databases"
+                    placeholder="* for all, or db1, db2"
+                    value={formData.databases}
+                    onChange={handleInputChange}
+                    required
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Use * for all, or comma-separated names
+                  </p>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="status">Status</Label>
+                  <Select
+                    value={formData.status}
+                    onValueChange={(value: "active" | "inactive") =>
+                      setFormData((prev) => ({ ...prev, status: value }))
+                    }
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="active">Active</SelectItem>
+                      <SelectItem value="inactive">Inactive</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    Inactive databases are skipped
+                  </p>
+                </div>
               </div>
 
               {/* Test Connection Server Selection */}

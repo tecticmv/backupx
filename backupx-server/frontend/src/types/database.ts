@@ -7,6 +7,7 @@ export interface DatabaseConfig {
   username: string;
   password: string;
   databases: string; // comma-separated list or "*" for all
+  status: "active" | "inactive";
   created_at?: string;
   updated_at?: string;
 }
