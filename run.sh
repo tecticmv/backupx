@@ -67,6 +67,7 @@ Commands:
   agent:stop      Stop the BackupX agent
   agent:restart   Restart the BackupX agent
   agent:status    Check agent status
+  agent:info      Show agent configuration
 
   test            Run tests for server
   test:cov        Run tests with coverage report
@@ -482,6 +483,43 @@ agent_status() {
         log_warn "Agent is not running"
         return 1
     fi
+}
+
+agent_info() {
+    if [ ! -f "$AGENT_DIR/.env" ]; then
+        log_error "Agent configuration not found at $AGENT_DIR/.env"
+        log_info "Run './run.sh' to set up the agent"
+        return 1
+    fi
+
+    source "$AGENT_DIR/.env"
+
+    local agent_name="${AGENT_NAME:-backupx-agent}"
+    local agent_port="${AGENT_PORT:-8090}"
+    local api_key="${AGENT_API_KEY:-}"
+    local allowed_paths="${ALLOWED_PATHS:-all}"
+
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "  Agent Configuration"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo -e "  Name:          ${YELLOW}$agent_name${NC}"
+    echo -e "  Port:          ${YELLOW}$agent_port${NC}"
+    echo -e "  API Key:       ${YELLOW}$api_key${NC}"
+    echo -e "  Allowed Paths: ${YELLOW}$allowed_paths${NC}"
+    echo -e ""
+    echo -e "  Config File:   $AGENT_DIR/.env"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+
+    # Check if running
+    if is_running "agent"; then
+        local pid=$(get_pid "agent")
+        echo -e "  Status:        ${GREEN}Running (PID: $pid)${NC}"
+    else
+        echo -e "  Status:        ${YELLOW}Stopped${NC}"
+    fi
+    echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+    echo ""
 }
 
 # =============================================================================
@@ -1234,6 +1272,9 @@ case "${1:-}" in
         ;;
     agent:status)
         agent_status
+        ;;
+    agent:info)
+        agent_info
         ;;
     test)
         shift
