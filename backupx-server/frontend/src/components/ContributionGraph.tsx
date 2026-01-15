@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { cn } from "@/lib/utils";
 
 interface ContributionDay {
@@ -18,44 +18,49 @@ export function ContributionGraph({ data, className }: ContributionGraphProps) {
   const [tooltipPosition, setTooltipPosition] = useState({ x: 0, y: 0 });
 
   // Build weeks aligned by actual day of week (Sunday = 0)
-  const buildWeeks = () => {
-    if (data.length === 0) return [];
+  const weeks = useMemo(() => {
+    if (!data || data.length === 0) return [];
 
-    const weeks: (ContributionDay | null)[][] = [];
+    const result: (ContributionDay | null)[][] = [];
+
+    // Create a map of date strings to data for quick lookup
+    const dataMap = new Map<string, ContributionDay>();
+    data.forEach(d => dataMap.set(d.date, d));
+
+    // Get the date range
+    const startDate = new Date(data[0].date);
+    const endDate = new Date(data[data.length - 1].date);
+
+    // Start from the Sunday of the first week
+    const firstSunday = new Date(startDate);
+    firstSunday.setDate(startDate.getDate() - startDate.getDay());
+
+    let currentDate = new Date(firstSunday);
     let currentWeek: (ContributionDay | null)[] = [];
 
-    // Start with the first day and pad with nulls if it doesn't start on Sunday
-    const firstDate = new Date(data[0].date);
-    const firstDayOfWeek = firstDate.getDay(); // 0 = Sunday
+    while (currentDate <= endDate) {
+      const dateStr = currentDate.toISOString().split('T')[0];
+      const dayData = dataMap.get(dateStr) || null;
 
-    // Pad the beginning of the first week
-    for (let i = 0; i < firstDayOfWeek; i++) {
-      currentWeek.push(null);
-    }
+      currentWeek.push(dayData);
 
-    // Add all days
-    for (const day of data) {
-      const date = new Date(day.date);
-      const dayOfWeek = date.getDay();
-
-      // If it's Sunday and we have data in current week, start a new week
-      if (dayOfWeek === 0 && currentWeek.length > 0) {
-        weeks.push(currentWeek);
+      // If we've completed a week (Saturday), push it and start a new one
+      if (currentDate.getDay() === 6) {
+        result.push(currentWeek);
         currentWeek = [];
       }
 
-      currentWeek.push(day);
+      // Move to next day
+      currentDate.setDate(currentDate.getDate() + 1);
     }
 
-    // Push the last week if it has data
+    // Push any remaining days in the last week
     if (currentWeek.length > 0) {
-      weeks.push(currentWeek);
+      result.push(currentWeek);
     }
 
-    return weeks;
-  };
-
-  const weeks = buildWeeks();
+    return result;
+  }, [data]);
 
   // Get intensity level (0-4) based on total backups
   const getIntensityLevel = (day: ContributionDay): number => {
@@ -117,27 +122,28 @@ export function ContributionGraph({ data, className }: ContributionGraphProps) {
   };
 
   // Get month labels for the graph
-  const getMonthLabels = () => {
-    const labels: { month: string; index: number }[] = [];
-    let lastMonth = "";
+  const monthLabels = useMemo(() => {
+    const labels: { month: string; weekIndex: number }[] = [];
+    let lastMonth = -1;
 
     weeks.forEach((week, weekIndex) => {
       // Find first non-null day in the week
       const firstDay = week.find(d => d !== null);
       if (firstDay) {
         const date = new Date(firstDay.date);
-        const month = date.toLocaleDateString("en-US", { month: "short" });
+        const month = date.getMonth();
         if (month !== lastMonth) {
-          labels.push({ month, index: weekIndex });
+          labels.push({
+            month: date.toLocaleDateString("en-US", { month: "short" }),
+            weekIndex
+          });
           lastMonth = month;
         }
       }
     });
 
     return labels;
-  };
-
-  const monthLabels = getMonthLabels();
+  }, [weeks]);
 
   const handleMouseEnter = (day: ContributionDay, event: React.MouseEvent) => {
     setHoveredDay(day);
@@ -148,26 +154,32 @@ export function ContributionGraph({ data, className }: ContributionGraphProps) {
     });
   };
 
+  if (weeks.length === 0) {
+    return (
+      <div className={cn("text-sm text-muted-foreground", className)}>
+        No backup data available
+      </div>
+    );
+  }
+
   return (
     <div className={cn("relative", className)}>
       {/* Month labels */}
-      <div className="flex mb-1 ml-8 text-xs text-muted-foreground">
+      <div className="relative h-5 ml-8">
         {monthLabels.map((label, idx) => (
-          <div
+          <span
             key={idx}
-            style={{
-              position: "absolute",
-              left: `${32 + label.index * 13}px`,
-            }}
+            className="absolute text-xs text-muted-foreground"
+            style={{ left: `${label.weekIndex * 14}px` }}
           >
             {label.month}
-          </div>
+          </span>
         ))}
       </div>
 
-      <div className="flex mt-5">
+      <div className="flex">
         {/* Day labels */}
-        <div className="flex flex-col gap-[3px] pr-2 text-xs text-muted-foreground">
+        <div className="flex flex-col gap-[3px] pr-2 text-xs text-muted-foreground shrink-0">
           <span className="h-[11px] leading-[11px]"></span>
           <span className="h-[11px] leading-[11px]">Mon</span>
           <span className="h-[11px] leading-[11px]"></span>
@@ -180,15 +192,14 @@ export function ContributionGraph({ data, className }: ContributionGraphProps) {
         {/* Grid */}
         <div className="flex gap-[3px] overflow-x-auto pb-1">
           {weeks.map((week, weekIndex) => (
-            <div key={weekIndex} className="flex flex-col gap-[3px]">
-              {/* Pad week to always have 7 slots */}
+            <div key={weekIndex} className="flex flex-col gap-[3px] shrink-0">
               {Array.from({ length: 7 }).map((_, dayIndex) => {
-                const day = week[dayIndex] || null;
+                const day = week[dayIndex] ?? null;
                 return (
                   <div
                     key={dayIndex}
                     className={cn(
-                      "w-[11px] h-[11px] rounded-sm",
+                      "w-[11px] h-[11px] rounded-sm shrink-0",
                       day ? "cursor-pointer transition-all hover:ring-1 hover:ring-foreground/50" : "",
                       getColorClass(day)
                     )}
