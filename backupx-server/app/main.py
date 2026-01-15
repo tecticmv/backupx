@@ -484,6 +484,7 @@ def init_db():
             username TEXT NOT NULL,
             password TEXT NOT NULL,
             databases TEXT DEFAULT '*',
+            status TEXT DEFAULT 'active',
             created_at TEXT NOT NULL,
             updated_at TEXT
         );
@@ -597,7 +598,7 @@ def init_db():
     # Add new columns if they don't exist (migration for existing databases)
     try:
         conn = get_db_connection()
-        # Check and add connection_type column
+        # Check and add connection_type column to servers
         cursor = conn.execute("PRAGMA table_info(servers)")
         columns = [col[1] for col in cursor.fetchall()]
 
@@ -610,6 +611,14 @@ def init_db():
         if 'agent_api_key' not in columns:
             conn.execute("ALTER TABLE servers ADD COLUMN agent_api_key TEXT")
             logger.info("Added agent_api_key column to servers table")
+
+        # Check and add status column to db_configs
+        cursor = conn.execute("PRAGMA table_info(db_configs)")
+        db_columns = [col[1] for col in cursor.fetchall()]
+
+        if 'status' not in db_columns:
+            conn.execute("ALTER TABLE db_configs ADD COLUMN status TEXT DEFAULT 'active'")
+            logger.info("Added status column to db_configs table")
 
         conn.commit()
         conn.close()
@@ -1052,11 +1061,11 @@ def create_db_config(config):
     """Create a new database config"""
     conn = get_db_connection()
     conn.execute('''
-        INSERT INTO db_configs (id, name, type, host, port, username, password, databases, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO db_configs (id, name, type, host, port, username, password, databases, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (config['id'], config['name'], config.get('type', 'mysql'), config['host'], config.get('port', 3306),
           config['username'], encrypt_credential(config['password']), config.get('databases', '*'),
-          config.get('created_at', utc_isoformat()), config.get('updated_at')))
+          config.get('status', 'active'), config.get('created_at', utc_isoformat()), config.get('updated_at')))
     conn.commit()
     conn.close()
 
@@ -1065,11 +1074,11 @@ def update_db_config_in_db(config_id, config):
     """Update a database config"""
     conn = get_db_connection()
     conn.execute('''
-        UPDATE db_configs SET name=?, type=?, host=?, port=?, username=?, password=?, databases=?, updated_at=?
+        UPDATE db_configs SET name=?, type=?, host=?, port=?, username=?, password=?, databases=?, status=?, updated_at=?
         WHERE id=?
     ''', (config['name'], config.get('type', 'mysql'), config['host'], config.get('port', 3306),
           config['username'], encrypt_credential(config['password']), config.get('databases', '*'),
-          utc_isoformat(), config_id))
+          config.get('status', 'active'), utc_isoformat(), config_id))
     conn.commit()
     conn.close()
 
@@ -3810,6 +3819,7 @@ def api_create_db_config_route():
         'username': data['username'],
         'password': data['password'],
         'databases': data.get('databases', '*'),
+        'status': data.get('status', 'active'),
         'created_at': utc_isoformat(),
         'updated_at': utc_isoformat()
     }
@@ -3843,6 +3853,7 @@ def api_update_db_config_route(config_id):
     config['port'] = int(data.get('port', config.get('port', 3306)))
     config['username'] = data.get('username', config['username'])
     config['databases'] = data.get('databases', config.get('databases', '*'))
+    config['status'] = data.get('status', config.get('status', 'active'))
 
     # Only update password if provided and not empty
     if data.get('password'):
