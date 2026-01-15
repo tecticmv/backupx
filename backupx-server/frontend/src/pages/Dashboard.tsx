@@ -10,6 +10,7 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
+import { ContributionGraph } from "@/components/ContributionGraph";
 import { toast } from "sonner";
 import type { Jobs, HistoryEntry } from "@/types/job";
 import JobFormModal from "@/components/JobFormModal";
@@ -28,9 +29,17 @@ import {
   Activity,
   Timer,
   Archive,
-  BarChart3,
   RefreshCw,
+  Database,
+  Server,
 } from "lucide-react";
+
+interface ContributionDay {
+  date: string;
+  success: number;
+  failed: number;
+  total: number;
+}
 
 interface DashboardStats {
   total_jobs: number;
@@ -52,6 +61,7 @@ interface DashboardStats {
     failed: number;
     total: number;
   }>;
+  contribution_data: ContributionDay[];
   next_backup: string | null;
   next_backup_job: string | null;
   avg_duration: number;
@@ -200,10 +210,9 @@ export default function Dashboard() {
     return `in ${diffDays}d ${diffHours % 24}h`;
   };
 
-  // Calculate max value for chart scaling
-  const maxDailyTotal = stats?.daily_stats
-    ? Math.max(...stats.daily_stats.map(d => d.total), 1)
-    : 1;
+  // Calculate totals from contribution data
+  const totalBackupsYear = stats?.contribution_data?.reduce((sum, d) => sum + d.total, 0) ?? 0;
+  const successBackupsYear = stats?.contribution_data?.reduce((sum, d) => sum + d.success, 0) ?? 0;
 
   if (isLoading) {
     return (
@@ -215,18 +224,18 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
-      {/* Primary Stats Row */}
+      {/* Hero Stats Section */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <Card>
+        <Card className="bg-gradient-to-br from-emerald-500/10 to-emerald-500/5 border-emerald-500/20">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium">Success Rate</CardTitle>
             <TrendingUp className="h-4 w-4 text-emerald-500" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{stats?.success_rate ?? 0}%</div>
+            <div className="text-3xl font-bold text-emerald-500">{stats?.success_rate ?? 0}%</div>
             <Progress
               value={stats?.success_rate ?? 0}
-              className="mt-2 h-2"
+              className="mt-2 h-1.5"
             />
             <p className="text-xs text-muted-foreground mt-2">
               Last {stats?.success_rate_period ?? '7 days'}
@@ -234,16 +243,16 @@ export default function Dashboard() {
           </CardContent>
         </Card>
 
-        <Card>
+        <Card className="bg-gradient-to-br from-primary/10 to-primary/5 border-primary/20">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium">Last 24 Hours</CardTitle>
             <Activity className="h-4 w-4 text-primary" />
           </CardHeader>
           <CardContent>
             <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-emerald-500">{stats?.last_24h.success ?? 0}</span>
+              <span className="text-3xl font-bold text-emerald-500">{stats?.last_24h.success ?? 0}</span>
               <span className="text-muted-foreground">/</span>
-              <span className="text-2xl font-bold text-destructive">{stats?.last_24h.failed ?? 0}</span>
+              <span className="text-3xl font-bold text-destructive">{stats?.last_24h.failed ?? 0}</span>
             </div>
             <p className="text-xs text-muted-foreground mt-2">
               {stats?.last_24h.total ?? 0} backups completed
@@ -257,7 +266,7 @@ export default function Dashboard() {
             <CalendarClock className="h-4 w-4 text-primary" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
+            <div className="text-3xl font-bold">
               {stats?.next_backup ? formatNextBackup(stats.next_backup) : "—"}
             </div>
             <p className="text-xs text-muted-foreground mt-2 truncate">
@@ -268,22 +277,58 @@ export default function Dashboard() {
 
         <Card>
           <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium">Avg Duration</CardTitle>
-            <Timer className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-sm font-medium">Total Snapshots</CardTitle>
+            <Archive className="h-4 w-4 text-primary" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
-              {stats?.avg_duration ? formatDuration(stats.avg_duration) : "—"}
-            </div>
+            <div className="text-3xl font-bold">{stats?.total_snapshots ?? 0}</div>
             <p className="text-xs text-muted-foreground mt-2">
-              Per backup (7 days)
+              Successful backup snapshots
             </p>
           </CardContent>
         </Card>
       </div>
 
-      {/* Secondary Stats Row */}
-      <div className="grid gap-4 md:grid-cols-4">
+      {/* GitHub-style Contribution Graph */}
+      <Card>
+        <CardHeader className="pb-2">
+          <div className="flex items-center justify-between">
+            <div>
+              <CardTitle className="text-base">Backup Activity</CardTitle>
+              <CardDescription>
+                {totalBackupsYear} backups in the last year
+                {successBackupsYear > 0 && (
+                  <span className="ml-2 text-emerald-500">
+                    ({successBackupsYear} successful)
+                  </span>
+                )}
+              </CardDescription>
+            </div>
+            <div className="flex items-center gap-4 text-xs text-muted-foreground">
+              <div className="flex items-center gap-1.5">
+                <div className="w-3 h-3 rounded-sm bg-emerald-500" />
+                <span>Success</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <div className="w-3 h-3 rounded-sm bg-amber-500" />
+                <span>Mixed</span>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <div className="w-3 h-3 rounded-sm bg-destructive" />
+                <span>Failed</span>
+              </div>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {stats?.contribution_data && (
+            <ContributionGraph data={stats.contribution_data} />
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Quick Stats Row */}
+      <div className="grid gap-4 md:grid-cols-5">
         <Card className="bg-card/50">
           <CardContent className="pt-4">
             <div className="flex items-center gap-3">
@@ -327,75 +372,31 @@ export default function Dashboard() {
           <CardContent className="pt-4">
             <div className="flex items-center gap-3">
               <div className="p-2 rounded-lg bg-primary/10">
-                <Archive className="h-5 w-5 text-primary" />
+                <CalendarClock className="h-5 w-5 text-primary" />
               </div>
               <div>
-                <p className="text-2xl font-bold">{stats?.total_snapshots ?? 0}</p>
-                <p className="text-xs text-muted-foreground">Snapshots</p>
+                <p className="text-2xl font-bold">{stats?.scheduled_jobs ?? 0}</p>
+                <p className="text-xs text-muted-foreground">Scheduled</p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="bg-card/50">
+          <CardContent className="pt-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-primary/10">
+                <Timer className="h-5 w-5 text-primary" />
+              </div>
+              <div>
+                <p className="text-2xl font-bold">
+                  {stats?.avg_duration ? formatDuration(stats.avg_duration) : "—"}
+                </p>
+                <p className="text-xs text-muted-foreground">Avg Duration</p>
               </div>
             </div>
           </CardContent>
         </Card>
       </div>
-
-      {/* 7-Day Activity Chart */}
-      <Card>
-        <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div>
-              <CardTitle className="text-base flex items-center gap-2">
-                <BarChart3 className="h-4 w-4" />
-                7-Day Activity
-              </CardTitle>
-              <CardDescription>Backup operations over the last week</CardDescription>
-            </div>
-            <div className="flex items-center gap-4 text-sm">
-              <div className="flex items-center gap-1.5">
-                <div className="w-3 h-3 rounded-sm bg-emerald-500" />
-                <span className="text-muted-foreground">Success</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <div className="w-3 h-3 rounded-sm bg-destructive" />
-                <span className="text-muted-foreground">Failed</span>
-              </div>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-end justify-between gap-2 h-32">
-            {stats?.daily_stats.map((day) => (
-              <div key={day.date} className="flex-1 flex flex-col items-center gap-1">
-                <div className="w-full flex flex-col-reverse gap-0.5" style={{ height: '100px' }}>
-                  {day.success > 0 && (
-                    <div
-                      className="w-full bg-emerald-500 rounded-t-sm transition-all"
-                      style={{
-                        height: `${(day.success / maxDailyTotal) * 100}%`,
-                        minHeight: day.success > 0 ? '4px' : '0'
-                      }}
-                      title={`${day.success} successful`}
-                    />
-                  )}
-                  {day.failed > 0 && (
-                    <div
-                      className="w-full bg-destructive rounded-t-sm transition-all"
-                      style={{
-                        height: `${(day.failed / maxDailyTotal) * 100}%`,
-                        minHeight: day.failed > 0 ? '4px' : '0'
-                      }}
-                      title={`${day.failed} failed`}
-                    />
-                  )}
-                  {day.total === 0 && (
-                    <div className="w-full bg-muted/30 rounded-sm h-1" />
-                  )}
-                </div>
-                <span className="text-xs text-muted-foreground">{day.day}</span>
-              </div>
-            ))}
-          </div>
-        </CardContent>
-      </Card>
 
       {/* Jobs and Activity Grid */}
       <div className="grid gap-6 lg:grid-cols-7">
@@ -438,7 +439,14 @@ export default function Dashboard() {
                     <div className="flex items-center gap-3 min-w-0">
                       {getStatusIcon(job.status)}
                       <div className="min-w-0">
-                        <p className="font-medium truncate">{job.name}</p>
+                        <div className="flex items-center gap-2">
+                          <p className="font-medium truncate">{job.name}</p>
+                          {job.backup_type === 'database' ? (
+                            <Database className="h-3 w-3 text-muted-foreground" />
+                          ) : (
+                            <Server className="h-3 w-3 text-muted-foreground" />
+                          )}
+                        </div>
                         <p className="text-xs text-muted-foreground truncate">
                           {job.backup_type === 'database' ? 'Database Backup' : job.remote_host || 'Local'}
                         </p>

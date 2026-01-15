@@ -3152,6 +3152,34 @@ def api_dashboard_stats():
     # Each successful backup creates one snapshot
     total_snapshots = sum(1 for e in history if e.get('status') == 'success')
 
+    # Contribution data for GitHub-style graph (last 365 days)
+    contribution_data = []
+    for i in range(364, -1, -1):
+        day = now - timedelta(days=i)
+        day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+
+        day_success = 0
+        day_failed = 0
+        for entry in history:
+            try:
+                entry_time = datetime.fromisoformat(entry.get('timestamp', '').replace('Z', '+00:00'))
+                entry_time_naive = entry_time.replace(tzinfo=None)
+                if day_start <= entry_time_naive < day_end:
+                    if entry.get('status') == 'success':
+                        day_success += 1
+                    elif entry.get('status') == 'failed':
+                        day_failed += 1
+            except (ValueError, TypeError):
+                pass
+
+        contribution_data.append({
+            'date': day_start.strftime('%Y-%m-%d'),
+            'success': day_success,
+            'failed': day_failed,
+            'total': day_success + day_failed
+        })
+
     return jsonify({
         'total_jobs': total_jobs,
         'success_jobs': success_jobs,
@@ -3166,6 +3194,7 @@ def api_dashboard_stats():
             'total': len(last_24h)
         },
         'daily_stats': daily_stats,
+        'contribution_data': contribution_data,
         'next_backup': next_backup.isoformat() if next_backup else None,
         'next_backup_job': next_backup_job,
         'avg_duration': avg_duration,
