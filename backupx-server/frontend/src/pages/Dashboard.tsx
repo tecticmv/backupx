@@ -95,7 +95,7 @@ export default function Dashboard() {
       }
       if (historyRes.ok) {
         const historyData = await historyRes.json();
-        setHistory(historyData.slice(-10).reverse());
+        setHistory(historyData.slice(0, 10));
       }
       if (statsRes.ok) {
         setStats(await statsRes.json());
