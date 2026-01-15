@@ -28,6 +28,8 @@ export interface Job {
   retention_monthly: number;
   timeout: number;
   status: "pending" | "running" | "success" | "failed" | "timeout" | "error";
+  progress?: number;
+  progress_message?: string;
   created_at: string;
   updated_at?: string;
   last_run?: string;

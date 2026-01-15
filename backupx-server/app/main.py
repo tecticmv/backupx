@@ -635,6 +635,17 @@ def init_db():
             conn.execute("ALTER TABLE s3_configs ADD COLUMN status TEXT DEFAULT 'active'")
             logger.info("Added status column to s3_configs table")
 
+        # Check and add progress columns to jobs
+        cursor = conn.execute("PRAGMA table_info(jobs)")
+        job_columns = [col[1] for col in cursor.fetchall()]
+
+        if 'progress' not in job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN progress INTEGER DEFAULT 0")
+            logger.info("Added progress column to jobs table")
+        if 'progress_message' not in job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN progress_message TEXT")
+            logger.info("Added progress_message column to jobs table")
+
         conn.commit()
         conn.close()
     except Exception as e:
@@ -893,6 +904,15 @@ def update_job_status(job_id, status, last_run=None, last_success=None):
     else:
         conn.execute('UPDATE jobs SET status=?, updated_at=? WHERE id=?',
                      (status, utc_isoformat(), job_id))
+    conn.commit()
+    conn.close()
+
+
+def update_job_progress(job_id, progress, message):
+    """Update job progress during backup execution"""
+    conn = get_db_connection()
+    conn.execute('UPDATE jobs SET progress=?, progress_message=?, updated_at=? WHERE id=?',
+                 (progress, message, utc_isoformat(), job_id))
     conn.commit()
     conn.close()
 
@@ -1501,9 +1521,11 @@ def run_filesystem_backup(job_id, job):
 
     # Update job status
     update_job_status(job_id, 'running', last_run=start_time.isoformat())
+    update_job_progress(job_id, 0, 'Initializing backup...')
 
     try:
         # Build exclude args with proper escaping
+        update_job_progress(job_id, 10, 'Preparing backup configuration...')
         exclude_args = []
         for pattern in job.get('excludes', []):
             exclude_args.append(f'--exclude {shlex.quote(pattern)}')
@@ -1540,6 +1562,8 @@ restic backup --compression auto --tag automated {insecure_flag} {' '.join(exclu
 """
 
         # Execute
+        update_job_progress(job_id, 20, 'Connecting to remote server...')
+        update_job_progress(job_id, 30, 'Running backup on remote server...')
         result = subprocess.run(
             ssh_cmd + [remote_cmd],
             capture_output=True,
@@ -1547,9 +1571,11 @@ restic backup --compression auto --tag automated {insecure_flag} {' '.join(exclu
             timeout=job.get('timeout', 7200)  # 2 hour default timeout
         )
 
+        update_job_progress(job_id, 90, 'Finalizing backup...')
         duration = (utc_now() - start_time).total_seconds()
 
         if result.returncode == 0:
+            update_job_progress(job_id, 100, 'Backup completed successfully')
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
             add_history(job_id, job['name'], 'success', 'Backup completed successfully', duration)
             send_notification(job_id, job['name'], 'success', 'Backup completed successfully', duration)
@@ -1585,9 +1611,11 @@ def run_database_backup(job_id, job):
 
     # Update job status
     update_job_status(job_id, 'running', last_run=start_time.isoformat())
+    update_job_progress(job_id, 0, 'Initializing database backup...')
 
     try:
         # Get database config
+        update_job_progress(job_id, 10, 'Loading database configuration...')
         db_config_id = job.get('database_config_id')
         if not db_config_id:
             raise Exception("Database configuration not specified")
@@ -1661,6 +1689,8 @@ exit $RESTIC_EXIT
 """
 
         # Execute
+        update_job_progress(job_id, 20, 'Connecting to remote server...')
+        update_job_progress(job_id, 30, 'Dumping database...')
         result = subprocess.run(
             ssh_cmd + [remote_cmd],
             capture_output=True,
@@ -1668,9 +1698,11 @@ exit $RESTIC_EXIT
             timeout=job.get('timeout', 7200)  # 2 hour default timeout
         )
 
+        update_job_progress(job_id, 90, 'Finalizing backup...')
         duration = (utc_now() - start_time).total_seconds()
 
         if result.returncode == 0:
+            update_job_progress(job_id, 100, 'Database backup completed successfully')
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
             message = f'MySQL backup completed successfully ({databases})'
             add_history(job_id, job['name'], 'success', message, duration)
@@ -1707,8 +1739,10 @@ def run_agent_filesystem_backup(job_id, job, server):
 
     # Update job status
     update_job_status(job_id, 'running', last_run=start_time.isoformat())
+    update_job_progress(job_id, 0, 'Initializing agent backup...')
 
     try:
+        update_job_progress(job_id, 10, 'Preparing backup request...')
         agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/backup/filesystem"
 
         # Prepare request payload
@@ -1735,13 +1769,17 @@ def run_agent_filesystem_backup(job_id, job, server):
         req.add_header('X-API-Key', server['agent_api_key'])
 
         # Make request with timeout
+        update_job_progress(job_id, 20, 'Connecting to agent...')
+        update_job_progress(job_id, 30, 'Running backup via agent...')
         timeout = job.get('timeout', 7200)
         with urlopen(req, timeout=timeout) as response:
             result = json.loads(response.read().decode('utf-8'))
 
+        update_job_progress(job_id, 90, 'Finalizing backup...')
         duration = (utc_now() - start_time).total_seconds()
 
         if result.get('success'):
+            update_job_progress(job_id, 100, 'Backup completed successfully')
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
             add_history(job_id, job['name'], 'success', 'Backup completed successfully via agent', duration)
             send_notification(job_id, job['name'], 'success', 'Backup completed successfully via agent', duration)
@@ -1790,9 +1828,11 @@ def run_agent_database_backup(job_id, job, server):
 
     # Update job status
     update_job_status(job_id, 'running', last_run=start_time.isoformat())
+    update_job_progress(job_id, 0, 'Initializing database backup...')
 
     try:
         # Get database config
+        update_job_progress(job_id, 10, 'Loading database configuration...')
         db_config_id = job.get('database_config_id')
         if not db_config_id:
             raise Exception("Database configuration not specified")
@@ -1826,13 +1866,17 @@ def run_agent_database_backup(job_id, job, server):
         req.add_header('X-API-Key', server['agent_api_key'])
 
         # Make request with timeout
+        update_job_progress(job_id, 20, 'Connecting to agent...')
+        update_job_progress(job_id, 30, 'Dumping database via agent...')
         timeout = job.get('timeout', 7200)
         with urlopen(req, timeout=timeout) as response:
             result = json.loads(response.read().decode('utf-8'))
 
+        update_job_progress(job_id, 90, 'Finalizing backup...')
         duration = (utc_now() - start_time).total_seconds()
 
         if result.get('success'):
+            update_job_progress(job_id, 100, 'Database backup completed successfully')
             databases = db_config.get('databases', '*')
             message = f'MySQL backup completed successfully via agent ({databases})'
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())

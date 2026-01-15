@@ -51,6 +51,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { Progress } from "@/components/ui/progress";
 
 export default function Jobs() {
   const [jobs, setJobs] = useState<JobsType>({});
@@ -64,6 +65,18 @@ export default function Jobs() {
   useEffect(() => {
     fetchJobs();
   }, []);
+
+  // Poll for updates when jobs are running
+  useEffect(() => {
+    const hasRunningJobs = Object.values(jobs).some(j => j.status === "running");
+    if (!hasRunningJobs) return;
+
+    const interval = setInterval(() => {
+      fetchJobs();
+    }, 2000); // Poll every 2 seconds
+
+    return () => clearInterval(interval);
+  }, [jobs]);
 
   const fetchJobs = async () => {
     try {
@@ -339,11 +352,28 @@ export default function Jobs() {
                       )}
                     </TableCell>
                     <TableCell>
-                      <div>
-                        {getStatusBadge(job.status)}
-                        <p className="text-xs text-muted-foreground mt-1">
-                          {formatTime(job.last_run)}
-                        </p>
+                      <div className="min-w-35">
+                        {job.status === "running" ? (
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-2">
+                              <Loader2 className="h-3 w-3 animate-spin text-primary" />
+                              <span className="text-xs font-medium text-primary">
+                                {job.progress ?? 0}%
+                              </span>
+                            </div>
+                            <Progress value={job.progress ?? 0} className="h-2" />
+                            <p className="text-xs text-muted-foreground truncate">
+                              {job.progress_message || "Running..."}
+                            </p>
+                          </div>
+                        ) : (
+                          <>
+                            {getStatusBadge(job.status)}
+                            <p className="text-xs text-muted-foreground mt-1">
+                              {formatTime(job.last_run)}
+                            </p>
+                          </>
+                        )}
                       </div>
                     </TableCell>
                     <TableCell className="text-right">
