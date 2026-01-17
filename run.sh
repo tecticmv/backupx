@@ -74,6 +74,7 @@ Commands:
   install         Install dependencies for both server and agent
   check           Run pre-deployment checks
   logs            Tail logs (use: ./run.sh logs [server|agent])
+  update          Pull latest changes and rebuild Docker containers
   help            Show this help message
 
 Environment Variables:
@@ -679,6 +680,63 @@ tail_logs() {
             tail -f "$LOG_DIR"/*.log
             ;;
     esac
+}
+
+update_and_rebuild() {
+    local component=${1:-all}
+
+    log_info "Updating BackupX..."
+
+    # Pull latest changes
+    cd "$SCRIPT_DIR"
+    log_info "Pulling latest changes from git..."
+    git pull
+
+    if [ $? -ne 0 ]; then
+        log_error "Git pull failed. Please resolve conflicts and try again."
+        exit 1
+    fi
+
+    # Check if docker is available
+    if ! command -v docker &> /dev/null; then
+        log_error "Docker is not installed. Cannot rebuild containers."
+        log_info "For native Python, run: ./run.sh install && ./run.sh server:restart"
+        exit 1
+    fi
+
+    case "$component" in
+        server)
+            log_info "Rebuilding server container..."
+            cd "$SERVER_DIR"
+            docker compose down
+            docker compose up -d --build
+            ;;
+        agent)
+            log_info "Rebuilding agent container..."
+            cd "$AGENT_DIR"
+            docker compose down
+            docker compose up -d --build
+            ;;
+        all|*)
+            # Rebuild server if docker-compose exists
+            if [ -f "$SERVER_DIR/docker-compose.yml" ] || [ -f "$SERVER_DIR/compose.yml" ]; then
+                log_info "Rebuilding server container..."
+                cd "$SERVER_DIR"
+                docker compose down
+                docker compose up -d --build
+            fi
+
+            # Rebuild agent if docker-compose exists
+            if [ -f "$AGENT_DIR/docker-compose.yml" ] || [ -f "$AGENT_DIR/compose.yml" ]; then
+                log_info "Rebuilding agent container..."
+                cd "$AGENT_DIR"
+                docker compose down
+                docker compose up -d --build
+            fi
+            ;;
+    esac
+
+    log_info "Update complete!"
 }
 
 # =============================================================================
@@ -1292,6 +1350,9 @@ case "${1:-}" in
         ;;
     logs)
         tail_logs "${2:-all}"
+        ;;
+    update)
+        update_and_rebuild "${2:-all}"
         ;;
     help|--help|-h)
         print_usage
