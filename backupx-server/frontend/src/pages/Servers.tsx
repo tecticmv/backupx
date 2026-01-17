@@ -616,6 +616,17 @@ export default function Servers() {
               {/* Agent-specific fields */}
               {formData.connection_type === 'agent' && (
                 <>
+                  <div className="rounded-md border border-blue-200 bg-blue-50 dark:border-blue-900 dark:bg-blue-950/50 p-3">
+                    <p className="text-xs font-medium text-blue-800 dark:text-blue-200 mb-1">
+                      Quick Install
+                    </p>
+                    <p className="text-xs text-blue-700 dark:text-blue-300 mb-2">
+                      Run this command on the remote server to install the agent:
+                    </p>
+                    <code className="block text-xs bg-blue-100 dark:bg-blue-900/50 p-2 rounded font-mono break-all select-all">
+                      curl -sSL https://raw.githubusercontent.com/SaiphMuhammad/backupx/main/install-agent.sh | sudo bash
+                    </code>
+                  </div>
                   <div className="grid gap-2">
                     <Label htmlFor="agent_port">Agent Port</Label>
                     <Input
