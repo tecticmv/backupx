@@ -38,7 +38,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
 COPY app/ ./app/
-COPY templates/ ./templates/
 COPY static/ ./static/
 
 # Copy React frontend build from builder stage
