@@ -622,6 +622,17 @@ def init_db():
             conn.execute("ALTER TABLE s3_configs ADD COLUMN status TEXT DEFAULT 'active'")
             logger.info("Added status column to s3_configs table")
 
+        # Check and add SSH auth columns to servers
+        if 'ssh_auth_type' not in columns:
+            conn.execute("ALTER TABLE servers ADD COLUMN ssh_auth_type TEXT DEFAULT 'key_path'")
+            logger.info("Added ssh_auth_type column to servers table")
+        if 'ssh_password' not in columns:
+            conn.execute("ALTER TABLE servers ADD COLUMN ssh_password TEXT")
+            logger.info("Added ssh_password column to servers table")
+        if 'ssh_key_content' not in columns:
+            conn.execute("ALTER TABLE servers ADD COLUMN ssh_key_content TEXT")
+            logger.info("Added ssh_key_content column to servers table")
+
         # Check and add progress columns to jobs
         cursor = conn.execute("PRAGMA table_info(jobs)")
         job_columns = [col[1] for col in cursor.fetchall()]
@@ -1021,10 +1032,11 @@ def create_server(server):
     """Create a new server"""
     conn = get_db_connection()
     conn.execute('''
-        INSERT INTO servers (id, name, host, ssh_port, ssh_user, ssh_key, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO servers (id, name, host, ssh_port, ssh_user, ssh_key, ssh_auth_type, ssh_password, ssh_key_content, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (server['id'], server['name'], server['host'],
           server.get('ssh_port', 22), server.get('ssh_user'), server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
+          server.get('ssh_auth_type', 'key_path'), server.get('ssh_password'), server.get('ssh_key_content'),
           server.get('status', 'active'), server.get('created_at', utc_isoformat()), server.get('updated_at')))
     conn.commit()
     conn.close()
@@ -1034,10 +1046,11 @@ def update_server_in_db(server_id, server):
     """Update a server"""
     conn = get_db_connection()
     conn.execute('''
-        UPDATE servers SET name=?, host=?, ssh_port=?, ssh_user=?, ssh_key=?, status=?, updated_at=?
+        UPDATE servers SET name=?, host=?, ssh_port=?, ssh_user=?, ssh_key=?, ssh_auth_type=?, ssh_password=?, ssh_key_content=?, status=?, updated_at=?
         WHERE id=?
     ''', (server['name'], server['host'],
           server.get('ssh_port', 22), server.get('ssh_user'), server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
+          server.get('ssh_auth_type', 'key_path'), server.get('ssh_password'), server.get('ssh_key_content'),
           server.get('status', 'active'), utc_isoformat(), server_id))
     conn.commit()
     conn.close()
@@ -1470,10 +1483,15 @@ def run_backup(job_id):
 
     # Ensure restic is installed on the remote server before running backup
     if server and server.get('ssh_user') and server.get('host'):
+        ssh_key = _get_ssh_key_path(server)
+        auth_type = server.get('ssh_auth_type', 'key_path')
+        ssh_password = server.get('ssh_password', '')
+        if ssh_password and is_encrypted(ssh_password):
+            ssh_password = decrypt_credential(ssh_password)
         success, msg = ensure_restic_installed(
             server['host'], server['ssh_user'],
             int(server.get('ssh_port') or 22),
-            server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
+            ssh_key, ssh_auth_type=auth_type, ssh_password=ssh_password
         )
         if not success:
             error_msg = f"Restic not available on remote server: {msg}"
@@ -1501,18 +1519,75 @@ def sanitize_error_message(error: str, max_length: int = 500) -> str:
     return sanitized
 
 
-def _build_ssh_cmd(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_rsa', timeout=30):
+def _write_server_key_file(server_id, key_content):
+    """Write SSH key content to a per-server file and return the path"""
+    key_dir = os.path.join(os.environ.get('APP_DATA_DIR', '/app/data'), 'ssh_keys')
+    os.makedirs(key_dir, mode=0o700, exist_ok=True)
+    key_path = os.path.join(key_dir, f'{server_id}.key')
+    with open(key_path, 'w') as f:
+        f.write(key_content)
+        if not key_content.endswith('\n'):
+            f.write('\n')
+    os.chmod(key_path, 0o600)
+    return key_path
+
+
+def _get_ssh_key_path(server):
+    """Get the effective SSH key path for a server, handling key_content if needed"""
+    auth_type = server.get('ssh_auth_type', 'key_path')
+    if auth_type == 'key_content':
+        key_content = server.get('ssh_key_content', '')
+        if key_content:
+            # Decrypt if encrypted
+            if is_encrypted(key_content):
+                key_content = decrypt_credential(key_content)
+            return _write_server_key_file(server.get('id', 'temp'), key_content)
+    return server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
+
+
+def _build_ssh_cmd(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_rsa', timeout=30, ssh_auth_type='key_path', ssh_password=None):
     """Build a standard SSH command prefix"""
-    return [
-        'ssh', '-i', ssh_key,
+    base_opts = [
         '-p', str(ssh_port),
         '-o', 'StrictHostKeyChecking=accept-new',
-        '-o', 'BatchMode=yes',
         '-o', f'ConnectTimeout={timeout}',
         '-o', 'ServerAliveInterval=60',
         '-o', 'ServerAliveCountMax=5',
-        f'{ssh_user}@{host}'
     ]
+
+    if ssh_auth_type == 'password' and ssh_password:
+        # Use sshpass for password authentication
+        return [
+            'sshpass', '-p', ssh_password,
+            'ssh',
+            *base_opts,
+            '-o', 'PubkeyAuthentication=no',
+            f'{ssh_user}@{host}'
+        ]
+    else:
+        # Key-based authentication (key_path or key_content)
+        return [
+            'ssh', '-i', ssh_key,
+            *base_opts,
+            '-o', 'BatchMode=yes',
+            f'{ssh_user}@{host}'
+        ]
+
+
+def _build_ssh_cmd_for_server(server, timeout=30):
+    """Build SSH command from a server dict, handling all auth types"""
+    auth_type = server.get('ssh_auth_type', 'key_path')
+    ssh_key = _get_ssh_key_path(server)
+    ssh_password = None
+    if auth_type == 'password':
+        ssh_password = server.get('ssh_password', '')
+        if ssh_password and is_encrypted(ssh_password):
+            ssh_password = decrypt_credential(ssh_password)
+    return _build_ssh_cmd(
+        server['host'], server.get('ssh_user', 'root'),
+        int(server.get('ssh_port') or 22), ssh_key, timeout,
+        ssh_auth_type=auth_type, ssh_password=ssh_password
+    )
 
 
 # Cache of servers where restic is confirmed installed (cleared on restart)
@@ -1521,10 +1596,19 @@ _restic_confirmed = set()
 RESTIC_VERSION = '0.17.3'
 RESTIC_INSTALL_SCRIPT = """
 set -e
+export PATH="$HOME/.local/bin:$PATH"
+MIN_MAJOR=0
+MIN_MINOR=14
 if command -v restic >/dev/null 2>&1; then
-    echo "RESTIC_ALREADY_INSTALLED"
-    restic version
-    exit 0
+    CURRENT=$(restic version 2>/dev/null | head -1 | awk '{print $2}')
+    CUR_MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+    CUR_MINOR=$(echo "$CURRENT" | cut -d. -f2)
+    if [ "$CUR_MAJOR" -gt "$MIN_MAJOR" ] || ([ "$CUR_MAJOR" -eq "$MIN_MAJOR" ] && [ "$CUR_MINOR" -ge "$MIN_MINOR" ]); then
+        echo "RESTIC_ALREADY_INSTALLED"
+        restic version
+        exit 0
+    fi
+    echo "RESTIC_OUTDATED: $CURRENT - upgrading"
 fi
 
 ARCH=$(uname -m)
@@ -1540,23 +1624,41 @@ RESTIC_VER="%s"
 URL="https://github.com/restic/restic/releases/download/v${RESTIC_VER}/restic_${RESTIC_VER}_${OS}_${ARCH}.bz2"
 
 echo "RESTIC_INSTALLING from $URL"
-TMPFILE=$(mktemp)
-curl -fsSL "$URL" -o "$TMPFILE.bz2"
-bunzip2 "$TMPFILE.bz2"
-chmod +x "$TMPFILE"
-mv "$TMPFILE" /usr/local/bin/restic
+TMPDIR=$(mktemp -d)
+curl -fsSL "$URL" -o "$TMPDIR/restic.bz2"
+bunzip2 "$TMPDIR/restic.bz2"
+chmod +x "$TMPDIR/restic"
+
+# Try /usr/local/bin with sudo, fall back to ~/.local/bin
+if sudo -n mv "$TMPDIR/restic" /usr/local/bin/restic 2>/dev/null; then
+    echo "RESTIC_INSTALLED_SYSTEM"
+elif mv "$TMPDIR/restic" /usr/local/bin/restic 2>/dev/null; then
+    echo "RESTIC_INSTALLED_SYSTEM"
+else
+    mkdir -p "$HOME/.local/bin"
+    mv "$TMPDIR/restic" "$HOME/.local/bin/restic"
+    # Ensure ~/.local/bin is in PATH for future sessions
+    if ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+    fi
+    if ! grep -q '.local/bin' "$HOME/.profile" 2>/dev/null; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.profile"
+    fi
+    echo "RESTIC_INSTALLED_USER"
+fi
+rmdir "$TMPDIR" 2>/dev/null || true
 echo "RESTIC_INSTALLED"
 restic version
 """ % RESTIC_VERSION
 
 
-def ensure_restic_installed(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_rsa'):
+def ensure_restic_installed(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_rsa', ssh_auth_type='key_path', ssh_password=None):
     """Check if restic is installed on remote server, install if missing. Returns (success, message)."""
     cache_key = f"{ssh_user}@{host}:{ssh_port}"
     if cache_key in _restic_confirmed:
         return True, "Restic already confirmed"
 
-    ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key)
+    ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key, ssh_auth_type=ssh_auth_type, ssh_password=ssh_password)
 
     try:
         result = subprocess.run(
@@ -1599,6 +1701,9 @@ def run_filesystem_backup(job_id, job):
     update_job_status(job_id, 'running', last_run=start_time.isoformat())
     update_job_progress(job_id, 0, 'Initializing backup...')
 
+    # Look up server for SSH auth details
+    server = get_server(job['server_id']) if job.get('server_id') else None
+
     try:
         # Build exclude args with proper escaping
         update_job_progress(job_id, 10, 'Preparing backup configuration...')
@@ -1618,20 +1723,19 @@ def run_filesystem_backup(job_id, job):
         backup_prefix = shlex.quote(job['backup_prefix'])
 
         # Run backup via SSH on remote
-        ssh_cmd = [
-            'ssh', '-i', job.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
-            '-p', str(job.get('ssh_port', 22)),
-            '-o', 'StrictHostKeyChecking=accept-new',
-            '-o', 'BatchMode=yes',
-            '-o', 'ConnectTimeout=30',
-            '-o', 'ServerAliveInterval=60',
-            '-o', 'ServerAliveCountMax=5',
-            job['remote_host']
-        ]
+        if server:
+            ssh_cmd = _build_ssh_cmd_for_server(server, timeout=30)
+        else:
+            ssh_cmd = _build_ssh_cmd(
+                job['remote_host'].split('@')[-1] if '@' in job.get('remote_host', '') else job.get('remote_host', ''),
+                job['remote_host'].split('@')[0] if '@' in job.get('remote_host', '') else 'root',
+                int(job.get('ssh_port', 22)),
+                job.get('ssh_key', '/home/backupx/.ssh/id_rsa'))
 
         # Build remote command with proper escaping
         insecure_flag = '--insecure-tls' if job.get('skip_ssl_verify') else ''
         remote_cmd = f"""
+export PATH="$HOME/.local/bin:$PATH"
 export AWS_ACCESS_KEY_ID={s3_access_key}
 export AWS_SECRET_ACCESS_KEY={s3_secret_key}
 export RESTIC_PASSWORD={restic_password}
@@ -1654,6 +1758,7 @@ restic backup --compression auto --tag automated {insecure_flag} {' '.join(exclu
 
         if result.returncode == 0:
             update_job_progress(job_id, 100, 'Backup completed successfully')
+            invalidate_snapshot_cache(job_id)
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
             add_history(job_id, job['name'], 'success', 'Backup completed successfully', duration)
             send_notification(job_id, job['name'], 'success', 'Backup completed successfully', duration)
@@ -1691,6 +1796,9 @@ def run_database_backup(job_id, job):
     update_job_status(job_id, 'running', last_run=start_time.isoformat())
     update_job_progress(job_id, 0, 'Initializing database backup...')
 
+    # Look up server for SSH auth details
+    server = get_server(job['server_id']) if job.get('server_id') else None
+
     try:
         # Get database config
         update_job_progress(job_id, 10, 'Loading database configuration...')
@@ -1704,16 +1812,14 @@ def run_database_backup(job_id, job):
             raise Exception("Database configuration not found")
 
         # Build SSH command to run on remote server
-        ssh_cmd = [
-            'ssh', '-i', job.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
-            '-p', str(job.get('ssh_port', 22)),
-            '-o', 'StrictHostKeyChecking=accept-new',
-            '-o', 'BatchMode=yes',
-            '-o', 'ConnectTimeout=30',
-            '-o', 'ServerAliveInterval=60',
-            '-o', 'ServerAliveCountMax=5',
-            job['remote_host']
-        ]
+        if server:
+            ssh_cmd = _build_ssh_cmd_for_server(server, timeout=30)
+        else:
+            ssh_cmd = _build_ssh_cmd(
+                job['remote_host'].split('@')[-1] if '@' in job.get('remote_host', '') else job.get('remote_host', ''),
+                job['remote_host'].split('@')[0] if '@' in job.get('remote_host', '') else 'root',
+                int(job.get('ssh_port', 22)),
+                job.get('ssh_key', '/home/backupx/.ssh/id_rsa'))
 
         # Get database list with proper escaping
         databases = db_config.get('databases', '*')
@@ -1740,6 +1846,7 @@ def run_database_backup(job_id, job):
         # Build remote command with proper escaping
         insecure_flag = '--insecure-tls' if job.get('skip_ssl_verify') else ''
         remote_cmd = f"""
+export PATH="$HOME/.local/bin:$PATH"
 export AWS_ACCESS_KEY_ID={s3_access_key}
 export AWS_SECRET_ACCESS_KEY={s3_secret_key}
 export RESTIC_PASSWORD={restic_password}
@@ -1783,6 +1890,7 @@ exit $RESTIC_EXIT
 
         if result.returncode == 0:
             update_job_progress(job_id, 100, 'Database backup completed successfully')
+            invalidate_snapshot_cache(job_id)
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
             message = f'MySQL backup completed successfully ({databases})'
             add_history(job_id, job['name'], 'success', message, duration)
@@ -1812,8 +1920,29 @@ exit $RESTIC_EXIT
         return False, error_msg
 
 
+# Simple in-memory cache for snapshots and stats (TTL in seconds)
+_snapshot_cache = {}
+_snapshot_cache_ttl = 60  # 1 minute
+_stats_cache = {}
+_stats_cache_ttl = 300  # 5 minutes
+
+
+def invalidate_snapshot_cache(job_id):
+    """Invalidate cached snapshots/stats for a job (call after backup/restore)"""
+    _snapshot_cache.pop(job_id, None)
+    _stats_cache.pop(job_id, None)
+
+
 def get_snapshots(job, server=None):
     """Get list of snapshots for a job"""
+    import time
+    job_id = job.get('id')
+    # Check cache
+    if job_id and job_id in _snapshot_cache:
+        cached_at, cached_data = _snapshot_cache[job_id]
+        if time.time() - cached_at < _snapshot_cache_ttl:
+            return cached_data
+
     # Get skip_ssl_verify from S3 config
     s3_config_id = job.get('s3_config_id')
     skip_ssl_verify = False
@@ -1846,6 +1975,9 @@ def get_snapshots(job, server=None):
             snapshots = json.loads(result.stdout)
             # Sort by time, newest first
             snapshots.sort(key=lambda x: x.get('time', ''), reverse=True)
+            # Cache result
+            if job_id:
+                _snapshot_cache[job_id] = (time.time(), snapshots)
             return snapshots
         return []
     except Exception as e:
@@ -1854,6 +1986,13 @@ def get_snapshots(job, server=None):
 
 
 def get_repo_stats(job, server=None):
+    import time
+    job_id = job.get('id')
+    # Check cache
+    if job_id and job_id in _stats_cache:
+        cached_at, cached_data = _stats_cache[job_id]
+        if time.time() - cached_at < _stats_cache_ttl:
+            return cached_data
     """Get repository statistics"""
     # Get skip_ssl_verify from S3 config
     s3_config_id = job.get('s3_config_id')
@@ -1871,7 +2010,7 @@ def get_repo_stats(job, server=None):
         env['RESTIC_PASSWORD'] = job['restic_password']
         env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
 
-        cmd = ['restic', 'stats', '--json']
+        cmd = ['restic', 'stats', '--json', '--mode', 'raw-data']
         if skip_ssl_verify:
             cmd.append('--insecure-tls')
 
@@ -1880,11 +2019,14 @@ def get_repo_stats(job, server=None):
             capture_output=True,
             text=True,
             env=env,
-            timeout=120
+            timeout=60
         )
 
         if result.returncode == 0:
-            return json.loads(result.stdout)
+            stats = json.loads(result.stdout)
+            if job_id:
+                _stats_cache[job_id] = (time.time(), stats)
+            return stats
         return None
     except Exception as e:
         logger.error(f"Failed to get repo stats: {e}")
@@ -1918,6 +2060,7 @@ def schedule_job(job_id, job):
 
 # Routes
 @app.route('/health')
+@limiter.exempt
 def health():
     return jsonify({'status': 'ok'})
 
@@ -2060,6 +2203,42 @@ def api_change_password():
 def api_jobs():
     jobs = load_jobs()
     return jsonify(jobs)
+
+
+@app.route('/api/jobs/<job_id>/reveal-password', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_reveal_restic_password(job_id):
+    """Reveal the restic password for a job. Audited."""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+
+    password = job.get('restic_password', '')
+    if not password:
+        return jsonify({'error': 'No password stored'}), 404
+
+    # Audit log this action
+    try:
+        from .audit.logger import get_audit_logger
+        audit_logger = get_audit_logger()
+        if audit_logger:
+            audit_logger.log(
+                action='reveal',
+                resource_type='job',
+                resource_id=job_id,
+                resource_name=job.get('name'),
+                user_id=current_user.id if hasattr(current_user, 'id') else 'unknown',
+                user_name=current_user.id if hasattr(current_user, 'id') else 'unknown',
+                status='success',
+                new_value={'field': 'restic_password'},
+                ip_address=request.remote_addr,
+                user_agent=request.headers.get('User-Agent', '')
+            )
+    except Exception as e:
+        logger.warning(f"Failed to audit reveal: {e}")
+
+    return jsonify({'restic_password': password})
 
 
 @app.route('/api/jobs/<job_id>/status')
@@ -2397,13 +2576,28 @@ def api_job_snapshots(job_id):
     server_id = job.get('server_id')
     server = get_server(server_id) if server_id else None
 
+    # Only fetch snapshots (fast). Stats is fetched separately on-demand.
     snapshots = get_snapshots(job, server)
-    stats = get_repo_stats(job, server)
 
     return jsonify({
         'snapshots': snapshots,
-        'stats': stats
+        'stats': None
     })
+
+
+@app.route('/api/jobs/<job_id>/snapshots/stats')
+@login_required
+def api_job_snapshot_stats(job_id):
+    """Get repository statistics (slow - fetched separately)"""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+
+    server_id = job.get('server_id')
+    server = get_server(server_id) if server_id else None
+
+    stats = get_repo_stats(job, server)
+    return jsonify({'stats': stats})
 
 
 @app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/files')
@@ -2648,36 +2842,36 @@ def api_snapshot_restore(job_id, snapshot_id):
         # Build restic restore command
         repo = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
 
+        # Escape values for shell
+        safe_snapshot = shlex.quote(snapshot_id)
+        safe_target = shlex.quote(target_path)
+        safe_source = shlex.quote(source_path)
+
         # Create the restic restore command - restore specific path to target
-        restic_cmd = f"restic restore {snapshot_id} --target {target_path} --include {source_path}"
-        if skip_ssl_verify:
-            restic_cmd += " --insecure-tls"
+        insecure_flag = ' --insecure-tls' if skip_ssl_verify else ''
+        restic_cmd = f"restic restore {safe_snapshot} --target {safe_target} --include {safe_source}{insecure_flag}"
 
         # Environment variables for restic
-        env_exports = f"""
-export AWS_ACCESS_KEY_ID='{job['s3_access_key']}'
-export AWS_SECRET_ACCESS_KEY='{job['s3_secret_key']}'
-export RESTIC_PASSWORD='{job['restic_password']}'
-export RESTIC_REPOSITORY='{repo}'
+        full_cmd = f"""
+export PATH="$HOME/.local/bin:$PATH"
+export AWS_ACCESS_KEY_ID={shlex.quote(job['s3_access_key'])}
+export AWS_SECRET_ACCESS_KEY={shlex.quote(job['s3_secret_key'])}
+export RESTIC_PASSWORD={shlex.quote(job['restic_password'])}
+export RESTIC_REPOSITORY={shlex.quote(repo)}
+mkdir -p {safe_target}
+{restic_cmd}
 """
-        full_cmd = env_exports + restic_cmd
 
-        # Use SSH to run the restore
-        ssh_host = server.get('host')
-        ssh_port = server.get('ssh_port') or 22
-        ssh_user = server.get('ssh_user', 'root')
-        ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
-
-        if not ssh_host:
+        if not server.get('host'):
             return jsonify({'error': 'Server SSH configuration incomplete'}), 400
 
-        ssh_cmd = _build_ssh_cmd(ssh_host, ssh_user, ssh_port, ssh_key)
+        ssh_cmd = _build_ssh_cmd_for_server(server, timeout=30)
 
         result = subprocess.run(
             ssh_cmd + [full_cmd],
             capture_output=True,
             text=True,
-            timeout=600
+            timeout=1800
         )
 
         if result.returncode != 0:
@@ -3290,7 +3484,14 @@ def api_download_s3_file(config_id):
 def api_get_servers():
     """Get all servers"""
     servers = load_servers()
-    return jsonify(servers)
+    # Strip sensitive fields
+    safe_servers = []
+    for s in servers:
+        safe = {**s}
+        safe.pop('ssh_password', None)
+        safe.pop('ssh_key_content', None)
+        safe_servers.append(safe)
+    return jsonify(safe_servers)
 
 
 @app.route('/api/servers', methods=['POST'])
@@ -3320,9 +3521,29 @@ def api_create_server_route():
     if not validate_port(ssh_port):
         return jsonify({'error': 'Invalid SSH port (must be 1-65535)'}), 400
 
+    ssh_auth_type = data.get('ssh_auth_type', 'key_path')
+    if ssh_auth_type not in ('key_path', 'key_content', 'password'):
+        return jsonify({'error': 'Invalid ssh_auth_type'}), 400
+
     ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
-    if not validate_path(ssh_key):
-        return jsonify({'error': 'Invalid SSH key path'}), 400
+    if ssh_auth_type == 'key_path':
+        if not validate_path(ssh_key):
+            return jsonify({'error': 'Invalid SSH key path'}), 400
+
+    # Encrypt sensitive fields
+    ssh_password = None
+    if ssh_auth_type == 'password':
+        ssh_password = data.get('ssh_password', '')
+        if not ssh_password:
+            return jsonify({'error': 'SSH password is required for password authentication'}), 400
+        ssh_password = encrypt_credential(ssh_password)
+
+    ssh_key_content = None
+    if ssh_auth_type == 'key_content':
+        ssh_key_content = data.get('ssh_key_content', '')
+        if not ssh_key_content:
+            return jsonify({'error': 'SSH key content is required'}), 400
+        ssh_key_content = encrypt_credential(ssh_key_content)
 
     new_server = {
         'id': generate_id(),
@@ -3331,6 +3552,9 @@ def api_create_server_route():
         'ssh_port': ssh_port,
         'ssh_user': data['ssh_user'],
         'ssh_key': ssh_key,
+        'ssh_auth_type': ssh_auth_type,
+        'ssh_password': ssh_password,
+        'ssh_key_content': ssh_key_content,
         'status': data.get('status', 'active'),
         'created_at': utc_isoformat(),
         'updated_at': utc_isoformat()
@@ -3339,19 +3563,32 @@ def api_create_server_route():
     create_server(new_server)
 
     # Auto-install restic on remote server in background
-    def _provision(host, ssh_user, ssh_port, ssh_key):
-        success, msg = ensure_restic_installed(host, ssh_user, ssh_port, ssh_key)
+    def _provision(srv):
+        host = srv['host']
+        ssh_user = srv.get('ssh_user', 'root')
+        auth_type = srv.get('ssh_auth_type', 'key_path')
+        ssh_pw = srv.get('ssh_password', '')
+        if ssh_pw and is_encrypted(ssh_pw):
+            ssh_pw = decrypt_credential(ssh_pw)
+        success, msg = ensure_restic_installed(host, ssh_user,
+            int(srv.get('ssh_port') or 22),
+            _get_ssh_key_path(srv),
+            ssh_auth_type=auth_type, ssh_password=ssh_pw)
         if success:
             logger.info(f"Auto-provisioned restic on {ssh_user}@{host}: {msg}")
         else:
             logger.warning(f"Failed to auto-provision restic on {ssh_user}@{host}: {msg}")
     threading.Thread(
         target=_provision,
-        args=(new_server['host'], new_server['ssh_user'], new_server['ssh_port'], new_server['ssh_key']),
+        args=(new_server,),
         daemon=True
     ).start()
 
-    return jsonify(new_server), 201
+    # Don't return encrypted values
+    safe_server = {**new_server}
+    safe_server.pop('ssh_password', None)
+    safe_server.pop('ssh_key_content', None)
+    return jsonify(safe_server), 201
 
 
 @app.route('/api/servers/<server_id>', methods=['PUT'])
@@ -3374,24 +3611,44 @@ def api_update_server_route(server_id):
     server['ssh_port'] = int(data.get('ssh_port', server.get('ssh_port', 22)))
     server['ssh_user'] = data.get('ssh_user', server.get('ssh_user'))
     server['ssh_key'] = data.get('ssh_key', server.get('ssh_key', '/home/backupx/.ssh/id_rsa'))
+    server['ssh_auth_type'] = data.get('ssh_auth_type', server.get('ssh_auth_type', 'key_path'))
+
+    # Update password if provided
+    if 'ssh_password' in data and data['ssh_password']:
+        server['ssh_password'] = encrypt_credential(data['ssh_password'])
+    # Update key content if provided
+    if 'ssh_key_content' in data and data['ssh_key_content']:
+        server['ssh_key_content'] = encrypt_credential(data['ssh_key_content'])
 
     update_server_in_db(server_id, server)
 
     # Auto-install restic on remote server in background
     if server.get('ssh_user') and server.get('host'):
-        def _provision(host, ssh_user, ssh_port, ssh_key):
-            success, msg = ensure_restic_installed(host, ssh_user, ssh_port, ssh_key)
+        def _provision(srv):
+            auth_type = srv.get('ssh_auth_type', 'key_path')
+            ssh_pw = srv.get('ssh_password', '')
+            if ssh_pw and is_encrypted(ssh_pw):
+                ssh_pw = decrypt_credential(ssh_pw)
+            success, msg = ensure_restic_installed(
+                srv['host'], srv.get('ssh_user', 'root'),
+                int(srv.get('ssh_port') or 22),
+                _get_ssh_key_path(srv),
+                ssh_auth_type=auth_type, ssh_password=ssh_pw)
             if success:
-                logger.info(f"Auto-provisioned restic on {ssh_user}@{host}: {msg}")
+                logger.info(f"Auto-provisioned restic on {srv.get('ssh_user')}@{srv['host']}: {msg}")
             else:
-                logger.warning(f"Failed to auto-provision restic on {ssh_user}@{host}: {msg}")
+                logger.warning(f"Failed to auto-provision restic on {srv.get('ssh_user')}@{srv['host']}: {msg}")
         threading.Thread(
             target=_provision,
-            args=(server['host'], server['ssh_user'], int(server.get('ssh_port') or 22), server.get('ssh_key', '/home/backupx/.ssh/id_rsa')),
+            args=(server,),
             daemon=True
         ).start()
 
-    return jsonify(server)
+    # Don't return encrypted values
+    safe_server = {**server}
+    safe_server.pop('ssh_password', None)
+    safe_server.pop('ssh_key_content', None)
+    return jsonify(safe_server)
 
 
 @app.route('/api/servers/<server_id>', methods=['DELETE'])
@@ -3425,15 +3682,24 @@ def api_test_server_connection():
     ssh_port = int(data.get('ssh_port', 22))
     ssh_user = data.get('ssh_user', '')
     ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
+    ssh_auth_type = data.get('ssh_auth_type', 'key_path')
+    ssh_password = data.get('ssh_password', '')
 
     if not ssh_user:
         return jsonify({'error': 'SSH user is required'}), 400
 
+    # Handle key_content: write to temp file
+    if ssh_auth_type == 'key_content':
+        key_content = data.get('ssh_key_content', '')
+        if key_content:
+            ssh_key = _write_server_key_file('test_connection', key_content)
+
     try:
-        ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key, timeout=10)
+        ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key, timeout=10,
+                                  ssh_auth_type=ssh_auth_type, ssh_password=ssh_password)
 
         result = subprocess.run(
-            ssh_cmd + ['echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")'],
+            ssh_cmd + ['export PATH="$HOME/.local/bin:$PATH"; echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")'],
             capture_output=True,
             text=True,
             timeout=30
@@ -3472,16 +3738,11 @@ def api_test_server_connection_by_id(server_id):
     if not server:
         return jsonify({'error': 'Server not found'}), 404
 
-    host = server.get('host', '')
-    ssh_port = int(server.get('ssh_port') or 22)
-    ssh_user = server.get('ssh_user') or ''
-    ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
-
     try:
-        ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key, timeout=10)
+        ssh_cmd = _build_ssh_cmd_for_server(server, timeout=10)
 
         result = subprocess.run(
-            ssh_cmd + ['echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")'],
+            ssh_cmd + ['export PATH="$HOME/.local/bin:$PATH"; echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")'],
             capture_output=True,
             text=True,
             timeout=30
@@ -3515,7 +3776,6 @@ def api_test_server_connection_by_id(server_id):
 @app.route('/api/servers/<server_id>/install-restic', methods=['POST'])
 @login_required
 @csrf.exempt
-@audit_log('install_restic')
 def api_install_restic(server_id):
     """Install restic on a remote server via SSH"""
     server = get_server(server_id)
@@ -3525,7 +3785,6 @@ def api_install_restic(server_id):
     host = server.get('host', '')
     ssh_user = server.get('ssh_user', '')
     ssh_port = int(server.get('ssh_port') or 22)
-    ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
 
     if not host or not ssh_user:
         return jsonify({'error': 'Server SSH configuration incomplete'}), 400
@@ -3534,11 +3793,77 @@ def api_install_restic(server_id):
     cache_key = f"{ssh_user}@{host}:{ssh_port}"
     _restic_confirmed.discard(cache_key)
 
-    success, message = ensure_restic_installed(host, ssh_user, ssh_port, ssh_key)
+    auth_type = server.get('ssh_auth_type', 'key_path')
+    ssh_password = server.get('ssh_password', '')
+    if ssh_password and is_encrypted(ssh_password):
+        ssh_password = decrypt_credential(ssh_password)
+    success, message = ensure_restic_installed(host, ssh_user, ssh_port,
+        _get_ssh_key_path(server),
+        ssh_auth_type=auth_type, ssh_password=ssh_password)
     if success:
         return jsonify({'success': True, 'message': message})
     else:
         return jsonify({'error': message}), 400
+
+
+@app.route('/api/servers/<server_id>/browse', methods=['GET'])
+@login_required
+def api_browse_server_directories(server_id):
+    """Browse directories on a remote server via SSH"""
+    server = get_server(server_id)
+    if not server:
+        return jsonify({'error': 'Server not found'}), 404
+
+    path = request.args.get('path', '/')
+
+    # Validate path
+    if not path.startswith('/'):
+        return jsonify({'error': 'Path must be absolute'}), 400
+    if '..' in path.split('/'):
+        return jsonify({'error': 'Path traversal not allowed'}), 400
+
+    if not server.get('host') or not server.get('ssh_user'):
+        return jsonify({'error': 'Server SSH configuration incomplete'}), 400
+
+    try:
+        ssh_cmd = _build_ssh_cmd_for_server(server, timeout=10)
+        safe_path = shlex.quote(path)
+        # List both directories and files, tagged with 'd' or 'f'
+        remote_cmd = f"find {safe_path} -maxdepth 1 -mindepth 1 -printf '%y\\t%p\\n' 2>/dev/null | sort -t$'\\t' -k1,1 -k2,2 | head -1000"
+
+        result = subprocess.run(
+            ssh_cmd + [remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+
+        if result.returncode != 0 and not result.stdout:
+            return jsonify({'error': 'Failed to list directories'}), 500
+
+        directories = []
+        files = []
+        for line in result.stdout.strip().split('\n'):
+            line = line.strip()
+            if not line or '\t' not in line:
+                continue
+            entry_type, entry_path = line.split('\t', 1)
+            entry = {
+                'name': os.path.basename(entry_path),
+                'path': entry_path,
+                'type': 'directory' if entry_type == 'd' else 'file'
+            }
+            if entry_type == 'd':
+                directories.append(entry)
+            else:
+                files.append(entry)
+
+        return jsonify({'path': path, 'directories': directories, 'files': files})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Connection timed out'}), 504
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # Database Configuration API Routes
@@ -4148,6 +4473,7 @@ def api_set_timezone():
 
 # Serve React frontend
 @app.route('/assets/<path:filename>')
+@limiter.exempt
 def serve_assets(filename):
     """Serve static assets from React build"""
     return send_from_directory(FRONTEND_DIST / 'assets', filename)
@@ -4155,6 +4481,7 @@ def serve_assets(filename):
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
+@limiter.exempt
 def serve_frontend(path):
     """Serve React frontend for all non-API routes"""
     # Skip API routes

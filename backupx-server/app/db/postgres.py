@@ -371,6 +371,14 @@ class PostgresBackend(DatabaseBackend):
         if 'agent_api_key' not in columns:
             self.add_column('servers', 'agent_api_key', 'TEXT')
 
+        # Add SSH auth columns to servers table
+        if 'ssh_auth_type' not in columns:
+            self.add_column('servers', 'ssh_auth_type', 'TEXT', "'key_path'")
+        if 'ssh_password' not in columns:
+            self.add_column('servers', 'ssh_password', 'TEXT')
+        if 'ssh_key_content' not in columns:
+            self.add_column('servers', 'ssh_key_content', 'TEXT')
+
         # Create app_settings table if it doesn't exist
         self.executescript('''
             CREATE TABLE IF NOT EXISTS app_settings (

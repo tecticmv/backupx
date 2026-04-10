@@ -4,7 +4,7 @@ services:
     container_name: backup-ui
     restart: unless-stopped
     ports:
-      - "8088:5000"
+      - "9090:9090"
     volumes:
       - ./config:/app/config
       - ./logs:/app/logs
@@ -18,6 +18,7 @@ services:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=UTC
+      - LISTEN_PORT=9090
       # PostgreSQL configuration
       - DATABASE_TYPE=postgresql
       - DATABASE_HOST=postgres
@@ -29,7 +30,7 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -53,3 +54,10 @@ services:
 volumes:
   backup-data:
   postgres-data:
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.200.0.0/24

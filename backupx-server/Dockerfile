@@ -24,6 +24,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     openssh-client \
+    sshpass \
     restic \
     rclone \
     cron \
@@ -51,7 +52,7 @@ RUN mkdir -p /app/config /app/logs /app/data /home/backupx/.ssh \
 USER backupx
 
 # Expose port
-EXPOSE 5000
+EXPOSE 9090
 
 # Run the application with gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--access-logfile", "-", "--error-logfile", "-", "app.main:app"]
+CMD sh -c 'gunicorn --bind "0.0.0.0:${LISTEN_PORT:-9090}" --workers 2 --threads 4 --access-logfile - --error-logfile - app.main:app'

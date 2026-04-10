@@ -42,7 +42,6 @@ import {
   Pencil,
   HardDrive,
   Camera,
-  FileText,
   Loader2,
   Info,
   RefreshCw,
@@ -93,8 +92,13 @@ export default function Snapshots() {
       if (snapshotsRes.ok) {
         const data = await snapshotsRes.json();
         setSnapshots(data.snapshots || []);
-        setStats(data.stats || null);
       }
+
+      // Fetch stats in the background (slower)
+      fetch(`/api/jobs/${jobId}/snapshots/stats`)
+        .then((res) => res.ok ? res.json() : null)
+        .then((data) => data && setStats(data.stats))
+        .catch(() => {});
     } catch {
       toast.error("Failed to fetch data");
     } finally {
@@ -273,7 +277,7 @@ export default function Snapshots() {
         </div>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium">Total Size</CardTitle>
@@ -281,7 +285,7 @@ export default function Snapshots() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {stats ? formatBytes(stats.total_size) : "-"}
+              {stats?.total_size != null ? formatBytes(stats.total_size) : "-"}
             </div>
             <p className="text-xs text-muted-foreground">
               Repository storage used
@@ -297,20 +301,6 @@ export default function Snapshots() {
             <div className="text-2xl font-bold text-primary">{snapshots.length}</div>
             <p className="text-xs text-muted-foreground">
               Available restore points
-            </p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium">Total Files</CardTitle>
-            <FileText className="h-4 w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">
-              {stats ? stats.total_file_count.toLocaleString() : "-"}
-            </div>
-            <p className="text-xs text-muted-foreground">
-              Files backed up
             </p>
           </CardContent>
         </Card>
@@ -434,23 +424,9 @@ export default function Snapshots() {
 
       <Alert>
         <Info className="h-4 w-4" />
-        <AlertTitle>Restore Instructions</AlertTitle>
+        <AlertTitle>Restoring Files</AlertTitle>
         <AlertDescription className="mt-2">
-          <p className="mb-2">
-            To restore files from a snapshot, SSH to the remote server and run:
-          </p>
-          <pre className="bg-muted p-3 rounded-md text-sm overflow-x-auto font-mono">
-            {`export RESTIC_REPOSITORY="s3:https://${job.s3_endpoint}/${job.s3_bucket}/${job.backup_prefix}"
-export RESTIC_PASSWORD="your-password"
-export AWS_ACCESS_KEY_ID="your-access-key"
-export AWS_SECRET_ACCESS_KEY="your-secret-key"
-
-# List snapshots
-restic snapshots
-
-# Restore a specific snapshot
-restic restore SNAPSHOT_ID --target /restore/path`}
-          </pre>
+          Click the <RotateCcw className="inline h-3 w-3 mx-1" /> Restore button on any snapshot to restore it back to the remote server via SSH.
         </AlertDescription>
       </Alert>
 

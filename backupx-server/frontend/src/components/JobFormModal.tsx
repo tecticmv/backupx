@@ -30,12 +30,17 @@ import {
   Save,
   Server as ServerIcon,
   FolderSync,
+  FolderOpen,
   CloudCog,
   CalendarClock,
   Shield,
   Settings,
   Database,
+  Eye,
+  EyeOff,
+  Copy,
 } from "lucide-react";
+import DirectoryBrowser from "@/components/DirectoryBrowser";
 
 const defaultFormData: JobFormData = {
   job_id: "",
@@ -78,12 +83,16 @@ export default function JobFormModal({
   const [dbConfigs, setDbConfigs] = useState<DatabaseConfig[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [browseOpen, setBrowseOpen] = useState(false);
+  const [revealedPassword, setRevealedPassword] = useState<string | null>(null);
+  const [isRevealing, setIsRevealing] = useState(false);
 
   useEffect(() => {
     if (open) {
       fetchS3Configs();
       fetchServers();
       fetchDbConfigs();
+      setRevealedPassword(null);
       if (jobId) {
         fetchJob();
       } else {
@@ -173,6 +182,41 @@ export default function JobFormModal({
       ...prev,
       [name]: type === "number" ? parseInt(value) || 0 : value,
     }));
+  };
+
+  const handleRevealPassword = async () => {
+    if (!jobId) return;
+    if (revealedPassword !== null) {
+      setRevealedPassword(null);
+      return;
+    }
+    setIsRevealing(true);
+    try {
+      const response = await fetch(`/api/jobs/${jobId}/reveal-password`, {
+        method: "POST",
+      });
+      if (response.ok) {
+        const data = await response.json();
+        setRevealedPassword(data.restic_password);
+      } else {
+        const data = await response.json();
+        toast.error(data.error || "Failed to reveal password");
+      }
+    } catch {
+      toast.error("Failed to reveal password");
+    } finally {
+      setIsRevealing(false);
+    }
+  };
+
+  const handleCopyPassword = async () => {
+    if (!revealedPassword) return;
+    try {
+      await navigator.clipboard.writeText(revealedPassword);
+      toast.success("Password copied to clipboard");
+    } catch {
+      toast.error("Failed to copy");
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -382,7 +426,19 @@ export default function JobFormModal({
                     </div>
                     <div className="grid gap-4 md:grid-cols-2">
                       <div className="space-y-2">
-                        <Label htmlFor="directories">Directories to Backup</Label>
+                        <div className="flex items-center justify-between">
+                          <Label htmlFor="directories">Directories to Backup</Label>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setBrowseOpen(true)}
+                            disabled={!formData.server_id}
+                          >
+                            <FolderOpen className="h-4 w-4 mr-1" />
+                            Browse
+                          </Button>
+                        </div>
                         <Textarea
                           id="directories"
                           name="directories"
@@ -395,6 +451,20 @@ export default function JobFormModal({
                         <p className="text-xs text-muted-foreground">
                           One directory per line
                         </p>
+                        {formData.backup_type === "filesystem" && (
+                          <DirectoryBrowser
+                            serverId={formData.server_id}
+                            open={browseOpen}
+                            onOpenChange={setBrowseOpen}
+                            selectedPaths={formData.directories.split("\n").filter(Boolean)}
+                            onSelect={(paths) => {
+                              setFormData((prev) => ({
+                                ...prev,
+                                directories: paths.join("\n"),
+                              }));
+                            }}
+                          />
+                        )}
                       </div>
                       <div className="space-y-2">
                         <Label htmlFor="excludes">Exclude Patterns</Label>
@@ -537,14 +607,35 @@ export default function JobFormModal({
                         </p>
                       </div>
                       <div className="space-y-2">
-                        <Label htmlFor="restic_password">
-                          Restic Password{" "}
+                        <div className="flex items-center justify-between">
+                          <Label htmlFor="restic_password">
+                            Restic Password{" "}
+                            {isEditing && (
+                              <span className="text-muted-foreground text-xs">
+                                (blank to keep current)
+                              </span>
+                            )}
+                          </Label>
                           {isEditing && (
-                            <span className="text-muted-foreground">
-                              (leave blank to keep current)
-                            </span>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="h-6 text-xs gap-1"
+                              onClick={handleRevealPassword}
+                              disabled={isRevealing}
+                            >
+                              {isRevealing ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : revealedPassword !== null ? (
+                                <EyeOff className="h-3 w-3" />
+                              ) : (
+                                <Eye className="h-3 w-3" />
+                              )}
+                              {revealedPassword !== null ? "Hide" : "Reveal"}
+                            </Button>
                           )}
-                        </Label>
+                        </div>
                         <Input
                           id="restic_password"
                           name="restic_password"
@@ -552,7 +643,30 @@ export default function JobFormModal({
                           value={formData.restic_password}
                           onChange={handleChange}
                           required={!isEditing}
+                          placeholder={isEditing ? "•••••••••••" : ""}
                         />
+                        {revealedPassword !== null && (
+                          <div className="rounded-md border border-amber-500/50 bg-amber-500/10 p-2 space-y-1">
+                            <div className="flex items-center justify-between gap-2">
+                              <code className="text-xs font-mono break-all flex-1 select-all">
+                                {revealedPassword}
+                              </code>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="h-6 w-6 p-0 shrink-0"
+                                onClick={handleCopyPassword}
+                                title="Copy to clipboard"
+                              >
+                                <Copy className="h-3 w-3" />
+                              </Button>
+                            </div>
+                            <p className="text-[10px] text-amber-700 dark:text-amber-400">
+                              Store this securely. This action is audit-logged.
+                            </p>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>

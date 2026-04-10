@@ -33,7 +33,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { toast } from "sonner";
-import type { Server, ServerFormData } from "@/types/server";
+import { Textarea } from "@/components/ui/textarea";
+import type { Server, ServerFormData, SshAuthType } from "@/types/server";
 import {
   Plus,
   Pencil,
@@ -43,6 +44,10 @@ import {
   Server as ServerIcon,
   Monitor,
   Key,
+  KeyRound,
+  Lock,
+  FileKey,
+  Upload,
   CheckCircle2,
   XCircle,
   RefreshCw,
@@ -59,6 +64,9 @@ const initialServerFormData: ServerFormData = {
   ssh_port: 22,
   ssh_user: "root",
   ssh_key: "/home/backupx/.ssh/id_rsa",
+  ssh_auth_type: "key_path",
+  ssh_password: "",
+  ssh_key_content: "",
   status: "active",
 };
 
@@ -199,6 +207,9 @@ export default function Servers() {
       ssh_port: server.ssh_port || 22,
       ssh_user: server.ssh_user || 'root',
       ssh_key: server.ssh_key || '/home/backupx/.ssh/id_rsa',
+      ssh_auth_type: server.ssh_auth_type || 'key_path',
+      ssh_password: '',
+      ssh_key_content: '',
       status: server.status || 'active',
     });
     setIsDialogOpen(true);
@@ -407,7 +418,11 @@ export default function Servers() {
                     </TableCell>
                     <TableCell className="text-muted-foreground">
                       <div className="flex items-center gap-1">
-                        <Key className="h-3 w-3" />
+                        {server.ssh_auth_type === 'password' ? (
+                          <Lock className="h-3 w-3" />
+                        ) : (
+                          <Key className="h-3 w-3" />
+                        )}
                         {server.ssh_user}@:{server.ssh_port}
                       </div>
                     </TableCell>
@@ -466,9 +481,9 @@ export default function Servers() {
 
       {/* Server Dialog */}
       <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-        <DialogContent className="sm:max-w-[500px]">
-          <form onSubmit={handleSubmit}>
-            <DialogHeader>
+        <DialogContent className="sm:max-w-[500px] max-h-[90vh] flex flex-col p-0 overflow-hidden">
+          <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1 overflow-hidden">
+            <DialogHeader className="px-6 pt-6 pb-4 shrink-0">
               <DialogTitle>
                 {editingServer ? "Edit Server" : "Add Server"}
               </DialogTitle>
@@ -476,7 +491,7 @@ export default function Servers() {
                 Configure a remote server for backups via SSH. Restic will be installed automatically.
               </DialogDescription>
             </DialogHeader>
-            <div className="grid gap-4 py-4">
+            <div className="grid gap-4 py-4 px-6 overflow-y-auto flex-1 min-h-0">
               <div className="grid gap-2">
                 <Label htmlFor="name">Name</Label>
                 <Input
@@ -526,19 +541,139 @@ export default function Servers() {
                 </div>
               </div>
               <div className="grid gap-2">
-                <Label htmlFor="ssh_key">SSH Key Path</Label>
-                <Input
-                  id="ssh_key"
-                  name="ssh_key"
-                  placeholder="/home/backupx/.ssh/id_rsa"
-                  value={formData.ssh_key}
-                  onChange={handleInputChange}
-                  required
-                />
-                <p className="text-xs text-muted-foreground">
-                  Path to the SSH private key on the BackupX server
-                </p>
+                <Label>Authentication Method</Label>
+                <Select
+                  value={formData.ssh_auth_type}
+                  onValueChange={(value: SshAuthType) =>
+                    setFormData((prev) => ({ ...prev, ssh_auth_type: value }))
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="key_path">
+                      <div className="flex items-center gap-2">
+                        <KeyRound className="h-4 w-4" />
+                        Key File Path
+                      </div>
+                    </SelectItem>
+                    <SelectItem value="key_content">
+                      <div className="flex items-center gap-2">
+                        <FileKey className="h-4 w-4" />
+                        Paste / Upload Key
+                      </div>
+                    </SelectItem>
+                    <SelectItem value="password">
+                      <div className="flex items-center gap-2">
+                        <Lock className="h-4 w-4" />
+                        Password
+                      </div>
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
+
+              {formData.ssh_auth_type === "key_path" && (
+                <div className="grid gap-2">
+                  <Label htmlFor="ssh_key">SSH Key Path</Label>
+                  <Input
+                    id="ssh_key"
+                    name="ssh_key"
+                    placeholder="/home/backupx/.ssh/id_rsa"
+                    value={formData.ssh_key}
+                    onChange={handleInputChange}
+                    required
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Path to the SSH private key inside the container
+                  </p>
+                </div>
+              )}
+
+              {formData.ssh_auth_type === "key_content" && (
+                <div className="grid gap-2">
+                  <div className="flex items-center justify-between">
+                    <Label htmlFor="ssh_key_content">SSH Private Key</Label>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-xs gap-1"
+                      onClick={() => {
+                        const input = document.createElement('input');
+                        input.type = 'file';
+                        input.accept = '.pem,.key,*';
+                        input.onchange = (e) => {
+                          const file = (e.target as HTMLInputElement).files?.[0];
+                          if (file) {
+                            const reader = new FileReader();
+                            reader.onload = (ev) => {
+                              setFormData((prev) => ({
+                                ...prev,
+                                ssh_key_content: ev.target?.result as string || '',
+                              }));
+                            };
+                            reader.readAsText(file);
+                          }
+                        };
+                        input.click();
+                      }}
+                    >
+                      <Upload className="h-3 w-3" />
+                      Upload file
+                    </Button>
+                  </div>
+                  <Textarea
+                    id="ssh_key_content"
+                    name="ssh_key_content"
+                    value={formData.ssh_key_content}
+                    onChange={(e) =>
+                      setFormData((prev) => ({ ...prev, ssh_key_content: e.target.value }))
+                    }
+                    placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
+                    rows={5}
+                    className="font-mono text-xs"
+                    required
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const file = e.dataTransfer.files[0];
+                      if (file) {
+                        const reader = new FileReader();
+                        reader.onload = (ev) => {
+                          setFormData((prev) => ({
+                            ...prev,
+                            ssh_key_content: ev.target?.result as string || '',
+                          }));
+                        };
+                        reader.readAsText(file);
+                      }
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Paste your private key, upload a file, or drag &amp; drop. Stored encrypted.
+                  </p>
+                </div>
+              )}
+
+              {formData.ssh_auth_type === "password" && (
+                <div className="grid gap-2">
+                  <Label htmlFor="ssh_password">SSH Password</Label>
+                  <Input
+                    id="ssh_password"
+                    name="ssh_password"
+                    type="password"
+                    value={formData.ssh_password}
+                    onChange={handleInputChange}
+                    placeholder={editingServer ? "(leave blank to keep current)" : "Enter SSH password"}
+                    required={!editingServer}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Stored encrypted. Key-based auth is recommended for production.
+                  </p>
+                </div>
+              )}
 
               <div className="grid gap-2">
                 <Label htmlFor="status">Status</Label>
@@ -561,7 +696,7 @@ export default function Servers() {
                 </p>
               </div>
             </div>
-            <DialogFooter className="gap-2">
+            <DialogFooter className="gap-2 px-6 py-4 border-t shrink-0">
               <Button
                 type="button"
                 variant="outline"

@@ -1,0 +1,13 @@
+# Override for Linux deployments with LAN access
+# Usage: docker compose -f docker-compose.yml -f docker-compose.host.yml up -d
+services:
+  backup-ui:
+    network_mode: host
+    ports: []
+    environment:
+      - DATABASE_HOST=127.0.0.1
+      - DATABASE_PORT=5433
+
+  postgres:
+    ports:
+      - "5433:5432"
