@@ -1509,6 +1509,8 @@ def _build_ssh_cmd(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_r
         '-o', 'StrictHostKeyChecking=accept-new',
         '-o', 'BatchMode=yes',
         '-o', f'ConnectTimeout={timeout}',
+        '-o', 'ServerAliveInterval=60',
+        '-o', 'ServerAliveCountMax=5',
         f'{ssh_user}@{host}'
     ]
 
@@ -1622,6 +1624,8 @@ def run_filesystem_backup(job_id, job):
             '-o', 'StrictHostKeyChecking=accept-new',
             '-o', 'BatchMode=yes',
             '-o', 'ConnectTimeout=30',
+            '-o', 'ServerAliveInterval=60',
+            '-o', 'ServerAliveCountMax=5',
             job['remote_host']
         ]
 
@@ -1706,6 +1710,8 @@ def run_database_backup(job_id, job):
             '-o', 'StrictHostKeyChecking=accept-new',
             '-o', 'BatchMode=yes',
             '-o', 'ConnectTimeout=30',
+            '-o', 'ServerAliveInterval=60',
+            '-o', 'ServerAliveCountMax=5',
             job['remote_host']
         ]
 
