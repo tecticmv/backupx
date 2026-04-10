@@ -450,12 +450,9 @@ def init_db():
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             host TEXT NOT NULL,
-            connection_type TEXT DEFAULT 'ssh',
             ssh_port INTEGER DEFAULT 22,
             ssh_user TEXT,
             ssh_key TEXT DEFAULT '/home/backupx/.ssh/id_rsa',
-            agent_port INTEGER DEFAULT 8090,
-            agent_api_key TEXT,
             status TEXT DEFAULT 'active',
             created_at TEXT NOT NULL,
             updated_at TEXT
@@ -604,16 +601,6 @@ def init_db():
         cursor = conn.execute("PRAGMA table_info(servers)")
         columns = [col[1] for col in cursor.fetchall()]
 
-        if 'connection_type' not in columns:
-            conn.execute("ALTER TABLE servers ADD COLUMN connection_type TEXT DEFAULT 'ssh'")
-            logger.info("Added connection_type column to servers table")
-        if 'agent_port' not in columns:
-            conn.execute("ALTER TABLE servers ADD COLUMN agent_port INTEGER DEFAULT 8090")
-            logger.info("Added agent_port column to servers table")
-        if 'agent_api_key' not in columns:
-            conn.execute("ALTER TABLE servers ADD COLUMN agent_api_key TEXT")
-            logger.info("Added agent_api_key column to servers table")
-
         # Check and add status column to db_configs
         cursor = conn.execute("PRAGMA table_info(db_configs)")
         db_columns = [col[1] for col in cursor.fetchall()]
@@ -681,11 +668,10 @@ def migrate_json_to_sqlite():
                 servers = json.load(f)
             for s in servers:
                 conn.execute('''
-                    INSERT INTO servers (id, name, host, connection_type, ssh_port, ssh_user, ssh_key, agent_port, agent_api_key, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (s['id'], s['name'], s['host'], s.get('connection_type', 'ssh'),
+                    INSERT INTO servers (id, name, host, ssh_port, ssh_user, ssh_key, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (s['id'], s['name'], s['host'],
                       s.get('ssh_port', 22), s.get('ssh_user'), s.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
-                      s.get('agent_port', 8090), s.get('agent_api_key'),
                       s.get('created_at', utc_isoformat()), s.get('updated_at')))
             logger.info(f"  Migrated {len(servers)} servers")
         except Exception as e:
@@ -1011,9 +997,7 @@ def delete_s3_config(config_id):
 # --- Servers ---
 
 def _decrypt_server(server):
-    """Decrypt sensitive fields in server config"""
-    if server:
-        server['agent_api_key'] = decrypt_credential(server.get('agent_api_key', '') or '')
+    """Return server config (no sensitive fields to decrypt for SSH-only)"""
     return server
 
 
@@ -1037,11 +1021,10 @@ def create_server(server):
     """Create a new server"""
     conn = get_db_connection()
     conn.execute('''
-        INSERT INTO servers (id, name, host, connection_type, ssh_port, ssh_user, ssh_key, agent_port, agent_api_key, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (server['id'], server['name'], server['host'], server.get('connection_type', 'ssh'),
+        INSERT INTO servers (id, name, host, ssh_port, ssh_user, ssh_key, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (server['id'], server['name'], server['host'],
           server.get('ssh_port', 22), server.get('ssh_user'), server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
-          server.get('agent_port', 8090), encrypt_credential(server.get('agent_api_key', '') or ''),
           server.get('status', 'active'), server.get('created_at', utc_isoformat()), server.get('updated_at')))
     conn.commit()
     conn.close()
@@ -1051,11 +1034,10 @@ def update_server_in_db(server_id, server):
     """Update a server"""
     conn = get_db_connection()
     conn.execute('''
-        UPDATE servers SET name=?, host=?, connection_type=?, ssh_port=?, ssh_user=?, ssh_key=?, agent_port=?, agent_api_key=?, status=?, updated_at=?
+        UPDATE servers SET name=?, host=?, ssh_port=?, ssh_user=?, ssh_key=?, status=?, updated_at=?
         WHERE id=?
-    ''', (server['name'], server['host'], server.get('connection_type', 'ssh'),
+    ''', (server['name'], server['host'],
           server.get('ssh_port', 22), server.get('ssh_user'), server.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
-          server.get('agent_port', 8090), encrypt_credential(server.get('agent_api_key', '') or ''),
           server.get('status', 'active'), utc_isoformat(), server_id))
     conn.commit()
     conn.close()
@@ -1481,40 +1463,30 @@ def run_backup(job_id):
         if s3_config:
             job['skip_ssl_verify'] = s3_config.get('skip_ssl_verify', False)
 
-    # Get server to determine connection type
     server_id = job.get('server_id')
     server = get_server(server_id) if server_id else None
 
     backup_type = job.get('backup_type', 'filesystem')
-    connection_type = server.get('connection_type', 'ssh') if server else 'ssh'
 
-    if connection_type == 'agent' and server:
-        # Use agent-based backup
-        if backup_type == 'database':
-            return run_agent_database_backup(job_id, job, server)
-        else:
-            return run_agent_filesystem_backup(job_id, job, server)
+    # Ensure restic is installed on the remote server before running backup
+    if server and server.get('ssh_user') and server.get('host'):
+        success, msg = ensure_restic_installed(
+            server['host'], server['ssh_user'],
+            int(server.get('ssh_port') or 22),
+            server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
+        )
+        if not success:
+            error_msg = f"Restic not available on remote server: {msg}"
+            update_job_status(job_id, 'error')
+            add_history(job_id, job['name'], 'error', error_msg, 0)
+            send_notification(job_id, job['name'], 'error', error_msg, 0)
+            logger.error(f"Backup aborted - {error_msg}")
+            return False, error_msg
+
+    if backup_type == 'database':
+        return run_database_backup(job_id, job)
     else:
-        # Ensure restic is installed on the remote server before running backup
-        if server and server.get('ssh_user') and server.get('host'):
-            success, msg = ensure_restic_installed(
-                server['host'], server['ssh_user'],
-                int(server.get('ssh_port') or 22),
-                server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
-            )
-            if not success:
-                error_msg = f"Restic not available on remote server: {msg}"
-                update_job_status(job_id, 'error')
-                add_history(job_id, job['name'], 'error', error_msg, 0)
-                send_notification(job_id, job['name'], 'error', error_msg, 0)
-                logger.error(f"Backup aborted - {error_msg}")
-                return False, error_msg
-
-        # Use SSH-based backup
-        if backup_type == 'database':
-            return run_database_backup(job_id, job)
-        else:
-            return run_filesystem_backup(job_id, job)
+        return run_filesystem_backup(job_id, job)
 
 
 def sanitize_error_message(error: str, max_length: int = 500) -> str:
@@ -1834,187 +1806,6 @@ exit $RESTIC_EXIT
         return False, error_msg
 
 
-def run_agent_filesystem_backup(job_id, job, server):
-    """Execute a filesystem backup job via agent"""
-    start_time = utc_now()
-    logger.info(f"Starting agent-based filesystem backup job: {job_id} ({job['name']})")
-
-    # Update job status
-    update_job_status(job_id, 'running', last_run=start_time.isoformat())
-    update_job_progress(job_id, 0, 'Initializing agent backup...')
-
-    try:
-        update_job_progress(job_id, 10, 'Preparing backup request...')
-        agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/backup/filesystem"
-
-        # Prepare request payload
-        payload = {
-            's3_endpoint': job['s3_endpoint'],
-            's3_bucket': job['s3_bucket'],
-            's3_access_key': job['s3_access_key'],
-            's3_secret_key': job['s3_secret_key'],
-            'restic_password': job['restic_password'],
-            'backup_prefix': job.get('backup_prefix', job_id),
-            'directories': job.get('directories', []),
-            'excludes': job.get('excludes', []),
-            'skip_ssl_verify': job.get('skip_ssl_verify', False)
-        }
-
-        # Log payload details (without secrets) for debugging
-        logger.debug(f"Agent backup payload: directories={payload['directories']}, "
-                    f"s3_endpoint={payload['s3_endpoint']}, s3_bucket={payload['s3_bucket']}, "
-                    f"backup_prefix={payload['backup_prefix']}, skip_ssl_verify={payload['skip_ssl_verify']}")
-
-        data = json.dumps(payload).encode('utf-8')
-        req = Request(agent_url, data=data, method='POST')
-        req.add_header('Content-Type', 'application/json')
-        req.add_header('X-API-Key', server['agent_api_key'])
-
-        # Make request with timeout
-        update_job_progress(job_id, 20, 'Connecting to agent...')
-        update_job_progress(job_id, 30, 'Running backup via agent...')
-        timeout = job.get('timeout', 7200)
-        with urlopen(req, timeout=timeout) as response:
-            result = json.loads(response.read().decode('utf-8'))
-
-        update_job_progress(job_id, 90, 'Finalizing backup...')
-        duration = (utc_now() - start_time).total_seconds()
-
-        if result.get('success'):
-            update_job_progress(job_id, 100, 'Backup completed successfully')
-            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
-            add_history(job_id, job['name'], 'success', 'Backup completed successfully via agent', duration)
-            send_notification(job_id, job['name'], 'success', 'Backup completed successfully via agent', duration)
-            logger.info(f"Agent filesystem backup completed successfully: {job_id} (duration: {duration:.1f}s)")
-            return True, "Backup completed successfully"
-        else:
-            error_msg = sanitize_error_message(result.get('error', 'Unknown error'))
-            update_job_status(job_id, 'failed')
-            add_history(job_id, job['name'], 'failed', error_msg, duration)
-            send_notification(job_id, job['name'], 'failed', error_msg, duration)
-            logger.error(f"Agent filesystem backup failed: {job_id} - {error_msg[:200]}")
-            return False, error_msg
-
-    except (URLError, HTTPError) as e:
-        duration = (utc_now() - start_time).total_seconds()
-        if hasattr(e, 'code') and e.code == 401:
-            error_msg = "Agent authentication failed - check API key"
-        elif hasattr(e, 'code') and hasattr(e, 'read'):
-            # Read the error response from agent
-            try:
-                error_response = json.loads(e.read().decode('utf-8'))
-                error_msg = error_response.get('error', str(e))
-            except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
-                error_msg = sanitize_error_message(str(e))
-        else:
-            error_msg = sanitize_error_message(str(e))
-        update_job_status(job_id, 'error')
-        add_history(job_id, job['name'], 'error', error_msg, duration)
-        send_notification(job_id, job['name'], 'error', error_msg, duration)
-        logger.error(f"Agent filesystem backup error: {job_id} - {error_msg}")
-        return False, error_msg
-    except Exception as e:
-        duration = (utc_now() - start_time).total_seconds()
-        error_msg = sanitize_error_message(str(e))
-        update_job_status(job_id, 'error')
-        add_history(job_id, job['name'], 'error', error_msg, duration)
-        send_notification(job_id, job['name'], 'error', error_msg, duration)
-        logger.exception(f"Agent filesystem backup error: {job_id}")
-        return False, error_msg
-
-
-def run_agent_database_backup(job_id, job, server):
-    """Execute a MySQL database backup job via agent"""
-    start_time = utc_now()
-    logger.info(f"Starting agent-based database backup job: {job_id} ({job['name']})")
-
-    # Update job status
-    update_job_status(job_id, 'running', last_run=start_time.isoformat())
-    update_job_progress(job_id, 0, 'Initializing database backup...')
-
-    try:
-        # Get database config
-        update_job_progress(job_id, 10, 'Loading database configuration...')
-        db_config_id = job.get('database_config_id')
-        if not db_config_id:
-            raise Exception("Database configuration not specified")
-
-        db_config = get_db_config(db_config_id)
-        if not db_config:
-            raise Exception("Database configuration not found")
-
-        agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/backup/database"
-
-        # Prepare request payload
-        payload = {
-            's3_endpoint': job['s3_endpoint'],
-            's3_bucket': job['s3_bucket'],
-            's3_access_key': job['s3_access_key'],
-            's3_secret_key': job['s3_secret_key'],
-            'restic_password': job['restic_password'],
-            'backup_prefix': job.get('backup_prefix', job_id),
-            'db_type': db_config.get('type', 'mysql'),
-            'db_host': db_config['host'],
-            'db_port': db_config.get('port', 3306),
-            'db_user': db_config['username'],
-            'db_password': db_config['password'],
-            'databases': db_config.get('databases', '*'),
-            'skip_ssl_verify': job.get('skip_ssl_verify', False)
-        }
-
-        data = json.dumps(payload).encode('utf-8')
-        req = Request(agent_url, data=data, method='POST')
-        req.add_header('Content-Type', 'application/json')
-        req.add_header('X-API-Key', server['agent_api_key'])
-
-        # Make request with timeout
-        update_job_progress(job_id, 20, 'Connecting to agent...')
-        update_job_progress(job_id, 30, 'Dumping database via agent...')
-        timeout = job.get('timeout', 7200)
-        with urlopen(req, timeout=timeout) as response:
-            result = json.loads(response.read().decode('utf-8'))
-
-        update_job_progress(job_id, 90, 'Finalizing backup...')
-        duration = (utc_now() - start_time).total_seconds()
-
-        if result.get('success'):
-            update_job_progress(job_id, 100, 'Database backup completed successfully')
-            databases = db_config.get('databases', '*')
-            message = f'MySQL backup completed successfully via agent ({databases})'
-            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
-            add_history(job_id, job['name'], 'success', message, duration)
-            send_notification(job_id, job['name'], 'success', message, duration)
-            logger.info(f"Agent database backup completed successfully: {job_id} (duration: {duration:.1f}s)")
-            return True, "Database backup completed successfully"
-        else:
-            error_msg = sanitize_error_message(result.get('error', 'Unknown error'))
-            update_job_status(job_id, 'failed')
-            add_history(job_id, job['name'], 'failed', error_msg, duration)
-            send_notification(job_id, job['name'], 'failed', error_msg, duration)
-            logger.error(f"Agent database backup failed: {job_id} - {error_msg[:200]}")
-            return False, error_msg
-
-    except (URLError, HTTPError) as e:
-        duration = (utc_now() - start_time).total_seconds()
-        if hasattr(e, 'code') and e.code == 401:
-            error_msg = "Agent authentication failed - check API key"
-        else:
-            error_msg = sanitize_error_message(str(e))
-        update_job_status(job_id, 'error')
-        add_history(job_id, job['name'], 'error', error_msg, duration)
-        send_notification(job_id, job['name'], 'error', error_msg, duration)
-        logger.error(f"Agent database backup error: {job_id} - {error_msg}")
-        return False, error_msg
-    except Exception as e:
-        duration = (utc_now() - start_time).total_seconds()
-        error_msg = sanitize_error_message(str(e))
-        update_job_status(job_id, 'error')
-        add_history(job_id, job['name'], 'error', error_msg, duration)
-        send_notification(job_id, job['name'], 'error', error_msg, duration)
-        logger.exception(f"Agent database backup error: {job_id}")
-        return False, error_msg
-
-
 def get_snapshots(job, server=None):
     """Get list of snapshots for a job"""
     # Get skip_ssl_verify from S3 config
@@ -2025,40 +1816,7 @@ def get_snapshots(job, server=None):
         if s3_config:
             skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
 
-    # If using agent, call agent's /snapshots endpoint
-    if server and server.get('connection_type') == 'agent':
-        try:
-            agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/snapshots"
-
-            payload = {
-                's3_endpoint': job['s3_endpoint'],
-                's3_bucket': job['s3_bucket'],
-                's3_access_key': job['s3_access_key'],
-                's3_secret_key': job['s3_secret_key'],
-                'restic_password': job['restic_password'],
-                'backup_prefix': job.get('backup_prefix', job.get('id', '')),
-                'skip_ssl_verify': skip_ssl_verify
-            }
-
-            data = json.dumps(payload).encode('utf-8')
-            req = Request(agent_url, data=data, method='POST')
-            req.add_header('Content-Type', 'application/json')
-            req.add_header('X-API-Key', server['agent_api_key'])
-
-            with urlopen(req, timeout=60) as response:
-                result = json.loads(response.read().decode('utf-8'))
-
-            if result.get('success'):
-                snapshots = result.get('snapshots', [])
-                # Sort by time, newest first
-                snapshots.sort(key=lambda x: x.get('time', ''), reverse=True)
-                return snapshots
-            return []
-        except Exception as e:
-            logger.error(f"Failed to get snapshots via agent: {e}")
-            return []
-
-    # Local restic command
+    # Run restic command to list snapshots
     try:
         env = os.environ.copy()
         env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
@@ -2099,37 +1857,7 @@ def get_repo_stats(job, server=None):
         if s3_config:
             skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
 
-    # If using agent, call agent's /stats endpoint
-    if server and server.get('connection_type') == 'agent':
-        try:
-            agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/stats"
-
-            payload = {
-                's3_endpoint': job['s3_endpoint'],
-                's3_bucket': job['s3_bucket'],
-                's3_access_key': job['s3_access_key'],
-                's3_secret_key': job['s3_secret_key'],
-                'restic_password': job['restic_password'],
-                'backup_prefix': job.get('backup_prefix', job.get('id', '')),
-                'skip_ssl_verify': skip_ssl_verify
-            }
-
-            data = json.dumps(payload).encode('utf-8')
-            req = Request(agent_url, data=data, method='POST')
-            req.add_header('Content-Type', 'application/json')
-            req.add_header('X-API-Key', server['agent_api_key'])
-
-            with urlopen(req, timeout=120) as response:
-                result = json.loads(response.read().decode('utf-8'))
-
-            if result.get('success'):
-                return result.get('stats')
-            return None
-        except Exception as e:
-            logger.error(f"Failed to get stats via agent: {e}")
-            return None
-
-    # Local restic command
+    # Run restic command to get stats
     try:
         env = os.environ.copy()
         env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
@@ -2625,76 +2353,30 @@ def api_init_job_repo(job_id):
         if s3_config:
             job['skip_ssl_verify'] = s3_config.get('skip_ssl_verify', False)
 
-    # Get server to determine connection type
-    server_id = job.get('server_id')
-    server = get_server(server_id) if server_id else None
+    try:
+        env = os.environ.copy()
+        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
+        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
+        env['RESTIC_PASSWORD'] = job['restic_password']
+        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job.get('backup_prefix', job_id)}"
 
-    if server and server.get('connection_type') == 'agent':
-        # Use agent to initialize
-        try:
-            agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/init"
+        cmd = ['restic', 'init']
+        if job.get('skip_ssl_verify'):
+            cmd.append('--insecure-tls')
 
-            payload = {
-                's3_endpoint': job['s3_endpoint'],
-                's3_bucket': job['s3_bucket'],
-                's3_access_key': job['s3_access_key'],
-                's3_secret_key': job['s3_secret_key'],
-                'restic_password': job['restic_password'],
-                'backup_prefix': job.get('backup_prefix', job_id),
-                'skip_ssl_verify': job.get('skip_ssl_verify', False)
-            }
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
 
-            data = json.dumps(payload).encode('utf-8')
-            req = Request(agent_url, data=data, method='POST')
-            req.add_header('Content-Type', 'application/json')
-            req.add_header('X-API-Key', server['agent_api_key'])
+        if result.returncode == 0:
+            return jsonify({'success': True, 'message': 'Repository initialized'})
+        elif 'already initialized' in result.stderr.lower() or 'already exists' in result.stderr.lower():
+            return jsonify({'success': True, 'message': 'Repository already initialized'})
+        else:
+            return jsonify({'success': False, 'error': result.stderr or 'Failed to initialize repository'}), 400
 
-            with urlopen(req, timeout=60) as response:
-                result = json.loads(response.read().decode('utf-8'))
-
-            if result.get('success'):
-                return jsonify({'success': True, 'message': result.get('message', 'Repository initialized')})
-            else:
-                return jsonify({'success': False, 'error': result.get('error', 'Failed to initialize repository')}), 400
-
-        except (URLError, HTTPError) as e:
-            if hasattr(e, 'code') and hasattr(e, 'read'):
-                try:
-                    error_response = json.loads(e.read().decode('utf-8'))
-                    error_msg = error_response.get('error', str(e))
-                except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
-                    error_msg = str(e)
-            else:
-                error_msg = str(e)
-            return jsonify({'success': False, 'error': error_msg}), 400
-        except Exception as e:
-            return jsonify({'success': False, 'error': str(e)}), 500
-    else:
-        # SSH-based init
-        try:
-            env = os.environ.copy()
-            env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
-            env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
-            env['RESTIC_PASSWORD'] = job['restic_password']
-            env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job.get('backup_prefix', job_id)}"
-
-            cmd = ['restic', 'init']
-            if job.get('skip_ssl_verify'):
-                cmd.append('--insecure-tls')
-
-            result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
-
-            if result.returncode == 0:
-                return jsonify({'success': True, 'message': 'Repository initialized'})
-            elif 'already initialized' in result.stderr.lower() or 'already exists' in result.stderr.lower():
-                return jsonify({'success': True, 'message': 'Repository already initialized'})
-            else:
-                return jsonify({'success': False, 'error': result.stderr or 'Failed to initialize repository'}), 400
-
-        except subprocess.TimeoutExpired:
-            return jsonify({'success': False, 'error': 'Initialization timed out'}), 400
-        except Exception as e:
-            return jsonify({'success': False, 'error': str(e)}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'Initialization timed out'}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/api/jobs/<job_id>/snapshots')
@@ -2705,7 +2387,7 @@ def api_job_snapshots(job_id):
     if not job:
         return jsonify({'error': 'Job not found'}), 404
 
-    # Get server for agent-based jobs
+    # Get server details
     server_id = job.get('server_id')
     server = get_server(server_id) if server_id else None
 
@@ -2974,74 +2656,32 @@ export RESTIC_REPOSITORY='{repo}'
 """
         full_cmd = env_exports + restic_cmd
 
-        # Check if this is an agent-based server
-        if server.get('agent_url'):
-            # Use agent to run the restore
-            agent_url = server['agent_url'].rstrip('/')
-            try:
-                agent_response = requests.post(
-                    f"{agent_url}/execute",
-                    json={'command': full_cmd},
-                    timeout=600,
-                    verify=not server.get('skip_ssl_verify', False)
-                )
-                if agent_response.status_code == 200:
-                    result = agent_response.json()
-                    if result.get('exit_code', 1) != 0:
-                        return jsonify({'error': result.get('stderr', 'Restore failed')}), 400
-                    return jsonify({
-                        'success': True,
-                        'message': f"Restored {source_path} to {target_path}",
-                        'output': result.get('stdout', '')
-                    })
-                else:
-                    return jsonify({'error': 'Agent request failed'}), 400
-            except requests.exceptions.RequestException as e:
-                return jsonify({'error': f'Agent connection failed: {str(e)}'}), 400
-        else:
-            # Use SSH to run the restore
-            ssh_host = server.get('host')
-            ssh_port = server.get('ssh_port') or 22
-            ssh_key = server.get('ssh_key')
+        # Use SSH to run the restore
+        ssh_host = server.get('host')
+        ssh_port = server.get('ssh_port') or 22
+        ssh_user = server.get('ssh_user', 'root')
+        ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
 
-            if not ssh_host or not ssh_key:
-                return jsonify({'error': 'Server SSH configuration incomplete'}), 400
+        if not ssh_host:
+            return jsonify({'error': 'Server SSH configuration incomplete'}), 400
 
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.key', delete=False) as key_file:
-                key_file.write(ssh_key)
-                key_file_path = key_file.name
+        ssh_cmd = _build_ssh_cmd(ssh_host, ssh_user, ssh_port, ssh_key)
 
-            try:
-                os.chmod(key_file_path, 0o600)
+        result = subprocess.run(
+            ssh_cmd + [full_cmd],
+            capture_output=True,
+            text=True,
+            timeout=600
+        )
 
-                ssh_cmd = [
-                    'ssh', '-o', 'StrictHostKeyChecking=no',
-                    '-o', 'BatchMode=yes',
-                    '-i', key_file_path,
-                    '-p', str(ssh_port),
-                    f'root@{ssh_host}',
-                    full_cmd
-                ]
+        if result.returncode != 0:
+            return jsonify({'error': result.stderr or 'Restore failed'}), 400
 
-                result = subprocess.run(
-                    ssh_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=600
-                )
-
-                if result.returncode != 0:
-                    return jsonify({'error': result.stderr or 'Restore failed'}), 400
-
-                return jsonify({
-                    'success': True,
-                    'message': f"Restored {source_path} to {target_path}",
-                    'output': result.stdout
-                })
-
-            finally:
-                os.unlink(key_file_path)
+        return jsonify({
+            'success': True,
+            'message': f"Restored {source_path} to {target_path}",
+            'output': result.stdout
+        })
 
     except subprocess.TimeoutExpired:
         return jsonify({'error': 'Restore timed out'}), 400
@@ -3644,14 +3284,7 @@ def api_download_s3_file(config_id):
 def api_get_servers():
     """Get all servers"""
     servers = load_servers()
-    # Mask agent API keys in response
-    safe_servers = []
-    for server in servers:
-        safe_server = {**server}
-        if safe_server.get('agent_api_key'):
-            safe_server['agent_api_key'] = '********'
-        safe_servers.append(safe_server)
-    return jsonify(safe_servers)
+    return jsonify(servers)
 
 
 @app.route('/api/servers', methods=['POST'])
@@ -3674,83 +3307,45 @@ def api_create_server_route():
     if not validate_hostname(data['host']):
         return jsonify({'error': 'Invalid hostname or IP address'}), 400
 
-    connection_type = data.get('connection_type', 'ssh')
+    if not data.get('ssh_user'):
+        return jsonify({'error': 'ssh_user is required'}), 400
 
-    if connection_type == 'ssh':
-        # SSH-specific validation
-        if not data.get('ssh_user'):
-            return jsonify({'error': 'ssh_user is required for SSH connections'}), 400
+    ssh_port = int(data.get('ssh_port', 22))
+    if not validate_port(ssh_port):
+        return jsonify({'error': 'Invalid SSH port (must be 1-65535)'}), 400
 
-        ssh_port = int(data.get('ssh_port', 22))
-        if not validate_port(ssh_port):
-            return jsonify({'error': 'Invalid SSH port (must be 1-65535)'}), 400
+    ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
+    if not validate_path(ssh_key):
+        return jsonify({'error': 'Invalid SSH key path'}), 400
 
-        ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
-        if not validate_path(ssh_key):
-            return jsonify({'error': 'Invalid SSH key path'}), 400
-
-        new_server = {
-            'id': generate_id(),
-            'name': data['name'],
-            'host': data['host'],
-            'connection_type': 'ssh',
-            'ssh_port': ssh_port,
-            'ssh_user': data['ssh_user'],
-            'ssh_key': ssh_key,
-            'agent_port': None,
-            'agent_api_key': None,
-            'status': data.get('status', 'active'),
-            'created_at': utc_isoformat(),
-            'updated_at': utc_isoformat()
-        }
-    elif connection_type == 'agent':
-        # Agent-specific validation
-        if not data.get('agent_api_key'):
-            return jsonify({'error': 'agent_api_key is required for agent connections'}), 400
-
-        agent_port = int(data.get('agent_port', 8090))
-        if not validate_port(agent_port):
-            return jsonify({'error': 'Invalid agent port (must be 1-65535)'}), 400
-
-        new_server = {
-            'id': generate_id(),
-            'name': data['name'],
-            'host': data['host'],
-            'connection_type': 'agent',
-            'ssh_port': None,
-            'ssh_user': None,
-            'ssh_key': None,
-            'agent_port': agent_port,
-            'agent_api_key': data['agent_api_key'],
-            'status': data.get('status', 'active'),
-            'created_at': utc_isoformat(),
-            'updated_at': utc_isoformat()
-        }
-    else:
-        return jsonify({'error': 'Invalid connection_type. Must be "ssh" or "agent"'}), 400
+    new_server = {
+        'id': generate_id(),
+        'name': data['name'],
+        'host': data['host'],
+        'ssh_port': ssh_port,
+        'ssh_user': data['ssh_user'],
+        'ssh_key': ssh_key,
+        'status': data.get('status', 'active'),
+        'created_at': utc_isoformat(),
+        'updated_at': utc_isoformat()
+    }
 
     create_server(new_server)
 
-    # Auto-install restic on SSH servers in background
-    if connection_type == 'ssh':
-        def _provision(host, ssh_user, ssh_port, ssh_key):
-            success, msg = ensure_restic_installed(host, ssh_user, ssh_port, ssh_key)
-            if success:
-                logger.info(f"Auto-provisioned restic on {ssh_user}@{host}: {msg}")
-            else:
-                logger.warning(f"Failed to auto-provision restic on {ssh_user}@{host}: {msg}")
-        threading.Thread(
-            target=_provision,
-            args=(new_server['host'], new_server['ssh_user'], new_server['ssh_port'], new_server['ssh_key']),
-            daemon=True
-        ).start()
+    # Auto-install restic on remote server in background
+    def _provision(host, ssh_user, ssh_port, ssh_key):
+        success, msg = ensure_restic_installed(host, ssh_user, ssh_port, ssh_key)
+        if success:
+            logger.info(f"Auto-provisioned restic on {ssh_user}@{host}: {msg}")
+        else:
+            logger.warning(f"Failed to auto-provision restic on {ssh_user}@{host}: {msg}")
+    threading.Thread(
+        target=_provision,
+        args=(new_server['host'], new_server['ssh_user'], new_server['ssh_port'], new_server['ssh_key']),
+        daemon=True
+    ).start()
 
-    # Mask API key in response
-    response_server = {**new_server}
-    if response_server.get('agent_api_key'):
-        response_server['agent_api_key'] = '********'
-
-    return jsonify(response_server), 201
+    return jsonify(new_server), 201
 
 
 @app.route('/api/servers/<server_id>', methods=['PUT'])
@@ -3767,32 +3362,17 @@ def api_update_server_route(server_id):
     if not server:
         return jsonify({'error': 'Server not found'}), 404
 
-    # Update common fields
     server['name'] = data.get('name', server['name'])
     server['host'] = data.get('host', server['host'])
-    server['connection_type'] = data.get('connection_type', server.get('connection_type', 'ssh'))
     server['status'] = data.get('status', server.get('status', 'active'))
-
-    # Update type-specific fields
-    if server['connection_type'] == 'ssh':
-        server['ssh_port'] = int(data.get('ssh_port', server.get('ssh_port', 22)))
-        server['ssh_user'] = data.get('ssh_user', server.get('ssh_user'))
-        server['ssh_key'] = data.get('ssh_key', server.get('ssh_key', '/home/backupx/.ssh/id_rsa'))
-        server['agent_port'] = None
-        server['agent_api_key'] = None
-    elif server['connection_type'] == 'agent':
-        server['agent_port'] = int(data.get('agent_port', server.get('agent_port', 8090)))
-        # Only update API key if provided and not masked
-        if data.get('agent_api_key') and data.get('agent_api_key') != '********':
-            server['agent_api_key'] = data['agent_api_key']
-        server['ssh_port'] = None
-        server['ssh_user'] = None
-        server['ssh_key'] = None
+    server['ssh_port'] = int(data.get('ssh_port', server.get('ssh_port', 22)))
+    server['ssh_user'] = data.get('ssh_user', server.get('ssh_user'))
+    server['ssh_key'] = data.get('ssh_key', server.get('ssh_key', '/home/backupx/.ssh/id_rsa'))
 
     update_server_in_db(server_id, server)
 
-    # Auto-install restic on SSH servers in background
-    if server['connection_type'] == 'ssh' and server.get('ssh_user') and server.get('host'):
+    # Auto-install restic on remote server in background
+    if server.get('ssh_user') and server.get('host'):
         def _provision(host, ssh_user, ssh_port, ssh_key):
             success, msg = ensure_restic_installed(host, ssh_user, ssh_port, ssh_key)
             if success:
@@ -3805,12 +3385,7 @@ def api_update_server_route(server_id):
             daemon=True
         ).start()
 
-    # Mask API key in response
-    response_server = {**server}
-    if response_server.get('agent_api_key'):
-        response_server['agent_api_key'] = '********'
-
-    return jsonify(response_server)
+    return jsonify(server)
 
 
 @app.route('/api/servers/<server_id>', methods=['DELETE'])
@@ -3831,103 +3406,55 @@ def api_delete_server_route(server_id):
 @login_required
 @csrf.exempt
 def api_test_server_connection():
-    """Test connection to server (SSH or Agent)"""
+    """Test SSH connection to server"""
     data = request.get_json()
 
     if not data:
         return jsonify({'error': 'No data provided'}), 400
 
-    connection_type = data.get('connection_type', 'ssh')
     host = data.get('host', '')
-
     if not host:
         return jsonify({'error': 'Host is required'}), 400
 
-    if connection_type == 'ssh':
-        # Test SSH connection
-        ssh_port = int(data.get('ssh_port', 22))
-        ssh_user = data.get('ssh_user', '')
-        ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
+    ssh_port = int(data.get('ssh_port', 22))
+    ssh_user = data.get('ssh_user', '')
+    ssh_key = data.get('ssh_key', '/home/backupx/.ssh/id_rsa')
 
-        if not ssh_user:
-            return jsonify({'error': 'SSH user is required'}), 400
+    if not ssh_user:
+        return jsonify({'error': 'SSH user is required'}), 400
 
-        try:
-            ssh_cmd = [
-                'ssh', '-i', ssh_key,
-                '-p', str(ssh_port),
-                '-o', 'StrictHostKeyChecking=accept-new',
-                '-o', 'BatchMode=yes',
-                '-o', 'ConnectTimeout=10',
-                f'{ssh_user}@{host}',
-                'echo "Connection successful"'
-            ]
+    try:
+        ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key, timeout=10)
 
-            result = subprocess.run(
-                ssh_cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+        result = subprocess.run(
+            ssh_cmd + ['echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
 
-            if result.returncode == 0:
-                return jsonify({'success': True, 'message': 'SSH connection successful'})
-            else:
-                return jsonify({'error': result.stderr or 'SSH connection failed'}), 400
+        if result.returncode == 0:
+            output = result.stdout.strip()
+            restic_installed = 'RESTIC_NOT_FOUND' not in output
+            restic_version = None
+            if restic_installed:
+                for line in output.split('\n'):
+                    if line.startswith('restic'):
+                        restic_version = line.strip()
+                        break
+            return jsonify({
+                'success': True,
+                'message': 'SSH connection successful',
+                'restic_installed': restic_installed,
+                'restic_version': restic_version
+            })
+        else:
+            return jsonify({'error': result.stderr or 'SSH connection failed'}), 400
 
-        except subprocess.TimeoutExpired:
-            return jsonify({'error': 'SSH connection timed out'}), 400
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
-    elif connection_type == 'agent':
-        # Test Agent connection
-        agent_port = int(data.get('agent_port', 8090))
-        agent_api_key = data.get('agent_api_key', '')
-
-        if not agent_api_key:
-            return jsonify({'error': 'Agent API key is required'}), 400
-
-        try:
-            # Call the agent's /health endpoint first (no auth required)
-            health_url = f'http://{host}:{agent_port}/health'
-            health_req = Request(health_url, method='GET')
-            health_req.add_header('Content-Type', 'application/json')
-
-            try:
-                with urlopen(health_req, timeout=10) as response:
-                    if response.status != 200:
-                        return jsonify({'error': 'Agent health check failed'}), 400
-            except (URLError, HTTPError) as e:
-                return jsonify({'error': f'Cannot reach agent: {str(e)}'}), 400
-
-            # Now test with API key via /info endpoint
-            info_url = f'http://{host}:{agent_port}/info'
-            info_req = Request(info_url, method='GET')
-            info_req.add_header('Content-Type', 'application/json')
-            info_req.add_header('X-API-Key', agent_api_key)
-
-            try:
-                with urlopen(info_req, timeout=10) as response:
-                    if response.status == 200:
-                        info_data = json.loads(response.read().decode('utf-8'))
-                        agent_name = info_data.get('agent_name', 'Unknown')
-                        return jsonify({
-                            'success': True,
-                            'message': f'Agent connection successful (Agent: {agent_name})'
-                        })
-                    else:
-                        return jsonify({'error': 'Agent authentication failed'}), 400
-            except HTTPError as e:
-                if e.code == 401:
-                    return jsonify({'error': 'Invalid API key'}), 400
-                return jsonify({'error': f'Agent request failed: {str(e)}'}), 400
-
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
-    else:
-        return jsonify({'error': 'Invalid connection_type'}), 400
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'SSH connection timed out'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/servers/<server_id>/test', methods=['POST'])
@@ -3939,83 +3466,44 @@ def api_test_server_connection_by_id(server_id):
     if not server:
         return jsonify({'error': 'Server not found'}), 404
 
-    connection_type = server.get('connection_type', 'ssh')
     host = server.get('host', '')
+    ssh_port = int(server.get('ssh_port') or 22)
+    ssh_user = server.get('ssh_user') or ''
+    ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
 
-    if connection_type == 'ssh':
-        # Test SSH connection
-        ssh_port = int(server.get('ssh_port') or 22)
-        ssh_user = server.get('ssh_user') or ''
-        ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
+    try:
+        ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key, timeout=10)
 
-        try:
-            ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key, timeout=10)
+        result = subprocess.run(
+            ssh_cmd + ['echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
 
-            result = subprocess.run(
-                ssh_cmd + ['echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")'],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
+        if result.returncode == 0:
+            output = result.stdout.strip()
+            restic_installed = 'RESTIC_NOT_FOUND' not in output
+            restic_version = None
+            if restic_installed:
+                for line in output.split('\n'):
+                    if line.startswith('restic'):
+                        restic_version = line.strip()
+                        break
+            return jsonify({
+                'success': True,
+                'status': 'online',
+                'message': 'SSH connection successful',
+                'restic_installed': restic_installed,
+                'restic_version': restic_version
+            })
+        else:
+            return jsonify({'success': False, 'status': 'offline', 'error': result.stderr or 'SSH connection failed'})
 
-            if result.returncode == 0:
-                output = result.stdout.strip()
-                restic_installed = 'RESTIC_NOT_FOUND' not in output
-                restic_version = None
-                if restic_installed:
-                    for line in output.split('\n'):
-                        if line.startswith('restic'):
-                            restic_version = line.strip()
-                            break
-                return jsonify({
-                    'success': True,
-                    'status': 'online',
-                    'message': 'SSH connection successful',
-                    'restic_installed': restic_installed,
-                    'restic_version': restic_version
-                })
-            else:
-                return jsonify({'success': False, 'status': 'offline', 'error': result.stderr or 'SSH connection failed'})
-
-        except subprocess.TimeoutExpired:
-            return jsonify({'success': False, 'status': 'offline', 'error': 'SSH connection timed out'})
-        except Exception as e:
-            return jsonify({'success': False, 'status': 'error', 'error': str(e)})
-
-    elif connection_type == 'agent':
-        # Test Agent connection
-        agent_port = int(server.get('agent_port', 8090))
-        agent_api_key = server.get('agent_api_key', '')
-
-        try:
-            # Call the agent's /health endpoint (no auth required)
-            health_url = f'http://{host}:{agent_port}/health'
-            health_req = Request(health_url, method='GET')
-            health_req.add_header('Content-Type', 'application/json')
-
-            try:
-                with urlopen(health_req, timeout=10) as response:
-                    if response.status == 200:
-                        health_data = json.loads(response.read().decode('utf-8'))
-                        agent_name = health_data.get('agent', 'Unknown')
-                        version = health_data.get('version', 'Unknown')
-                        return jsonify({
-                            'success': True,
-                            'status': 'online',
-                            'message': f'Agent online',
-                            'agent_name': agent_name,
-                            'version': version
-                        })
-                    else:
-                        return jsonify({'success': False, 'status': 'offline', 'error': 'Agent health check failed'})
-            except (URLError, HTTPError) as e:
-                return jsonify({'success': False, 'status': 'offline', 'error': f'Cannot reach agent: {str(e)}'})
-
-        except Exception as e:
-            return jsonify({'success': False, 'status': 'error', 'error': str(e)})
-
-    else:
-        return jsonify({'success': False, 'status': 'error', 'error': 'Invalid connection_type'})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'status': 'offline', 'error': 'SSH connection timed out'})
+    except Exception as e:
+        return jsonify({'success': False, 'status': 'error', 'error': str(e)})
 
 
 @app.route('/api/servers/<server_id>/install-restic', methods=['POST'])
@@ -4027,10 +3515,6 @@ def api_install_restic(server_id):
     server = get_server(server_id)
     if not server:
         return jsonify({'error': 'Server not found'}), 404
-
-    connection_type = server.get('connection_type', 'ssh')
-    if connection_type != 'ssh':
-        return jsonify({'error': 'Restic auto-install is only supported for SSH connections'}), 400
 
     host = server.get('host', '')
     ssh_user = server.get('ssh_user', '')
@@ -4156,7 +3640,7 @@ def api_delete_db_config_route(config_id):
 @login_required
 @csrf.exempt
 def api_test_db_connection():
-    """Test MySQL database connection via SSH or Agent"""
+    """Test MySQL database connection via SSH"""
     data = request.get_json()
 
     if not data:
@@ -4182,41 +3666,6 @@ def api_test_db_connection():
     if not server:
         return jsonify({'error': 'Server not found'}), 400
 
-    connection_type = server.get('connection_type', 'ssh')
-
-    # Use agent for testing if server is agent-based
-    if connection_type == 'agent':
-        try:
-            agent_url = f"http://{server['host']}:{server.get('agent_port', 8090)}/test/database"
-
-            payload = {
-                'db_host': db_host,
-                'db_port': db_port,
-                'db_user': db_user,
-                'db_password': db_pass
-            }
-
-            req_data = json.dumps(payload).encode('utf-8')
-            req = Request(agent_url, data=req_data, method='POST')
-            req.add_header('Content-Type', 'application/json')
-            req.add_header('X-API-Key', server.get('agent_api_key', ''))
-
-            with urlopen(req, timeout=30) as response:
-                result = json.loads(response.read().decode('utf-8'))
-
-            if result.get('success'):
-                return jsonify({'success': True, 'message': 'Database connection successful'})
-            else:
-                return jsonify({'error': result.get('error', 'Connection failed')}), 400
-
-        except (URLError, HTTPError) as e:
-            if hasattr(e, 'code') and e.code == 401:
-                return jsonify({'error': 'Agent authentication failed - check API key'}), 400
-            return jsonify({'error': sanitize_error_message(str(e))}), 400
-        except Exception as e:
-            return jsonify({'error': sanitize_error_message(str(e))}), 500
-
-    # SSH-based testing
     try:
         # Escape all values for shell to prevent command injection
         escaped_host = shlex.quote(db_host)
@@ -4224,16 +3673,13 @@ def api_test_db_connection():
         escaped_pass = shlex.quote(db_pass)
 
         # Build SSH command to test MySQL connection
-        ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
-        ssh_cmd = [
-            'ssh', '-i', ssh_key,
-            '-p', str(server.get('ssh_port') or 22),
-            '-o', 'StrictHostKeyChecking=accept-new',
-            '-o', 'BatchMode=yes',
-            '-o', 'ConnectTimeout=10',
-            f"{server['ssh_user']}@{server['host']}",
-            f"mysql -h {escaped_host} -P {db_port} -u {escaped_user} -p{escaped_pass} -e 'SELECT 1' 2>&1"
-        ]
+        ssh_cmd = _build_ssh_cmd(
+            server['host'], server['ssh_user'],
+            int(server.get('ssh_port') or 22),
+            server.get('ssh_key') or '/home/backupx/.ssh/id_rsa',
+            timeout=10
+        )
+        ssh_cmd.append(f"mysql -h {escaped_host} -P {db_port} -u {escaped_user} -p{escaped_pass} -e 'SELECT 1' 2>&1")
 
         result = subprocess.run(
             ssh_cmd,

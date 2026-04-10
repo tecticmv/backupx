@@ -32,9 +32,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
-import type { Server, ServerFormData, ConnectionType } from "@/types/server";
+import type { Server, ServerFormData } from "@/types/server";
 import {
   Plus,
   Pencil,
@@ -43,7 +42,6 @@ import {
   TestTube,
   Server as ServerIcon,
   Monitor,
-  Network,
   Key,
   CheckCircle2,
   XCircle,
@@ -58,12 +56,9 @@ import {
 const initialServerFormData: ServerFormData = {
   name: "",
   host: "",
-  connection_type: "ssh",
   ssh_port: 22,
   ssh_user: "root",
   ssh_key: "/home/backupx/.ssh/id_rsa",
-  agent_port: 8090,
-  agent_api_key: "",
   status: "active",
 };
 
@@ -72,8 +67,6 @@ type ConnectionStatus = "online" | "offline" | "checking" | "unknown";
 interface ServerStatus {
   status: ConnectionStatus;
   message?: string;
-  agentName?: string;
-  version?: string;
   resticInstalled?: boolean;
   resticVersion?: string;
 }
@@ -131,8 +124,6 @@ export default function Servers() {
       const status: ServerStatus = {
         status: data.success ? "online" : "offline",
         message: data.message || data.error,
-        agentName: data.agent_name,
-        version: data.version,
         resticInstalled: data.restic_installed,
         resticVersion: data.restic_version,
       };
@@ -164,13 +155,6 @@ export default function Servers() {
     setFormData((prev) => ({
       ...prev,
       [name]: type === "number" ? parseInt(value) || 0 : value,
-    }));
-  };
-
-  const handleConnectionTypeChange = (value: ConnectionType) => {
-    setFormData((prev) => ({
-      ...prev,
-      connection_type: value,
     }));
   };
 
@@ -212,12 +196,9 @@ export default function Servers() {
     setFormData({
       name: server.name,
       host: server.host,
-      connection_type: server.connection_type || 'ssh',
       ssh_port: server.ssh_port || 22,
       ssh_user: server.ssh_user || 'root',
       ssh_key: server.ssh_key || '/home/backupx/.ssh/id_rsa',
-      agent_port: server.agent_port || 8090,
-      agent_api_key: server.agent_api_key || '',
       status: server.status || 'active',
     });
     setIsDialogOpen(true);
@@ -271,8 +252,7 @@ export default function Servers() {
     setIsDialogOpen(true);
   };
 
-  const sshServers = servers.filter((s) => s.connection_type !== 'agent');
-  const agentServers = servers.filter((s) => s.connection_type === 'agent');
+  const onlineCount = Object.values(serverStatuses).filter((s) => s.status === "online").length;
 
   if (isLoading) {
     return (
@@ -285,7 +265,7 @@ export default function Servers() {
   return (
     <div className="space-y-6">
       {/* Stats Cards */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-4 md:grid-cols-3">
         <Card>
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium">Total Servers</CardTitle>
@@ -300,25 +280,13 @@ export default function Servers() {
         </Card>
         <Card>
           <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium">SSH Servers</CardTitle>
-            <Key className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-sm font-medium">Online</CardTitle>
+            <CheckCircle2 className="h-4 w-4 text-green-500" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{sshServers.length}</div>
+            <div className="text-2xl font-bold">{onlineCount}</div>
             <p className="text-xs text-muted-foreground">
-              SSH key authentication
-            </p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium">Agent Servers</CardTitle>
-            <Network className="h-4 w-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-bold">{agentServers.length}</div>
-            <p className="text-xs text-muted-foreground">
-              BackupX Agent
+              SSH connected
             </p>
           </CardContent>
         </Card>
@@ -344,7 +312,7 @@ export default function Servers() {
           <div>
             <CardTitle>Remote Servers</CardTitle>
             <CardDescription>
-              Configure remote servers for backup via SSH or BackupX Agent
+              Configure remote servers for backup via SSH. Restic is installed automatically.
             </CardDescription>
           </div>
           <div className="flex gap-2">
@@ -383,7 +351,6 @@ export default function Servers() {
                   <TableHead>Status</TableHead>
                   <TableHead>Name</TableHead>
                   <TableHead>Host</TableHead>
-                  <TableHead>Type</TableHead>
                   <TableHead>Connection</TableHead>
                   <TableHead>Enabled</TableHead>
                   <TableHead className="text-right">Actions</TableHead>
@@ -415,8 +382,6 @@ export default function Servers() {
                           ) : status?.status === "online" ? (
                             <div>
                               <p className="font-medium text-green-500">Online</p>
-                              {status.agentName && <p className="text-xs">Agent: {status.agentName}</p>}
-                              {status.version && <p className="text-xs">Version: {status.version}</p>}
                               {status.resticInstalled !== undefined && (
                                 <p className={`text-xs ${status.resticInstalled ? "text-green-400" : "text-yellow-400"}`}>
                                   {status.resticInstalled
@@ -440,25 +405,11 @@ export default function Servers() {
                     <TableCell className="text-muted-foreground">
                       {server.host}
                     </TableCell>
-                    <TableCell>
-                      <Badge variant={server.connection_type === 'agent' ? 'default' : 'secondary'}>
-                        {server.connection_type === 'agent' ? (
-                          <>
-                            <Network className="h-3 w-3 mr-1" />
-                            Agent
-                          </>
-                        ) : (
-                          <>
-                            <Key className="h-3 w-3 mr-1" />
-                            SSH
-                          </>
-                        )}
-                      </Badge>
-                    </TableCell>
                     <TableCell className="text-muted-foreground">
-                      {server.connection_type === 'agent'
-                        ? `Port ${server.agent_port}`
-                        : `${server.ssh_user}@:${server.ssh_port}`}
+                      <div className="flex items-center gap-1">
+                        <Key className="h-3 w-3" />
+                        {server.ssh_user}@:{server.ssh_port}
+                      </div>
                     </TableCell>
                     <TableCell>
                       <span className={`inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
@@ -522,7 +473,7 @@ export default function Servers() {
                 {editingServer ? "Edit Server" : "Add Server"}
               </DialogTitle>
               <DialogDescription>
-                Configure a remote server for backups via SSH or BackupX Agent.
+                Configure a remote server for backups via SSH. Restic will be installed automatically.
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-4 py-4">
@@ -548,128 +499,46 @@ export default function Servers() {
                   required
                 />
               </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="grid gap-2">
+                  <Label htmlFor="ssh_user">SSH User</Label>
+                  <Input
+                    id="ssh_user"
+                    name="ssh_user"
+                    placeholder="root"
+                    value={formData.ssh_user}
+                    onChange={handleInputChange}
+                    required
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="ssh_port">SSH Port</Label>
+                  <Input
+                    id="ssh_port"
+                    name="ssh_port"
+                    type="number"
+                    placeholder="22"
+                    value={formData.ssh_port}
+                    onChange={handleInputChange}
+                    required
+                  />
+                </div>
+              </div>
               <div className="grid gap-2">
-                <Label htmlFor="connection_type">Connection Type</Label>
-                <Select
-                  value={formData.connection_type}
-                  onValueChange={handleConnectionTypeChange}
-                >
-                  <SelectTrigger>
-                    <SelectValue placeholder="Select connection type" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="ssh">
-                      <div className="flex items-center">
-                        <Key className="h-4 w-4 mr-2" />
-                        SSH (Key-based)
-                      </div>
-                    </SelectItem>
-                    <SelectItem value="agent">
-                      <div className="flex items-center">
-                        <Network className="h-4 w-4 mr-2" />
-                        BackupX Agent
-                      </div>
-                    </SelectItem>
-                  </SelectContent>
-                </Select>
+                <Label htmlFor="ssh_key">SSH Key Path</Label>
+                <Input
+                  id="ssh_key"
+                  name="ssh_key"
+                  placeholder="/home/backupx/.ssh/id_rsa"
+                  value={formData.ssh_key}
+                  onChange={handleInputChange}
+                  required
+                />
                 <p className="text-xs text-muted-foreground">
-                  {formData.connection_type === 'ssh'
-                    ? 'Connect via SSH using key authentication'
-                    : 'Connect via BackupX Agent running on the remote server'}
+                  Path to the SSH private key on the BackupX server
                 </p>
               </div>
-
-              {/* SSH-specific fields */}
-              {formData.connection_type === 'ssh' && (
-                <>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="grid gap-2">
-                      <Label htmlFor="ssh_user">SSH User</Label>
-                      <Input
-                        id="ssh_user"
-                        name="ssh_user"
-                        placeholder="root"
-                        value={formData.ssh_user}
-                        onChange={handleInputChange}
-                        required
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label htmlFor="ssh_port">SSH Port</Label>
-                      <Input
-                        id="ssh_port"
-                        name="ssh_port"
-                        type="number"
-                        placeholder="22"
-                        value={formData.ssh_port}
-                        onChange={handleInputChange}
-                        required
-                      />
-                    </div>
-                  </div>
-                  <div className="grid gap-2">
-                    <Label htmlFor="ssh_key">SSH Key Path</Label>
-                    <Input
-                      id="ssh_key"
-                      name="ssh_key"
-                      placeholder="/home/backupx/.ssh/id_rsa"
-                      value={formData.ssh_key}
-                      onChange={handleInputChange}
-                      required
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Path to the SSH private key on the BackupX server
-                    </p>
-                  </div>
-                </>
-              )}
-
-              {/* Agent-specific fields */}
-              {formData.connection_type === 'agent' && (
-                <>
-                  <div className="rounded-md border border-blue-200 bg-blue-50 dark:border-blue-900 dark:bg-blue-950/50 p-3">
-                    <p className="text-xs font-medium text-blue-800 dark:text-blue-200 mb-1">
-                      Quick Install
-                    </p>
-                    <p className="text-xs text-blue-700 dark:text-blue-300 mb-2">
-                      Run this command on the remote server to install the agent:
-                    </p>
-                    <code className="block text-xs bg-blue-100 dark:bg-blue-900/50 p-2 rounded font-mono break-all select-all">
-                      curl -sSL https://raw.githubusercontent.com/SaiphMuhammad/backupx/main/install-agent.sh | sudo bash
-                    </code>
-                  </div>
-                  <div className="grid gap-2">
-                    <Label htmlFor="agent_port">Agent Port</Label>
-                    <Input
-                      id="agent_port"
-                      name="agent_port"
-                      type="number"
-                      placeholder="8090"
-                      value={formData.agent_port}
-                      onChange={handleInputChange}
-                      required
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      Port where BackupX Agent is listening
-                    </p>
-                  </div>
-                  <div className="grid gap-2">
-                    <Label htmlFor="agent_api_key">Agent API Key</Label>
-                    <Input
-                      id="agent_api_key"
-                      name="agent_api_key"
-                      type="password"
-                      placeholder="Enter API key"
-                      value={formData.agent_api_key}
-                      onChange={handleInputChange}
-                      required={!editingServer}
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      API key configured on the remote BackupX Agent
-                    </p>
-                  </div>
-                </>
-              )}
 
               <div className="grid gap-2">
                 <Label htmlFor="status">Status</Label>

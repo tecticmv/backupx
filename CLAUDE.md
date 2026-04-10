@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-BackupX is an enterprise backup management system with a Flask backend and React frontend. It manages filesystem and database backups across multiple servers using Restic and S3-compatible storage.
+BackupX is an enterprise backup management system with a Flask backend and React frontend. It manages filesystem and database backups across multiple servers using Restic and S3-compatible storage. Fully agentless — all remote operations happen over SSH with automatic Restic provisioning.
 
 ## Commands
 
@@ -13,11 +13,9 @@ All commands use `./run.sh` from the project root:
 ```bash
 # Development
 ./run.sh server:dev          # Start server with hot reload
-./run.sh agent:dev           # Start agent with hot reload
 
 # Production
 ./run.sh server:start        # Start server (gunicorn, 4 workers)
-./run.sh agent:start         # Start agent
 ./run.sh server:stop         # Stop server
 ./run.sh server:status       # Check server status
 
@@ -30,7 +28,7 @@ All commands use `./run.sh` from the project root:
 # Other
 ./run.sh install             # Install all dependencies
 ./run.sh check               # Pre-deployment checks (Python version, env, deps, tests)
-./run.sh logs [server|agent] # Tail logs
+./run.sh logs server         # Tail logs
 ```
 
 Frontend build (from `backupx-server/frontend/`):
@@ -42,9 +40,10 @@ npm run lint     # ESLint
 
 ## Architecture
 
-### Two-Component System
+### SSH-Only Design
 - **Server** (`backupx-server/`): Flask app with React UI, job scheduling, and configuration storage
-- **Agent** (`backupx-agent/`): Optional lightweight Flask agent deployed on remote servers
+- All remote operations use SSH — no agents to install or maintain on target servers
+- Restic is auto-provisioned on remote servers when they are added (downloads static binary via SSH)
 
 ### Server Structure (`backupx-server/`)
 - `app/main.py` - Monolithic Flask app containing all REST API routes (~40 endpoints under `/api/*`)
@@ -59,20 +58,18 @@ npm run lint     # ESLint
 - `frontend/` - React + TypeScript + Vite + Radix UI + Tailwind
 - `tests/` - Pytest test suite
 
-### Agent Structure (`backupx-agent/`)
-- `agent.py` - Minimal Flask app with HMAC-SHA256 authentication
-
 ### Key Patterns
 - **Database**: Abstract factory pattern - all DB operations go through `DatabaseBackend` interface
 - **Audit**: Decorator pattern - use `@audit_log` to track operations with automatic sensitive field redaction
 - **Sessions**: Strategy pattern - filesystem (default) or Redis for horizontal scaling
 - **Scheduler**: Hybrid APScheduler + database for distributed deployments with leader election
+- **Restic provisioning**: Auto-install via SSH on server add/update, with in-memory cache and pre-backup safety check
 
 ### Data Flow
 1. React UI calls Flask REST API (`/api/*`)
 2. Flask stores job config in database with encrypted credentials (AES-256 via Fernet)
 3. APScheduler triggers jobs at scheduled times
-4. Jobs execute via SSH or Agent REST calls to remote servers
+4. Jobs execute via SSH to remote servers (restic auto-provisioned if missing)
 5. Remote servers run Restic backups to S3 storage
 6. Audit logs recorded with sensitive field redaction
 
@@ -86,10 +83,8 @@ npm run lint     # ESLint
 ## Environment Configuration
 
 Server config: `backupx-server/.env` (see `.env.example`)
-Agent config: `backupx-agent/.env` (see `.env.example`)
 
 Key variables:
 - `SECRET_KEY` - Encryption key (min 32 chars, required)
 - `DATABASE_HOST`, `DATABASE_USER`, `DATABASE_PASSWORD` - PostgreSQL connection
 - `SESSION_TYPE` - `filesystem` or `redis`
-- `AGENT_API_KEY` - Agent authentication key (min 32 chars)

@@ -488,15 +488,13 @@ export default function Databases() {
                   <SelectContent>
                     {servers.map((server) => (
                       <SelectItem key={server.id} value={server.id}>
-                        {server.name} ({server.host}) - {server.connection_type === 'agent' ? 'Agent' : 'SSH'}
+                        {server.name} ({server.host})
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  {testServerId && servers.find(s => s.id === testServerId)?.connection_type === 'agent'
-                    ? 'MySQL connection will be tested via the agent on the selected server'
-                    : 'MySQL connection will be tested via SSH from the selected server'}
+                  MySQL connection will be tested via SSH from the selected server
                 </p>
               </div>
             </div>
