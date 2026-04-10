@@ -74,6 +74,8 @@ interface ServerStatus {
   message?: string;
   agentName?: string;
   version?: string;
+  resticInstalled?: boolean;
+  resticVersion?: string;
 }
 
 export default function Servers() {
@@ -131,6 +133,8 @@ export default function Servers() {
         message: data.message || data.error,
         agentName: data.agent_name,
         version: data.version,
+        resticInstalled: data.restic_installed,
+        resticVersion: data.restic_version,
       };
 
       setServerStatuses((prev) => ({
@@ -413,6 +417,13 @@ export default function Servers() {
                               <p className="font-medium text-green-500">Online</p>
                               {status.agentName && <p className="text-xs">Agent: {status.agentName}</p>}
                               {status.version && <p className="text-xs">Version: {status.version}</p>}
+                              {status.resticInstalled !== undefined && (
+                                <p className={`text-xs ${status.resticInstalled ? "text-green-400" : "text-yellow-400"}`}>
+                                  {status.resticInstalled
+                                    ? `Restic: ${status.resticVersion || "installed"}`
+                                    : "Restic: not installed"}
+                                </p>
+                              )}
                             </div>
                           ) : status?.status === "offline" ? (
                             <div>

@@ -1495,6 +1495,21 @@ def run_backup(job_id):
         else:
             return run_agent_filesystem_backup(job_id, job, server)
     else:
+        # Ensure restic is installed on the remote server before running backup
+        if server and server.get('ssh_user') and server.get('host'):
+            success, msg = ensure_restic_installed(
+                server['host'], server['ssh_user'],
+                int(server.get('ssh_port') or 22),
+                server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
+            )
+            if not success:
+                error_msg = f"Restic not available on remote server: {msg}"
+                update_job_status(job_id, 'error')
+                add_history(job_id, job['name'], 'error', error_msg, 0)
+                send_notification(job_id, job['name'], 'error', error_msg, 0)
+                logger.error(f"Backup aborted - {error_msg}")
+                return False, error_msg
+
         # Use SSH-based backup
         if backup_type == 'database':
             return run_database_backup(job_id, job)
@@ -1512,6 +1527,93 @@ def sanitize_error_message(error: str, max_length: int = 500) -> str:
     if len(sanitized) > max_length:
         sanitized = sanitized[:max_length] + '...'
     return sanitized
+
+
+def _build_ssh_cmd(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_rsa', timeout=30):
+    """Build a standard SSH command prefix"""
+    return [
+        'ssh', '-i', ssh_key,
+        '-p', str(ssh_port),
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', 'BatchMode=yes',
+        '-o', f'ConnectTimeout={timeout}',
+        f'{ssh_user}@{host}'
+    ]
+
+
+# Cache of servers where restic is confirmed installed (cleared on restart)
+_restic_confirmed = set()
+
+RESTIC_VERSION = '0.17.3'
+RESTIC_INSTALL_SCRIPT = """
+set -e
+if command -v restic >/dev/null 2>&1; then
+    echo "RESTIC_ALREADY_INSTALLED"
+    restic version
+    exit 0
+fi
+
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  ARCH="amd64" ;;
+    aarch64) ARCH="arm64" ;;
+    armv7l)  ARCH="arm" ;;
+    *)       echo "UNSUPPORTED_ARCH: $ARCH"; exit 1 ;;
+esac
+
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+RESTIC_VER="%s"
+URL="https://github.com/restic/restic/releases/download/v${RESTIC_VER}/restic_${RESTIC_VER}_${OS}_${ARCH}.bz2"
+
+echo "RESTIC_INSTALLING from $URL"
+TMPFILE=$(mktemp)
+curl -fsSL "$URL" -o "$TMPFILE.bz2"
+bunzip2 "$TMPFILE.bz2"
+chmod +x "$TMPFILE"
+mv "$TMPFILE" /usr/local/bin/restic
+echo "RESTIC_INSTALLED"
+restic version
+""" % RESTIC_VERSION
+
+
+def ensure_restic_installed(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_rsa'):
+    """Check if restic is installed on remote server, install if missing. Returns (success, message)."""
+    cache_key = f"{ssh_user}@{host}:{ssh_port}"
+    if cache_key in _restic_confirmed:
+        return True, "Restic already confirmed"
+
+    ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key)
+
+    try:
+        result = subprocess.run(
+            ssh_cmd + [RESTIC_INSTALL_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+
+        output = result.stdout.strip()
+
+        if result.returncode == 0:
+            _restic_confirmed.add(cache_key)
+            if 'RESTIC_ALREADY_INSTALLED' in output:
+                logger.info(f"Restic already installed on {cache_key}")
+                return True, "Restic already installed"
+            elif 'RESTIC_INSTALLED' in output:
+                logger.info(f"Restic installed successfully on {cache_key}")
+                return True, "Restic installed successfully"
+            return True, output
+
+        error = result.stderr.strip() or output
+        if 'UNSUPPORTED_ARCH' in output:
+            return False, f"Unsupported architecture on {host}: {output}"
+        logger.error(f"Failed to install restic on {cache_key}: {error}")
+        return False, f"Failed to install restic: {sanitize_error_message(error)}"
+
+    except subprocess.TimeoutExpired:
+        return False, "Restic installation timed out"
+    except Exception as e:
+        return False, f"Error checking restic: {sanitize_error_message(str(e))}"
 
 
 def run_filesystem_backup(job_id, job):
@@ -3629,6 +3731,20 @@ def api_create_server_route():
 
     create_server(new_server)
 
+    # Auto-install restic on SSH servers in background
+    if connection_type == 'ssh':
+        def _provision(host, ssh_user, ssh_port, ssh_key):
+            success, msg = ensure_restic_installed(host, ssh_user, ssh_port, ssh_key)
+            if success:
+                logger.info(f"Auto-provisioned restic on {ssh_user}@{host}: {msg}")
+            else:
+                logger.warning(f"Failed to auto-provision restic on {ssh_user}@{host}: {msg}")
+        threading.Thread(
+            target=_provision,
+            args=(new_server['host'], new_server['ssh_user'], new_server['ssh_port'], new_server['ssh_key']),
+            daemon=True
+        ).start()
+
     # Mask API key in response
     response_server = {**new_server}
     if response_server.get('agent_api_key'):
@@ -3674,6 +3790,20 @@ def api_update_server_route(server_id):
         server['ssh_key'] = None
 
     update_server_in_db(server_id, server)
+
+    # Auto-install restic on SSH servers in background
+    if server['connection_type'] == 'ssh' and server.get('ssh_user') and server.get('host'):
+        def _provision(host, ssh_user, ssh_port, ssh_key):
+            success, msg = ensure_restic_installed(host, ssh_user, ssh_port, ssh_key)
+            if success:
+                logger.info(f"Auto-provisioned restic on {ssh_user}@{host}: {msg}")
+            else:
+                logger.warning(f"Failed to auto-provision restic on {ssh_user}@{host}: {msg}")
+        threading.Thread(
+            target=_provision,
+            args=(server['host'], server['ssh_user'], int(server.get('ssh_port') or 22), server.get('ssh_key', '/home/backupx/.ssh/id_rsa')),
+            daemon=True
+        ).start()
 
     # Mask API key in response
     response_server = {**server}
@@ -3819,25 +3949,31 @@ def api_test_server_connection_by_id(server_id):
         ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
 
         try:
-            ssh_cmd = [
-                'ssh', '-i', ssh_key,
-                '-p', str(ssh_port),
-                '-o', 'StrictHostKeyChecking=accept-new',
-                '-o', 'BatchMode=yes',
-                '-o', 'ConnectTimeout=10',
-                f'{ssh_user}@{host}',
-                'echo "Connection successful"'
-            ]
+            ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key, timeout=10)
 
             result = subprocess.run(
-                ssh_cmd,
+                ssh_cmd + ['echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")'],
                 capture_output=True,
                 text=True,
                 timeout=30
             )
 
             if result.returncode == 0:
-                return jsonify({'success': True, 'status': 'online', 'message': 'SSH connection successful'})
+                output = result.stdout.strip()
+                restic_installed = 'RESTIC_NOT_FOUND' not in output
+                restic_version = None
+                if restic_installed:
+                    for line in output.split('\n'):
+                        if line.startswith('restic'):
+                            restic_version = line.strip()
+                            break
+                return jsonify({
+                    'success': True,
+                    'status': 'online',
+                    'message': 'SSH connection successful',
+                    'restic_installed': restic_installed,
+                    'restic_version': restic_version
+                })
             else:
                 return jsonify({'success': False, 'status': 'offline', 'error': result.stderr or 'SSH connection failed'})
 
@@ -3880,6 +4016,39 @@ def api_test_server_connection_by_id(server_id):
 
     else:
         return jsonify({'success': False, 'status': 'error', 'error': 'Invalid connection_type'})
+
+
+@app.route('/api/servers/<server_id>/install-restic', methods=['POST'])
+@login_required
+@csrf.exempt
+@audit_log('install_restic')
+def api_install_restic(server_id):
+    """Install restic on a remote server via SSH"""
+    server = get_server(server_id)
+    if not server:
+        return jsonify({'error': 'Server not found'}), 404
+
+    connection_type = server.get('connection_type', 'ssh')
+    if connection_type != 'ssh':
+        return jsonify({'error': 'Restic auto-install is only supported for SSH connections'}), 400
+
+    host = server.get('host', '')
+    ssh_user = server.get('ssh_user', '')
+    ssh_port = int(server.get('ssh_port') or 22)
+    ssh_key = server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
+
+    if not host or not ssh_user:
+        return jsonify({'error': 'Server SSH configuration incomplete'}), 400
+
+    # Clear cache for this server so it re-checks
+    cache_key = f"{ssh_user}@{host}:{ssh_port}"
+    _restic_confirmed.discard(cache_key)
+
+    success, message = ensure_restic_installed(host, ssh_user, ssh_port, ssh_key)
+    if success:
+        return jsonify({'success': True, 'message': message})
+    else:
+        return jsonify({'error': message}), 400
 
 
 # Database Configuration API Routes
