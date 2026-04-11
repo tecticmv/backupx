@@ -379,6 +379,11 @@ class PostgresBackend(DatabaseBackend):
         if 'ssh_key_content' not in columns:
             self.add_column('servers', 'ssh_key_content', 'TEXT')
 
+        # Add docker_container column to db_configs for docker-exec backups
+        db_columns = self.get_table_columns('db_configs')
+        if 'docker_container' not in db_columns:
+            self.add_column('db_configs', 'docker_container', 'TEXT')
+
         # Create app_settings table if it doesn't exist
         self.executescript('''
             CREATE TABLE IF NOT EXISTS app_settings (

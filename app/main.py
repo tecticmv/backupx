@@ -483,6 +483,7 @@ def init_db():
             username TEXT NOT NULL,
             password TEXT NOT NULL,
             databases TEXT DEFAULT '*',
+            docker_container TEXT,
             status TEXT DEFAULT 'active',
             created_at TEXT NOT NULL,
             updated_at TEXT
@@ -608,6 +609,10 @@ def init_db():
         if 'status' not in db_columns:
             conn.execute("ALTER TABLE db_configs ADD COLUMN status TEXT DEFAULT 'active'")
             logger.info("Added status column to db_configs table")
+
+        if 'docker_container' not in db_columns:
+            conn.execute("ALTER TABLE db_configs ADD COLUMN docker_container TEXT")
+            logger.info("Added docker_container column to db_configs table")
 
         # Check and add status column to servers
         if 'status' not in columns:
@@ -1093,10 +1098,11 @@ def create_db_config(config):
     """Create a new database config"""
     conn = get_db_connection()
     conn.execute('''
-        INSERT INTO db_configs (id, name, type, host, port, username, password, databases, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO db_configs (id, name, type, host, port, username, password, databases, docker_container, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (config['id'], config['name'], config.get('type', 'mysql'), config['host'], config.get('port', 3306),
           config['username'], encrypt_credential(config['password']), config.get('databases', '*'),
+          config.get('docker_container') or None,
           config.get('status', 'active'), config.get('created_at', utc_isoformat()), config.get('updated_at')))
     conn.commit()
     conn.close()
@@ -1106,10 +1112,11 @@ def update_db_config_in_db(config_id, config):
     """Update a database config"""
     conn = get_db_connection()
     conn.execute('''
-        UPDATE db_configs SET name=?, type=?, host=?, port=?, username=?, password=?, databases=?, status=?, updated_at=?
+        UPDATE db_configs SET name=?, type=?, host=?, port=?, username=?, password=?, databases=?, docker_container=?, status=?, updated_at=?
         WHERE id=?
     ''', (config['name'], config.get('type', 'mysql'), config['host'], config.get('port', 3306),
           config['username'], encrypt_credential(config['password']), config.get('databases', '*'),
+          config.get('docker_container') or None,
           config.get('status', 'active'), utc_isoformat(), config_id))
     conn.commit()
     conn.close()
@@ -1629,7 +1636,47 @@ URL="https://github.com/restic/restic/releases/download/v${RESTIC_VER}/restic_${
 echo "RESTIC_INSTALLING from $URL"
 TMPDIR=$(mktemp -d)
 curl -fsSL "$URL" -o "$TMPDIR/restic.bz2"
-bunzip2 "$TMPDIR/restic.bz2"
+
+# Decompress .bz2 using whatever is available
+decompress_bz2() {
+    if command -v bunzip2 >/dev/null 2>&1; then
+        bunzip2 "$TMPDIR/restic.bz2" 2>/dev/null
+    elif command -v bzip2 >/dev/null 2>&1; then
+        bzip2 -d "$TMPDIR/restic.bz2" 2>/dev/null
+    elif command -v bzcat >/dev/null 2>&1; then
+        bzcat "$TMPDIR/restic.bz2" > "$TMPDIR/restic" 2>/dev/null && rm "$TMPDIR/restic.bz2"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "import bz2,sys; open('$TMPDIR/restic','wb').write(bz2.decompress(open('$TMPDIR/restic.bz2','rb').read()))" 2>/dev/null && rm "$TMPDIR/restic.bz2"
+    elif command -v python >/dev/null 2>&1; then
+        python -c "import bz2,sys; open('$TMPDIR/restic','wb').write(bz2.decompress(open('$TMPDIR/restic.bz2','rb').read()))" 2>/dev/null && rm "$TMPDIR/restic.bz2"
+    elif command -v perl >/dev/null 2>&1 && perl -MCompress::Bzip2 -e1 >/dev/null 2>&1; then
+        perl -MCompress::Bzip2 -e 'my $b=Compress::Bzip2->new; open(I,"$ENV{TMPDIR}/restic.bz2"); open(O,">$ENV{TMPDIR}/restic"); while(read(I,my $buf,4096)){print O $b->decompress($buf)}' 2>/dev/null && rm "$TMPDIR/restic.bz2"
+    else
+        return 1
+    fi
+    [ -f "$TMPDIR/restic" ]
+}
+
+if ! decompress_bz2; then
+    echo "Trying to install bzip2 via package manager..."
+    if sudo -n true 2>/dev/null; then
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo -n apt-get update -qq >/dev/null 2>&1
+            sudo -n apt-get install -y bzip2 >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo -n dnf install -y bzip2 >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            sudo -n yum install -y bzip2 >/dev/null 2>&1
+        elif command -v apk >/dev/null 2>&1; then
+            sudo -n apk add --no-cache bzip2 >/dev/null 2>&1
+        fi
+    fi
+    if ! decompress_bz2; then
+        echo "FAILED_BZIP2: cannot decompress restic archive." >&2
+        echo "Please install bzip2 on the server: apt-get install bzip2" >&2
+        exit 1
+    fi
+fi
 chmod +x "$TMPDIR/restic"
 
 # Try /usr/local/bin with sudo, fall back to ~/.local/bin
@@ -1849,6 +1896,13 @@ export AWS_ACCESS_KEY_ID={s3_access_key}
 export AWS_SECRET_ACCESS_KEY={s3_secret_key}
 export RESTIC_PASSWORD={restic_password}
 export RESTIC_REPOSITORY="s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+
+# Ensure repository exists (init if needed)
+if ! restic cat config {insecure_flag} >/dev/null 2>&1; then
+    echo "Initializing new restic repository..."
+    restic init {insecure_flag} 2>&1 || true
+fi
+
 restic backup --compression auto --tag automated {insecure_flag} {' '.join(exclude_args)} {directories}
 """
 
@@ -1920,8 +1974,8 @@ def run_database_backup(job_id, job):
         if not db_config:
             raise Exception("Database configuration not found")
 
-        # Auto-install database client if missing
-        if server:
+        # Auto-install database client if missing (skipped when using docker exec — client is inside the container)
+        if server and not (db_config.get('docker_container') or '').strip():
             db_type = db_config.get('type', 'mysql')
             client_type = 'postgres' if db_type in ('postgres', 'postgresql') else 'mysql'
             update_job_progress(job_id, 15, f'Checking {client_type} client on remote server...')
@@ -1948,37 +2002,57 @@ def run_database_backup(job_id, job):
             db_list = [shlex.quote(db.strip()) for db in databases.split(',') if db.strip()]
             db_flag = '--databases ' + ' '.join(db_list)
 
-        # Determine db type
+        # Check if we should use docker exec instead of direct connection
+        container = db_config.get('docker_container') or ''
+        use_docker = bool(container.strip())
+
+        # Determine db type: for docker-exec mode we auto-detect at run time;
+        # for direct connection we use the explicit type from the config
         db_type = db_config.get('type', 'mysql')
         is_postgres = db_type in ('postgres', 'postgresql')
 
         # Generate backup filename with timestamp
         timestamp = utc_now().strftime('%Y%m%d_%H%M%S')
-        prefix = 'pg' if is_postgres else 'mysql'
+        prefix = 'db' if use_docker else ('pg' if is_postgres else 'mysql')
         backup_filename = f"{prefix}_backup_{timestamp}.sql.gz"
 
         # Escape all values for shell
         s3_access_key = shlex.quote(job['s3_access_key'])
         s3_secret_key = shlex.quote(job['s3_secret_key'])
         restic_password = shlex.quote(job['restic_password'])
-        db_host = shlex.quote(db_config['host'])
+        db_host = shlex.quote(db_config['host'] or '')
         default_port = 5432 if is_postgres else 3306
         db_port = int(db_config.get('port', default_port))
-        db_user = shlex.quote(db_config['username'])
-        db_pass = shlex.quote(db_config['password'])
+        db_user = shlex.quote(db_config['username'] or '')
+        db_pass = shlex.quote(db_config['password'] or '')
+        safe_container = shlex.quote(container) if use_docker else ''
 
-        # Build the dump command based on db type
-        if is_postgres:
-            # pg_dump uses PGPASSWORD env var; --dbname="*" not supported so we dump each
+        # Build the dump command
+        if use_docker:
+            # Use the db_type from the config directly - it was set when the user picked
+            # the container (either manually or via "Pick from server")
+            if is_postgres:
+                dump_inner = f'pg_dumpall -U postgres'
+                backup_tag = 'postgres-backup'
+                dump_error_msg = 'pg_dumpall failed'
+            else:
+                dump_inner = f'mysqldump --all-databases --single-transaction --routines --triggers'
+                backup_tag = 'mysql-backup'
+                dump_error_msg = 'mysqldump failed'
+
+            dump_cmd = f'''sh -c '
+if docker ps >/dev/null 2>&1; then DOCKER="docker"; else DOCKER="sudo -n docker"; fi
+$DOCKER exec {safe_container} {dump_inner}
+' '''
+        elif is_postgres:
+            # Direct connection from jump server
             if databases == '*':
-                # pg_dumpall for all databases (includes roles/globals)
                 dump_cmd = f'PGPASSWORD={db_pass} pg_dumpall -h {db_host} -p {db_port} -U {db_user}'
             else:
                 db_list_raw = [db.strip() for db in databases.split(',') if db.strip()]
                 if len(db_list_raw) == 1:
                     dump_cmd = f'PGPASSWORD={db_pass} pg_dump -h {db_host} -p {db_port} -U {db_user} {shlex.quote(db_list_raw[0])}'
                 else:
-                    # Multiple databases: loop and concat
                     dump_parts = [f'PGPASSWORD={db_pass} pg_dump -h {db_host} -p {db_port} -U {db_user} {shlex.quote(db)}' for db in db_list_raw]
                     dump_cmd = ' && echo "-- NEXT DB --" && '.join(dump_parts)
             backup_tag = 'postgres-backup'
@@ -1996,6 +2070,12 @@ export AWS_ACCESS_KEY_ID={s3_access_key}
 export AWS_SECRET_ACCESS_KEY={s3_secret_key}
 export RESTIC_PASSWORD={restic_password}
 export RESTIC_REPOSITORY="s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+
+# Ensure repository exists (init if needed, ignore "already initialized" errors)
+if ! restic cat config {insecure_flag} >/dev/null 2>&1; then
+    echo "Initializing new restic repository..."
+    restic init {insecure_flag} 2>&1 || true
+fi
 
 # Create temp directory for backup
 BACKUP_DIR=$(mktemp -d)
@@ -3074,11 +3154,14 @@ def api_snapshot_restore_db(job_id, snapshot_id):
     if not server:
         return jsonify({'error': 'Server not found'}), 404
 
-    # Ensure DB client is installed
+    # Ensure DB client is installed (skip when using docker exec — psql/mysql is inside the container)
     db_type = target_db.get('type', 'mysql')
     is_postgres = db_type in ('postgres', 'postgresql')
     client_type = 'postgres' if is_postgres else 'mysql'
-    ok, msg = ensure_db_client_installed(server, client_type)
+    if (target_db.get('docker_container') or '').strip():
+        ok, msg = True, "using docker exec"
+    else:
+        ok, msg = ensure_db_client_installed(server, client_type)
     if not ok:
         return jsonify({'error': f'{client_type} client not available on jump server: {msg}'}), 400
 
@@ -3103,17 +3186,57 @@ def api_snapshot_restore_db(job_id, snapshot_id):
         db_port = int(target_db.get('port', default_port))
 
         # Build the import command based on DB type
-        if is_postgres:
+        # Check if the target DB uses docker exec
+        container = target_db.get('docker_container') or ''
+        use_docker = bool(container.strip())
+        safe_container = shlex.quote(container) if use_docker else ''
+
+        if use_docker:
+            # For docker-exec: leave import_cmd empty; detection + execution happens in the remote script body
+            import_cmd = None
+        elif is_postgres:
             if target_database:
                 import_cmd = f'PGPASSWORD={safe_db_pass} psql -h {safe_db_host} -p {db_port} -U {safe_db_user} -d {shlex.quote(target_database)}'
             else:
-                # No target DB specified - assume dump contains CREATE DATABASE or use postgres default
                 import_cmd = f'PGPASSWORD={safe_db_pass} psql -h {safe_db_host} -p {db_port} -U {safe_db_user} -d postgres'
         else:
             if target_database:
                 import_cmd = f'mysql -h {safe_db_host} -P {db_port} -u {safe_db_user} -p{safe_db_pass} {shlex.quote(target_database)}'
             else:
                 import_cmd = f'mysql -h {safe_db_host} -P {db_port} -u {safe_db_user} -p{safe_db_pass}'
+
+        if use_docker:
+            target_db_name_arg = shlex.quote(target_database) if target_database else '""'
+            import_block = f"""
+if docker ps >/dev/null 2>&1; then DOCKER="docker"; else DOCKER="sudo -n docker"; fi
+DETECTED=$($DOCKER exec {safe_container} sh -c "ps aux 2>/dev/null || ps 2>/dev/null" | tr '[:upper:]' '[:lower:]')
+TARGET_DB={target_db_name_arg}
+if echo "$DETECTED" | grep -qE "mysqld|mariadb"; then
+    echo "Detected MySQL/MariaDB in container"
+    if [ -n "$TARGET_DB" ]; then
+        zcat "$DUMP_FILE" | $DOCKER exec -i {safe_container} mysql "$TARGET_DB"
+    else
+        zcat "$DUMP_FILE" | $DOCKER exec -i {safe_container} mysql
+    fi
+elif echo "$DETECTED" | grep -q "postgres"; then
+    echo "Detected PostgreSQL in container"
+    if [ -n "$TARGET_DB" ]; then
+        zcat "$DUMP_FILE" | $DOCKER exec -i {safe_container} psql -U postgres -d "$TARGET_DB"
+    else
+        zcat "$DUMP_FILE" | $DOCKER exec -i {safe_container} psql -U postgres
+    fi
+else
+    echo "Could not detect database type in container {container}" >&2
+    exit 2
+fi
+IMPORT_EXIT=$?
+"""
+        else:
+            import_block = f"""
+echo "Importing into database..."
+zcat "$DUMP_FILE" | {import_cmd}
+IMPORT_EXIT=$?
+"""
 
         remote_cmd = f"""
 export PATH="$HOME/.local/bin:$PATH"
@@ -3141,9 +3264,7 @@ if [ -z "$DUMP_FILE" ]; then
 fi
 
 echo "Found dump: $DUMP_FILE"
-echo "Importing into database..."
-zcat "$DUMP_FILE" | {import_cmd}
-IMPORT_EXIT=$?
+{import_block}
 
 if [ $IMPORT_EXIT -ne 0 ]; then
     echo "Database import failed with exit code $IMPORT_EXIT"
@@ -4115,6 +4236,131 @@ def api_install_restic(server_id):
         return jsonify({'error': message}), 400
 
 
+@app.route('/api/servers/<server_id>/db-containers', methods=['GET'])
+@login_required
+def api_list_db_containers(server_id):
+    """List running database containers on a remote server via SSH.
+
+    Detects MySQL/MariaDB and PostgreSQL containers by running `docker ps`
+    and checking processes inside each container.
+    """
+    server = get_server(server_id)
+    if not server:
+        return jsonify({'error': 'Server not found'}), 404
+
+    if not server.get('host') or not server.get('ssh_user'):
+        return jsonify({'error': 'Server SSH configuration incomplete'}), 400
+
+    try:
+        ssh_cmd = _build_ssh_cmd_for_server(server, timeout=15)
+
+        # Use docker via direct call if possible, else sudo -n
+        remote_cmd = '''
+DOCKER=""
+for path in docker /usr/bin/docker /usr/local/bin/docker /snap/bin/docker; do
+    if command -v "$path" >/dev/null 2>&1 || [ -x "$path" ]; then
+        DOCKER=$(command -v "$path" 2>/dev/null || echo "$path")
+        break
+    fi
+done
+
+if [ -z "$DOCKER" ]; then
+    echo "DOCKER_NOT_FOUND"
+    exit 1
+fi
+
+if $DOCKER ps >/dev/null 2>&1; then
+    DOCKER_CMD="$DOCKER"
+elif sudo -n $DOCKER ps >/dev/null 2>&1; then
+    DOCKER_CMD="sudo -n $DOCKER"
+else
+    echo "DOCKER_NO_ACCESS"
+    $DOCKER ps 2>&1 >&2
+    sudo -n $DOCKER ps 2>&1 >&2
+    exit 1
+fi
+
+# List running containers + detect DB type
+# Use multiple signals: image name, /proc/1/comm, ps aux output, env vars
+for container in $($DOCKER_CMD ps --format '{{.Names}}'); do
+    image=$($DOCKER_CMD inspect --format='{{.Config.Image}}' "$container" 2>/dev/null || echo "unknown")
+    image_lc=$(echo "$image" | tr '[:upper:]' '[:lower:]')
+
+    # Signal 1: image name
+    db_type=""
+    case "$image_lc" in
+        *mysql*|*mariadb*|*percona*) db_type="mysql" ;;
+        *postgres*|*postgis*|*timescale*) db_type="postgres" ;;
+    esac
+
+    # Signal 2: /proc/1/comm (the main process name)
+    if [ -z "$db_type" ]; then
+        comm=$($DOCKER_CMD exec "$container" cat /proc/1/comm 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo "")
+        case "$comm" in
+            *mysqld*|*mariadb*) db_type="mysql" ;;
+            *postgres*|*postmaster*) db_type="postgres" ;;
+        esac
+    fi
+
+    # Signal 3: ps aux inside the container
+    if [ -z "$db_type" ]; then
+        procs=$($DOCKER_CMD exec "$container" sh -c "ps aux 2>/dev/null || ps 2>/dev/null" 2>/dev/null | tr '[:upper:]' '[:lower:]' || echo "")
+        if echo "$procs" | grep -qE "mysqld|mariadb"; then
+            db_type="mysql"
+        elif echo "$procs" | grep -q "postgres"; then
+            db_type="postgres"
+        fi
+    fi
+
+    if [ -n "$db_type" ]; then
+        echo "DB|$container|$db_type|$image"
+    fi
+done
+'''
+
+        result = subprocess.run(
+            ssh_cmd + [remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        output = (result.stdout or '').strip()
+        stderr = (result.stderr or '').strip()
+
+        if 'DOCKER_NOT_FOUND' in output:
+            return jsonify({'error': 'docker CLI not found on server', 'containers': []}), 400
+        if 'DOCKER_NO_ACCESS' in output:
+            debug = stderr[-500:] if stderr else ''
+            return jsonify({
+                'error': 'SSH user cannot access docker daemon (tried direct + sudo -n). Add the user to the docker group, or allow passwordless sudo for docker.',
+                'debug': debug,
+                'containers': []
+            }), 400
+
+        containers = []
+        for line in output.split('\n'):
+            line = line.strip()
+            if not line.startswith('DB|'):
+                continue
+            parts = line.split('|', 3)
+            if len(parts) < 4:
+                continue
+            _, name, db_type, image = parts
+            containers.append({
+                'name': name,
+                'type': db_type,
+                'image': image,
+            })
+
+        return jsonify({'containers': containers})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Listing containers timed out', 'containers': []}), 504
+    except Exception as e:
+        return jsonify({'error': str(e), 'containers': []}), 500
+
+
 @app.route('/api/servers/<server_id>/browse', methods=['GET'])
 @login_required
 def api_browse_server_directories(server_id):
@@ -4200,7 +4446,12 @@ def api_create_db_config_route():
     if not data:
         return jsonify({'error': 'No data provided'}), 400
 
-    required_fields = ['name', 'host', 'username', 'password']
+    # For docker-exec mode, only name + docker_container are required (auth happens via local socket inside the container)
+    # For direct mode, host/username/password are required
+    if (data.get('docker_container') or '').strip():
+        required_fields = ['name']
+    else:
+        required_fields = ['name', 'host', 'username', 'password']
     for field in required_fields:
         if not data.get(field):
             return jsonify({'error': f'{field} is required'}), 400
@@ -4209,11 +4460,12 @@ def api_create_db_config_route():
         'id': generate_id(),
         'name': data['name'],
         'type': data.get('type', 'mysql'),
-        'host': data['host'],
-        'port': int(data.get('port', 3306)),
-        'username': data['username'],
-        'password': data['password'],
-        'databases': data.get('databases', '*'),
+        'host': data.get('host') or '',
+        'port': int(data.get('port') or 3306),
+        'username': data.get('username') or '',
+        'password': data.get('password') or '',
+        'databases': data.get('databases') or '*',
+        'docker_container': data.get('docker_container') or None,
         'status': data.get('status', 'active'),
         'created_at': utc_isoformat(),
         'updated_at': utc_isoformat()
@@ -4248,6 +4500,7 @@ def api_update_db_config_route(config_id):
     config['port'] = int(data.get('port', config.get('port', 3306)))
     config['username'] = data.get('username', config['username'])
     config['databases'] = data.get('databases', config.get('databases', '*'))
+    config['docker_container'] = data.get('docker_container') if 'docker_container' in data else config.get('docker_container')
     config['status'] = data.get('status', config.get('status', 'active'))
 
     # Only update password if provided and not empty
@@ -4296,12 +4549,14 @@ def api_test_db_connection():
     db_port = int(data.get('port', default_port))
     db_user = data.get('username', '')
     db_pass = data.get('password', '')
+    docker_container = (data.get('docker_container') or '').strip()
+    use_docker = bool(docker_container)
 
     # Server config
     server_id = data.get('server_id', '')
 
-    if not all([db_host, db_user, db_pass]):
-        return jsonify({'error': 'Missing required database fields'}), 400
+    if not use_docker and (not db_user or not db_pass or not db_host):
+        return jsonify({'error': 'Host, username, and password are required'}), 400
 
     if not server_id:
         return jsonify({'error': 'Server selection required to test connection'}), 400
@@ -4311,23 +4566,37 @@ def api_test_db_connection():
     if not server:
         return jsonify({'error': 'Server not found'}), 400
 
-    # Ensure the right client is installed on the jump server
+    # Ensure the right client is installed on the jump server (skipped for docker exec)
     client_type = 'postgres' if is_postgres else 'mysql'
-    ok, msg = ensure_db_client_installed(server, client_type)
-    if not ok:
-        return jsonify({'error': f'{client_type} client not available on server: {msg}'}), 400
+    if not use_docker:
+        ok, msg = ensure_db_client_installed(server, client_type)
+        if not ok:
+            return jsonify({'error': f'{client_type} client not available on server: {msg}'}), 400
 
     try:
         # Escape all values for shell to prevent command injection
         escaped_host = shlex.quote(db_host)
         escaped_user = shlex.quote(db_user)
         escaped_pass = shlex.quote(db_pass)
+        escaped_container = shlex.quote(docker_container) if use_docker else ''
 
         # Build SSH command
         ssh_cmd = _build_ssh_cmd_for_server(server, timeout=10)
 
-        if is_postgres:
-            # Use psql to test connection
+        if use_docker:
+            # Pick direct docker or sudo -n docker, then auto-detect DB type and run SELECT 1
+            test_cmd = (
+                f'if docker ps >/dev/null 2>&1; then D="docker"; else D="sudo -n docker"; fi; '
+                f'DETECTED=$($D exec {escaped_container} sh -c "ps aux 2>/dev/null || ps 2>/dev/null" | tr "[:upper:]" "[:lower:]"); '
+                f'if echo "$DETECTED" | grep -qE "mysqld|mariadb"; then '
+                f'  $D exec {escaped_container} mysql -e "SELECT 1" 2>&1 && echo "OK: MySQL/MariaDB"; '
+                f'elif echo "$DETECTED" | grep -q "postgres"; then '
+                f'  $D exec {escaped_container} psql -U postgres -c "SELECT 1" 2>&1 && echo "OK: PostgreSQL"; '
+                f'else '
+                f'  echo "Could not detect database type in container"; exit 2; '
+                f'fi'
+            )
+        elif is_postgres:
             test_cmd = f"PGPASSWORD={escaped_pass} psql -h {escaped_host} -p {db_port} -U {escaped_user} -d postgres -c 'SELECT 1' 2>&1"
         else:
             test_cmd = f"mysql -h {escaped_host} -P {db_port} -u {escaped_user} -p{escaped_pass} -e 'SELECT 1' 2>&1"
