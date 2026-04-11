@@ -1,44 +1,66 @@
-# OS
-.DS_Store
-Thumbs.db
-
-# Environment
+# Environment files - NEVER commit these
 .env
-*.env.local
+.env.local
+.env.*.local
+*.env
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 .Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+# Python lib directories (not frontend/src/lib)
+/lib/
+lib64/
+!frontend/src/lib/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 venv/
 .venv/
-*.egg-info/
+ENV/
+
+# Testing
 .pytest_cache/
-
-# Node
-node_modules/
-npm-debug.log*
-
-# Build outputs
-dist/
-build/
-*.egg
+.coverage
+htmlcov/
+.tox/
+.nox/
 
 # IDE
-.idea/
 .vscode/
+.idea/
+.claude/
 *.swp
 *.swo
+*~
 
-# Database
-*.db
-*.sqlite
+# OS
+.DS_Store
+Thumbs.db
 
-# Logs
+# Application data (local development)
+data/*.db
+data/*.json
+logs/*.log
+config/*.yaml
+
+# Docker
 *.log
-logs/
 
-# Config (keep examples)
-config/*.json
-!config/*.example.json
+# Secrets - additional protection
+*.pem
+*.key
+credentials.json
+secrets.yaml

@@ -8,66 +8,68 @@ BackupX is an enterprise backup management system with a Flask backend and React
 
 ## Commands
 
-All commands use `./run.sh` from the project root:
+BackupX runs as a Docker Compose stack. From the repo root:
 
 ```bash
-# Development
-./run.sh server:dev          # Start server with hot reload
+# Start / stop
+docker compose up -d           # Start (uses bridge network)
+docker compose up -d --build   # Rebuild after code changes
+docker compose down            # Stop and remove containers
+docker compose logs -f         # Tail logs
 
-# Production
-./run.sh server:start        # Start server (gunicorn, 4 workers)
-./run.sh server:stop         # Stop server
-./run.sh server:status       # Check server status
-
-# Testing
-./run.sh test                           # Run all tests
-./run.sh test:cov                       # Run tests with coverage
-./run.sh test tests/test_security.py    # Run specific test file
-./run.sh test tests/test_security.py::TestAuthentication::test_login_success  # Run single test
-
-# Other
-./run.sh install             # Install all dependencies
-./run.sh check               # Pre-deployment checks (Python version, env, deps, tests)
-./run.sh logs server         # Tail logs
+# Linux/production with host networking (for LAN access)
+docker compose -f docker-compose.yml -f docker-compose.host.yml up -d
 ```
 
-Frontend build (from `backupx-server/frontend/`):
+Frontend development (from `frontend/`):
 ```bash
-npm run dev      # Development server
+npm run dev      # Vite dev server
 npm run build    # Production build
 npm run lint     # ESLint
+```
+
+Backend tests (requires local Python env):
+```bash
+pytest                                  # Run all tests
+pytest tests/test_security.py           # Run specific file
+pytest tests/test_security.py::TestAuthentication::test_login_success
 ```
 
 ## Architecture
 
 ### SSH-Only Design
-- **Server** (`backupx-server/`): Flask app with React UI, job scheduling, and configuration storage
+- Single Flask + React app, packaged as one Docker image
+- Sidecar PostgreSQL container for persistent config/history/audit storage
 - All remote operations use SSH — no agents to install or maintain on target servers
 - Restic is auto-provisioned on remote servers when they are added (downloads static binary via SSH)
 
-### Server Structure (`backupx-server/`)
-- `app/main.py` - Monolithic Flask app containing all REST API routes (~40 endpoints under `/api/*`)
+### Project Structure
+- `app/main.py` - Monolithic Flask app containing all REST API routes (`/api/*`)
 - `app/db/` - Database abstraction layer (PostgreSQL)
   - `base.py` - Abstract `DatabaseBackend` interface
   - `postgres.py` - PostgreSQL implementation with connection pooling
-  - `factory.py` - `create_database_backend()` factory function
+  - `factory.py` - `create_database_backend()` factory
   - `migrate.py` - Schema migrations
-- `app/audit/` - Audit logging with `@audit_log` decorator
+- `app/audit/` - Audit logging
 - `app/scheduler/distributed.py` - APScheduler with database-backed distributed coordination
-- `app/session.py` - Session management (filesystem or Redis backends)
+- `app/session.py` - Session management (filesystem or Redis)
 - `frontend/` - React + TypeScript + Vite + Radix UI + Tailwind
 - `tests/` - Pytest test suite
+- `Dockerfile` - Multi-stage build (Node for frontend, Python for backend)
+- `docker-compose.yml` - Main stack (backup-ui + postgres)
+- `docker-compose.host.yml` - Override for Linux host networking
 
 ### Key Patterns
-- **Database**: Abstract factory pattern - all DB operations go through `DatabaseBackend` interface
-- **Audit**: Decorator pattern - use `@audit_log` to track operations with automatic sensitive field redaction
-- **Sessions**: Strategy pattern - filesystem (default) or Redis for horizontal scaling
+- **Database**: Factory pattern — all DB operations go through `DatabaseBackend` interface
+- **SSH auth**: Three modes supported — key file path, pasted/uploaded key content, password (via `sshpass`). Sensitive values encrypted with Fernet
+- **Sessions**: Strategy pattern — filesystem (default) or Redis for horizontal scaling
 - **Scheduler**: Hybrid APScheduler + database for distributed deployments with leader election
-- **Restic provisioning**: Auto-install via SSH on server add/update, with in-memory cache and pre-backup safety check
+- **Restic provisioning**: Auto-install via SSH on server add/update. Falls back to `~/.local/bin` if `/usr/local/bin` isn't writable
+- **Snapshot caching**: In-memory TTL cache (60s for snapshot lists, 5m for repo stats) to avoid repeated S3 queries
 
 ### Data Flow
 1. React UI calls Flask REST API (`/api/*`)
-2. Flask stores job config in database with encrypted credentials (AES-256 via Fernet)
+2. Flask stores job config in PostgreSQL with encrypted credentials (AES-256 via Fernet)
 3. APScheduler triggers jobs at scheduled times
 4. Jobs execute via SSH to remote servers (restic auto-provisioned if missing)
 5. Remote servers run Restic backups to S3 storage
@@ -78,13 +80,15 @@ npm run lint     # ESLint
 **Backend**: Flask 3.0, APScheduler, PostgreSQL, Redis (optional), Gunicorn
 **Frontend**: React 19, TypeScript, Vite, Radix UI, Tailwind CSS, React Hook Form + Zod
 **Backup Engine**: Restic with S3-compatible storage
-**External Tools**: mysqldump, pg_dump (for database backups)
+**External Tools**: `ssh`, `sshpass`, `mysqldump`, `pg_dump`
 
 ## Environment Configuration
 
-Server config: `backupx-server/.env` (see `.env.example`)
+App config: `.env` (see `.env.example`)
 
 Key variables:
-- `SECRET_KEY` - Encryption key (min 32 chars, required)
-- `DATABASE_HOST`, `DATABASE_USER`, `DATABASE_PASSWORD` - PostgreSQL connection
-- `SESSION_TYPE` - `filesystem` or `redis`
+- `SECRET_KEY` — Encryption key for stored credentials (min 32 chars, required)
+- `ADMIN_USERNAME` / `ADMIN_PASSWORD` — Initial admin login (password min 12 chars in production)
+- `DATABASE_PASSWORD` — Shared between app and postgres container
+- `LISTEN_PORT` — Port gunicorn binds to (default 9090)
+- `SESSION_TYPE` — `filesystem` (default) or `redis`

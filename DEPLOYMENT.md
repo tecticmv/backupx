@@ -28,7 +28,7 @@ nano .env
 docker compose up -d
 ```
 
-Access the web interface at `http://your-server-ip:8088`
+Access the web interface at `http://your-server-ip:9090`
 
 ## Configuration
 
@@ -93,7 +93,7 @@ sudo apt update && sudo apt upgrade -y
 
 # Configure firewall
 sudo ufw allow 22/tcp      # SSH
-sudo ufw allow 8088/tcp    # BackupX (or your chosen port)
+sudo ufw allow 9090/tcp    # BackupX (or your chosen port)
 sudo ufw enable
 ```
 
@@ -110,7 +110,7 @@ services:
     container_name: backup-ui
     restart: unless-stopped
     ports:
-      - "8088:5000"  # Change port if needed
+      - "9090:9090"  # Change port if needed
     volumes:
       - ./config:/app/config
       - ./logs:/app/logs
@@ -124,7 +124,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TZ=${TZ:-UTC}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -152,7 +152,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/backupx.yourdomain.com/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:8088;
+        proxy_pass http://127.0.0.1:9090;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -223,139 +223,17 @@ BackupX supports two methods to connect to remote servers:
 
 Requires SSH key authentication from the BackupX server to remote servers.
 
-**Pros:**
-- No additional software on remote servers (only restic required)
-- Works with existing SSH infrastructure
+**How it works:**
+- BackupX connects to each remote server via SSH using key or password authentication
+- Restic is auto-installed on the remote server on first connection (falls back to `~/.local/bin` if `/usr/local/bin` is not writable)
+- Backups run on the remote server and stream directly to S3
+- No extra software to install or maintain on target servers — just SSH access
 
-**Cons:**
-- Requires SSH key management
-- BackupX server needs network access to remote SSH ports
-- Some cloud environments restrict SSH access
-
-### Method 2: BackupX Agent (Recommended)
-
-Deploy a lightweight agent on remote servers that communicates with the main BackupX server via HTTP API.
-
-**Pros:**
-- No SSH key management required
-- Agent handles backup execution locally
-- Better for cloud/containerized environments
-- API key authentication
-
-**Cons:**
-- Requires deploying agent on each remote server
-
-## Deploying BackupX Agent
-
-Deploy the agent on each remote server you want to backup.
-
-### Agent Quick Start
-
-```bash
-# On each remote server
-cd /opt
-git clone https://github.com/SaiphMuhammad/backupx.git
-cd backupx/agent
-
-# Create environment file
-cp .env.example .env
-
-# Generate API key
-API_KEY=$(openssl rand -hex 32)
-echo "AGENT_API_KEY=$API_KEY" >> .env
-echo "AGENT_NAME=my-server-$(hostname)" >> .env
-
-# Optional: Restrict backup paths
-echo "ALLOWED_PATHS=/var/www,/home,/etc" >> .env
-
-# Start the agent
-docker compose up -d
-```
-
-### Agent Configuration
-
-Edit `/opt/backupx/agent/.env`:
-
-```bash
-# REQUIRED: API key (must match in BackupX UI)
-AGENT_API_KEY=your-secure-api-key-here
-
-# Agent name (displayed in BackupX UI)
-AGENT_NAME=production-server
-
-# Logging level
-LOG_LEVEL=INFO
-
-# Restrict backup paths (optional, comma-separated)
-# Leave empty to allow all mounted paths
-ALLOWED_PATHS=/var/www,/home,/etc,/opt
-```
-
-### Agent Docker Compose
-
-```yaml
-version: "3.8"
-
-services:
-  backupx-agent:
-    build: .
-    container_name: backupx-agent
-    restart: unless-stopped
-    ports:
-      - "8090:8090"
-    volumes:
-      # Mount paths you want to backup
-      - /var/www:/data/www:ro
-      - /home:/data/home:ro
-      - /etc:/data/etc:ro
-    environment:
-      - AGENT_API_KEY=${AGENT_API_KEY}
-      - AGENT_NAME=${AGENT_NAME:-server-agent}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - ALLOWED_PATHS=${ALLOWED_PATHS:-}
-```
-
-### Adding Agent Server in BackupX UI
-
-1. Go to **Configuration > Servers**
-2. Click **Add Server**
-3. Select **Connection Type: BackupX Agent**
-4. Enter:
-   - **Name**: Descriptive server name
-   - **Host**: Remote server IP or hostname
-   - **Agent Port**: 8090 (default)
-   - **Agent API Key**: The key from agent's `.env` file
-5. Click **Test Connection** to verify
-6. Click **Save**
-
-### Agent Security
-
-1. **Firewall Rules**:
-   ```bash
-   # Only allow BackupX server to connect
-   sudo ufw allow from BACKUPX_SERVER_IP to any port 8090
-   ```
-
-2. **Use Strong API Keys**:
-   ```bash
-   openssl rand -hex 32
-   ```
-
-3. **Restrict Paths**: Configure `ALLOWED_PATHS` to limit what directories can be backed up
-
-4. **Network Isolation**: Consider placing agent on internal network only accessible by BackupX server
-
-### Agent Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check (no auth) |
-| `/info` | GET | Agent information |
-| `/backup/filesystem` | POST | Run filesystem backup |
-| `/backup/database` | POST | Run MySQL backup |
-| `/snapshots` | POST | List snapshots |
-| `/stats` | POST | Repository stats |
-| `/init` | POST | Initialize repository |
+**Prerequisites on remote servers:**
+- SSH access with key or password
+- `curl`, `bunzip2` (for restic auto-install)
+- `mysqldump` if backing up MySQL databases
+- Outbound HTTPS to your S3 endpoint
 
 ## Remote Server Requirements (SSH Method)
 
@@ -430,7 +308,7 @@ docker compose up -d
 ### Health Check
 
 ```bash
-curl http://localhost:8088/health
+curl http://localhost:9090/health
 ```
 
 ### View Logs
