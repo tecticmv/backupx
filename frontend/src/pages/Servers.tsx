@@ -64,7 +64,7 @@ const initialServerFormData: ServerFormData = {
   ssh_port: 22,
   ssh_user: "root",
   ssh_key: "/home/backupx/.ssh/id_rsa",
-  ssh_auth_type: "key_path",
+  ssh_auth_type: "key_content",
   ssh_password: "",
   ssh_key_content: "",
   status: "active",
@@ -240,7 +240,10 @@ export default function Servers() {
       const response = await fetch("/api/servers/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(formData),
+        body: JSON.stringify({
+          ...formData,
+          id: editingServer?.id,
+        }),
       });
 
       const data = await response.json();

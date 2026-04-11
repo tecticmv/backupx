@@ -33,7 +33,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { toast } from "sonner";
-import type { DatabaseConfig } from "@/types/database";
+import type { DatabaseConfig, DatabaseType } from "@/types/database";
 import type { Server } from "@/types/server";
 import {
   Plus,
@@ -47,7 +47,7 @@ import {
 
 interface DatabaseFormData {
   name: string;
-  type: "mysql";
+  type: DatabaseType;
   host: string;
   port: number;
   username: string;
@@ -383,11 +383,32 @@ export default function Databases() {
                 <Input
                   id="name"
                   name="name"
-                  placeholder="Production MySQL"
+                  placeholder="Production DB"
                   value={formData.name}
                   onChange={handleInputChange}
                   required
                 />
+              </div>
+              <div className="grid gap-2">
+                <Label>Database Type</Label>
+                <Select
+                  value={formData.type}
+                  onValueChange={(value: DatabaseType) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      type: value,
+                      port: value === "postgres" ? 5432 : 3306,
+                    }))
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="mysql">MySQL / MariaDB</SelectItem>
+                    <SelectItem value="postgres">PostgreSQL</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="grid gap-2">

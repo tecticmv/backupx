@@ -1555,13 +1555,16 @@ def _build_ssh_cmd(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_r
         '-o', 'ServerAliveCountMax=5',
     ]
 
-    if ssh_auth_type == 'password' and ssh_password:
+    if ssh_auth_type == 'password':
+        if not ssh_password:
+            raise ValueError("Password authentication selected but no password provided")
         # Use sshpass for password authentication
         return [
             'sshpass', '-p', ssh_password,
             'ssh',
             *base_opts,
             '-o', 'PubkeyAuthentication=no',
+            '-o', 'PreferredAuthentications=password',
             f'{ssh_user}@{host}'
         ]
     else:
@@ -1650,6 +1653,112 @@ rmdir "$TMPDIR" 2>/dev/null || true
 echo "RESTIC_INSTALLED"
 restic version
 """ % RESTIC_VERSION
+
+
+# Cache of servers where DB clients are confirmed installed
+_db_client_confirmed = {}  # cache_key -> set of installed client types ('mysql', 'postgres')
+
+# Script to check for and install mysqldump / pg_dump using the system package manager
+DB_CLIENT_INSTALL_SCRIPT = """
+set -e
+CLIENT_TYPE="%s"
+
+check_binary() {
+    case "$CLIENT_TYPE" in
+        mysql)    command -v mysqldump >/dev/null 2>&1 ;;
+        postgres) command -v pg_dump >/dev/null 2>&1 ;;
+    esac
+}
+
+if check_binary; then
+    echo "DB_CLIENT_ALREADY_INSTALLED"
+    exit 0
+fi
+
+# Detect package manager and install
+install_with() {
+    PKG_MGR="$1"
+    case "$CLIENT_TYPE:$PKG_MGR" in
+        mysql:apt)     sudo -n apt-get update -qq && sudo -n apt-get install -y --no-install-recommends mariadb-client 2>/dev/null || sudo -n apt-get install -y --no-install-recommends default-mysql-client ;;
+        mysql:dnf)     sudo -n dnf install -y mariadb 2>/dev/null || sudo -n dnf install -y mysql ;;
+        mysql:yum)     sudo -n yum install -y mariadb 2>/dev/null || sudo -n yum install -y mysql ;;
+        mysql:apk)     sudo -n apk add --no-cache mariadb-client 2>/dev/null || sudo -n apk add --no-cache mysql-client ;;
+        postgres:apt)  sudo -n apt-get update -qq && sudo -n apt-get install -y --no-install-recommends postgresql-client ;;
+        postgres:dnf)  sudo -n dnf install -y postgresql ;;
+        postgres:yum)  sudo -n yum install -y postgresql ;;
+        postgres:apk)  sudo -n apk add --no-cache postgresql-client ;;
+        *) return 1 ;;
+    esac
+}
+
+for pm in apt dnf yum apk; do
+    if command -v "$pm" >/dev/null 2>&1 || command -v "$pm-get" >/dev/null 2>&1; then
+        if [ "$pm" = "apt" ]; then pm_cmd="apt-get"; else pm_cmd="$pm"; fi
+        if command -v "$pm_cmd" >/dev/null 2>&1; then
+            echo "DB_CLIENT_INSTALLING with $pm"
+            if install_with "$pm"; then
+                if check_binary; then
+                    echo "DB_CLIENT_INSTALLED"
+                    exit 0
+                fi
+            fi
+            echo "DB_CLIENT_INSTALL_FAILED with $pm"
+            exit 1
+        fi
+    fi
+done
+
+echo "DB_CLIENT_NO_PACKAGE_MANAGER"
+exit 1
+"""
+
+
+def ensure_db_client_installed(server, client_type):
+    """Ensure mysqldump or pg_dump is installed on a remote server. Returns (success, message)."""
+    if client_type not in ('mysql', 'postgres'):
+        return False, f"Unknown client type: {client_type}"
+
+    host = server.get('host', '')
+    ssh_user = server.get('ssh_user', '')
+    ssh_port = int(server.get('ssh_port') or 22)
+
+    cache_key = f"{ssh_user}@{host}:{ssh_port}"
+    if cache_key in _db_client_confirmed and client_type in _db_client_confirmed[cache_key]:
+        return True, f"{client_type} client already confirmed"
+
+    ssh_cmd = _build_ssh_cmd_for_server(server, timeout=30)
+    script = DB_CLIENT_INSTALL_SCRIPT % client_type
+
+    try:
+        result = subprocess.run(
+            ssh_cmd + [script],
+            capture_output=True,
+            text=True,
+            timeout=180
+        )
+
+        output = result.stdout.strip()
+
+        if result.returncode == 0:
+            _db_client_confirmed.setdefault(cache_key, set()).add(client_type)
+            if 'DB_CLIENT_ALREADY_INSTALLED' in output:
+                logger.info(f"{client_type} client already installed on {cache_key}")
+                return True, f"{client_type} client already installed"
+            elif 'DB_CLIENT_INSTALLED' in output:
+                logger.info(f"{client_type} client installed on {cache_key}")
+                return True, f"{client_type} client installed"
+            return True, output
+
+        error = result.stderr.strip() or output
+        if 'DB_CLIENT_NO_PACKAGE_MANAGER' in output:
+            return False, f"No supported package manager found on {host}"
+        logger.warning(f"Failed to install {client_type} client on {cache_key}: {error}")
+        return False, f"Failed to install {client_type} client (may need sudo): {sanitize_error_message(error)}"
+
+    except subprocess.TimeoutExpired:
+        return False, f"{client_type} client installation timed out"
+    except Exception as e:
+        return False, f"Error installing {client_type} client: {sanitize_error_message(str(e))}"
 
 
 def ensure_restic_installed(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_rsa', ssh_auth_type='key_path', ssh_password=None):
@@ -1811,6 +1920,15 @@ def run_database_backup(job_id, job):
         if not db_config:
             raise Exception("Database configuration not found")
 
+        # Auto-install database client if missing
+        if server:
+            db_type = db_config.get('type', 'mysql')
+            client_type = 'postgres' if db_type in ('postgres', 'postgresql') else 'mysql'
+            update_job_progress(job_id, 15, f'Checking {client_type} client on remote server...')
+            ok, msg = ensure_db_client_installed(server, client_type)
+            if not ok:
+                raise Exception(f"{client_type} client not available on remote server: {msg}")
+
         # Build SSH command to run on remote server
         if server:
             ssh_cmd = _build_ssh_cmd_for_server(server, timeout=30)
@@ -1830,18 +1948,45 @@ def run_database_backup(job_id, job):
             db_list = [shlex.quote(db.strip()) for db in databases.split(',') if db.strip()]
             db_flag = '--databases ' + ' '.join(db_list)
 
+        # Determine db type
+        db_type = db_config.get('type', 'mysql')
+        is_postgres = db_type in ('postgres', 'postgresql')
+
         # Generate backup filename with timestamp
         timestamp = utc_now().strftime('%Y%m%d_%H%M%S')
-        backup_filename = f"mysql_backup_{timestamp}.sql.gz"
+        prefix = 'pg' if is_postgres else 'mysql'
+        backup_filename = f"{prefix}_backup_{timestamp}.sql.gz"
 
         # Escape all values for shell
         s3_access_key = shlex.quote(job['s3_access_key'])
         s3_secret_key = shlex.quote(job['s3_secret_key'])
         restic_password = shlex.quote(job['restic_password'])
         db_host = shlex.quote(db_config['host'])
-        db_port = int(db_config.get('port', 3306))
+        default_port = 5432 if is_postgres else 3306
+        db_port = int(db_config.get('port', default_port))
         db_user = shlex.quote(db_config['username'])
         db_pass = shlex.quote(db_config['password'])
+
+        # Build the dump command based on db type
+        if is_postgres:
+            # pg_dump uses PGPASSWORD env var; --dbname="*" not supported so we dump each
+            if databases == '*':
+                # pg_dumpall for all databases (includes roles/globals)
+                dump_cmd = f'PGPASSWORD={db_pass} pg_dumpall -h {db_host} -p {db_port} -U {db_user}'
+            else:
+                db_list_raw = [db.strip() for db in databases.split(',') if db.strip()]
+                if len(db_list_raw) == 1:
+                    dump_cmd = f'PGPASSWORD={db_pass} pg_dump -h {db_host} -p {db_port} -U {db_user} {shlex.quote(db_list_raw[0])}'
+                else:
+                    # Multiple databases: loop and concat
+                    dump_parts = [f'PGPASSWORD={db_pass} pg_dump -h {db_host} -p {db_port} -U {db_user} {shlex.quote(db)}' for db in db_list_raw]
+                    dump_cmd = ' && echo "-- NEXT DB --" && '.join(dump_parts)
+            backup_tag = 'postgres-backup'
+            dump_error_msg = 'pg_dump failed'
+        else:
+            dump_cmd = f'mysqldump -h {db_host} -P {db_port} -u {db_user} -p{db_pass} {db_flag} --single-transaction --routines --triggers'
+            backup_tag = 'mysql-backup'
+            dump_error_msg = 'mysqldump failed'
 
         # Build remote command with proper escaping
         insecure_flag = '--insecure-tls' if job.get('skip_ssl_verify') else ''
@@ -1856,17 +2001,17 @@ export RESTIC_REPOSITORY="s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{jo
 BACKUP_DIR=$(mktemp -d)
 BACKUP_FILE="$BACKUP_DIR/{backup_filename}"
 
-# Dump MySQL database
-mysqldump -h {db_host} -P {db_port} -u {db_user} -p{db_pass} {db_flag} --single-transaction --routines --triggers | gzip > "$BACKUP_FILE"
+# Dump database
+( {dump_cmd} ) | gzip > "$BACKUP_FILE"
 
 if [ $? -ne 0 ]; then
-    echo "mysqldump failed"
+    echo "{dump_error_msg}"
     rm -rf "$BACKUP_DIR"
     exit 1
 fi
 
 # Backup to restic repository
-restic backup --compression auto --tag automated --tag mysql-backup {insecure_flag} "$BACKUP_FILE"
+restic backup --compression auto --tag automated --tag {backup_tag} {insecure_flag} "$BACKUP_FILE"
 RESTIC_EXIT=$?
 
 # Cleanup
@@ -2889,6 +3034,152 @@ mkdir -p {safe_target}
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/restore-db', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_snapshot_restore_db(job_id, snapshot_id):
+    """Restore a database dump from a snapshot back into a database.
+
+    Steps:
+    1. Restore the snapshot's .sql.gz file to a temp dir on the jump server
+    2. Locate the dump file (it's nested in the original temp path)
+    3. Pipe it through zcat into mysql/psql against the target DB
+    4. Clean up the temp dir
+    """
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+
+    if job.get('backup_type') != 'database':
+        return jsonify({'error': 'Job is not a database backup'}), 400
+
+    data = request.get_json() or {}
+    # Allow overriding the target DB config, default to the job's configured one
+    target_db_config_id = data.get('db_config_id') or job.get('database_config_id')
+    target_database = data.get('target_database', '')  # Optional: restore into a specific DB name
+
+    if not target_db_config_id:
+        return jsonify({'error': 'No target database configuration'}), 400
+
+    target_db = get_db_config(target_db_config_id)
+    if not target_db:
+        return jsonify({'error': 'Target database config not found'}), 404
+
+    # Get server for SSH
+    server_id = job.get('server_id')
+    if not server_id:
+        return jsonify({'error': 'Job has no associated server'}), 400
+
+    server = get_server(server_id)
+    if not server:
+        return jsonify({'error': 'Server not found'}), 404
+
+    # Ensure DB client is installed
+    db_type = target_db.get('type', 'mysql')
+    is_postgres = db_type in ('postgres', 'postgresql')
+    client_type = 'postgres' if is_postgres else 'mysql'
+    ok, msg = ensure_db_client_installed(server, client_type)
+    if not ok:
+        return jsonify({'error': f'{client_type} client not available on jump server: {msg}'}), 400
+
+    # Get skip_ssl_verify
+    s3_config_id = job.get('s3_config_id')
+    skip_ssl_verify = False
+    if s3_config_id:
+        s3_config = get_s3_config(s3_config_id)
+        if s3_config:
+            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+
+    try:
+        repo = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+        insecure_flag = ' --insecure-tls' if skip_ssl_verify else ''
+
+        # Escape values
+        safe_snapshot = shlex.quote(snapshot_id)
+        safe_db_host = shlex.quote(target_db['host'])
+        safe_db_user = shlex.quote(target_db['username'])
+        safe_db_pass = shlex.quote(target_db['password'])
+        default_port = 5432 if is_postgres else 3306
+        db_port = int(target_db.get('port', default_port))
+
+        # Build the import command based on DB type
+        if is_postgres:
+            if target_database:
+                import_cmd = f'PGPASSWORD={safe_db_pass} psql -h {safe_db_host} -p {db_port} -U {safe_db_user} -d {shlex.quote(target_database)}'
+            else:
+                # No target DB specified - assume dump contains CREATE DATABASE or use postgres default
+                import_cmd = f'PGPASSWORD={safe_db_pass} psql -h {safe_db_host} -p {db_port} -U {safe_db_user} -d postgres'
+        else:
+            if target_database:
+                import_cmd = f'mysql -h {safe_db_host} -P {db_port} -u {safe_db_user} -p{safe_db_pass} {shlex.quote(target_database)}'
+            else:
+                import_cmd = f'mysql -h {safe_db_host} -P {db_port} -u {safe_db_user} -p{safe_db_pass}'
+
+        remote_cmd = f"""
+export PATH="$HOME/.local/bin:$PATH"
+export AWS_ACCESS_KEY_ID={shlex.quote(job['s3_access_key'])}
+export AWS_SECRET_ACCESS_KEY={shlex.quote(job['s3_secret_key'])}
+export RESTIC_PASSWORD={shlex.quote(job['restic_password'])}
+export RESTIC_REPOSITORY={shlex.quote(repo)}
+
+RESTORE_DIR=$(mktemp -d)
+trap 'rm -rf "$RESTORE_DIR"' EXIT
+
+echo "Restoring snapshot {safe_snapshot} from repository..."
+restic restore {safe_snapshot} --target "$RESTORE_DIR"{insecure_flag}
+if [ $? -ne 0 ]; then
+    echo "Failed to restore snapshot from restic"
+    exit 1
+fi
+
+# Find the .sql.gz file - restic restores with original paths
+DUMP_FILE=$(find "$RESTORE_DIR" -name "*.sql.gz" -type f | head -1)
+if [ -z "$DUMP_FILE" ]; then
+    echo "No .sql.gz dump file found in snapshot"
+    find "$RESTORE_DIR" -type f
+    exit 1
+fi
+
+echo "Found dump: $DUMP_FILE"
+echo "Importing into database..."
+zcat "$DUMP_FILE" | {import_cmd}
+IMPORT_EXIT=$?
+
+if [ $IMPORT_EXIT -ne 0 ]; then
+    echo "Database import failed with exit code $IMPORT_EXIT"
+    exit $IMPORT_EXIT
+fi
+
+echo "Database restore completed successfully"
+"""
+
+        ssh_cmd = _build_ssh_cmd_for_server(server, timeout=30)
+
+        result = subprocess.run(
+            ssh_cmd + [remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=3600  # 1 hour for DB restore
+        )
+
+        if result.returncode != 0:
+            error = sanitize_error_message(result.stderr or result.stdout or 'Database restore failed')
+            logger.error(f"DB restore failed for job {job_id}: {error}")
+            return jsonify({'error': error, 'output': result.stdout}), 400
+
+        return jsonify({
+            'success': True,
+            'message': 'Database restored successfully',
+            'output': result.stdout
+        })
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Database restore timed out'}), 400
+    except Exception as e:
+        logger.exception("Database restore error")
+        return jsonify({'error': sanitize_error_message(str(e))}), 500
+
+
 @app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/download-zip')
 @login_required
 def api_snapshot_download_zip(job_id, snapshot_id):
@@ -3688,8 +3979,26 @@ def api_test_server_connection():
     if not ssh_user:
         return jsonify({'error': 'SSH user is required'}), 400
 
+    # For edits: if password/key_content is blank, fall back to stored values
+    existing_server_id = data.get('id', '')
+    if existing_server_id:
+        existing = get_server(existing_server_id)
+        if existing:
+            if ssh_auth_type == 'password' and not ssh_password:
+                stored_pw = existing.get('ssh_password', '')
+                if stored_pw and is_encrypted(stored_pw):
+                    ssh_password = decrypt_credential(stored_pw)
+                else:
+                    ssh_password = stored_pw
+            if ssh_auth_type == 'key_content' and not data.get('ssh_key_content'):
+                stored_key = existing.get('ssh_key_content', '')
+                if stored_key and is_encrypted(stored_key):
+                    stored_key = decrypt_credential(stored_key)
+                if stored_key:
+                    ssh_key = _write_server_key_file(existing_server_id, stored_key)
+
     # Handle key_content: write to temp file
-    if ssh_auth_type == 'key_content':
+    if ssh_auth_type == 'key_content' and not existing_server_id:
         key_content = data.get('ssh_key_content', '')
         if key_content:
             ssh_key = _write_server_key_file('test_connection', key_content)
@@ -3971,15 +4280,20 @@ def api_delete_db_config_route(config_id):
 @login_required
 @csrf.exempt
 def api_test_db_connection():
-    """Test MySQL database connection via SSH"""
+    """Test database connection via SSH (MySQL or PostgreSQL)"""
     data = request.get_json()
 
     if not data:
         return jsonify({'error': 'No data provided'}), 400
 
+    # Determine db type
+    db_type = data.get('type', 'mysql')
+    is_postgres = db_type in ('postgres', 'postgresql')
+    default_port = 5432 if is_postgres else 3306
+
     # Database config
     db_host = data.get('host', '')
-    db_port = int(data.get('port', 3306))
+    db_port = int(data.get('port', default_port))
     db_user = data.get('username', '')
     db_pass = data.get('password', '')
 
@@ -3997,20 +4311,28 @@ def api_test_db_connection():
     if not server:
         return jsonify({'error': 'Server not found'}), 400
 
+    # Ensure the right client is installed on the jump server
+    client_type = 'postgres' if is_postgres else 'mysql'
+    ok, msg = ensure_db_client_installed(server, client_type)
+    if not ok:
+        return jsonify({'error': f'{client_type} client not available on server: {msg}'}), 400
+
     try:
         # Escape all values for shell to prevent command injection
         escaped_host = shlex.quote(db_host)
         escaped_user = shlex.quote(db_user)
         escaped_pass = shlex.quote(db_pass)
 
-        # Build SSH command to test MySQL connection
-        ssh_cmd = _build_ssh_cmd(
-            server['host'], server['ssh_user'],
-            int(server.get('ssh_port') or 22),
-            server.get('ssh_key') or '/home/backupx/.ssh/id_rsa',
-            timeout=10
-        )
-        ssh_cmd.append(f"mysql -h {escaped_host} -P {db_port} -u {escaped_user} -p{escaped_pass} -e 'SELECT 1' 2>&1")
+        # Build SSH command
+        ssh_cmd = _build_ssh_cmd_for_server(server, timeout=10)
+
+        if is_postgres:
+            # Use psql to test connection
+            test_cmd = f"PGPASSWORD={escaped_pass} psql -h {escaped_host} -p {db_port} -U {escaped_user} -d postgres -c 'SELECT 1' 2>&1"
+        else:
+            test_cmd = f"mysql -h {escaped_host} -P {db_port} -u {escaped_user} -p{escaped_pass} -e 'SELECT 1' 2>&1"
+
+        ssh_cmd.append(test_cmd)
 
         result = subprocess.run(
             ssh_cmd,

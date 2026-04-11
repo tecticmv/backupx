@@ -49,6 +49,8 @@ import {
   MoreHorizontal,
   RotateCcw,
   Archive,
+  Database,
+  AlertTriangle,
 } from "lucide-react";
 
 export default function Snapshots() {
@@ -66,6 +68,13 @@ export default function Snapshots() {
   const [restoreSnapshot, setRestoreSnapshot] = useState<Snapshot | null>(null);
   const [targetPath, setTargetPath] = useState("/");
   const [isRestoring, setIsRestoring] = useState(false);
+
+  // Database restore dialog state
+  const [dbRestoreDialogOpen, setDbRestoreDialogOpen] = useState(false);
+  const [dbRestoreSnapshot, setDbRestoreSnapshot] = useState<Snapshot | null>(null);
+  const [targetDatabase, setTargetDatabase] = useState("");
+  const [confirmText, setConfirmText] = useState("");
+  const [isDbRestoring, setIsDbRestoring] = useState(false);
 
   // Download ZIP state
   const [downloadingZip, setDownloadingZip] = useState<string | null>(null);
@@ -130,6 +139,44 @@ export default function Snapshots() {
     setRestoreSnapshot(snapshot);
     setTargetPath("/");
     setRestoreDialogOpen(true);
+  };
+
+  const openDbRestoreDialog = (snapshot: Snapshot) => {
+    setDbRestoreSnapshot(snapshot);
+    setTargetDatabase("");
+    setConfirmText("");
+    setDbRestoreDialogOpen(true);
+  };
+
+  const handleDbRestore = async () => {
+    if (!dbRestoreSnapshot) return;
+
+    setIsDbRestoring(true);
+    try {
+      const response = await fetch(
+        `/api/jobs/${jobId}/snapshots/${dbRestoreSnapshot.id}/restore-db`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            target_database: targetDatabase || undefined,
+          }),
+        }
+      );
+
+      const data = await response.json();
+
+      if (response.ok) {
+        toast.success(data.message || "Database restored successfully");
+        setDbRestoreDialogOpen(false);
+      } else {
+        toast.error(data.error || "Database restore failed");
+      }
+    } catch {
+      toast.error("Database restore failed");
+    } finally {
+      setIsDbRestoring(false);
+    }
   };
 
   const handleRestore = async () => {
@@ -395,10 +442,17 @@ export default function Snapshots() {
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
-                            <DropdownMenuItem onClick={() => openRestoreDialog(snapshot)}>
-                              <RotateCcw className="h-4 w-4 mr-2" />
-                              Restore to server
-                            </DropdownMenuItem>
+                            {job?.backup_type === "database" ? (
+                              <DropdownMenuItem onClick={() => openDbRestoreDialog(snapshot)}>
+                                <Database className="h-4 w-4 mr-2" />
+                                Restore into database
+                              </DropdownMenuItem>
+                            ) : (
+                              <DropdownMenuItem onClick={() => openRestoreDialog(snapshot)}>
+                                <RotateCcw className="h-4 w-4 mr-2" />
+                                Restore to server
+                              </DropdownMenuItem>
+                            )}
                             <DropdownMenuItem
                               onClick={() => handleDownloadZip(snapshot)}
                               disabled={downloadingZip === snapshot.id}
@@ -475,6 +529,77 @@ export default function Snapshots() {
                 <>
                   <RotateCcw className="h-4 w-4 mr-2" />
                   Restore
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Database Restore Dialog */}
+      <Dialog open={dbRestoreDialogOpen} onOpenChange={setDbRestoreDialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Database className="h-5 w-5" />
+              Restore Database Snapshot
+            </DialogTitle>
+            <DialogDescription>
+              Import the database dump from snapshot "{dbRestoreSnapshot?.id.slice(0, 8)}" back into the configured database.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <Alert variant="destructive">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>Destructive operation</AlertTitle>
+              <AlertDescription className="text-xs">
+                This will overwrite data in the target database. Tables with the same name in the dump will be replaced. Make sure you have a current backup before proceeding.
+              </AlertDescription>
+            </Alert>
+            <div className="space-y-2">
+              <Label>Snapshot</Label>
+              <Input value={dbRestoreSnapshot?.id || ""} disabled />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="target-database">Target Database Name <span className="text-muted-foreground text-xs">(optional)</span></Label>
+              <Input
+                id="target-database"
+                value={targetDatabase}
+                onChange={(e) => setTargetDatabase(e.target.value)}
+                placeholder="Leave blank to use the database(s) in the dump"
+              />
+              <p className="text-xs text-muted-foreground">
+                If set, the dump will be imported into this specific database. Leave blank for dumps that contain their own CREATE DATABASE statements or for pg_dumpall / --all-databases dumps.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="confirm-text">Type <code className="text-xs">RESTORE</code> to confirm</Label>
+              <Input
+                id="confirm-text"
+                value={confirmText}
+                onChange={(e) => setConfirmText(e.target.value)}
+                placeholder="RESTORE"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDbRestoreDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={handleDbRestore}
+              disabled={isDbRestoring || confirmText !== "RESTORE"}
+            >
+              {isDbRestoring ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Restoring database...
+                </>
+              ) : (
+                <>
+                  <Database className="h-4 w-4 mr-2" />
+                  Restore Database
                 </>
               )}
             </Button>

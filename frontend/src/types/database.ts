@@ -1,7 +1,9 @@
+export type DatabaseType = "mysql" | "postgres";
+
 export interface DatabaseConfig {
   id: string;
   name: string;
-  type: "mysql";
+  type: DatabaseType;
   host: string;
   port: number;
   username: string;
