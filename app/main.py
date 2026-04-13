@@ -1586,7 +1586,7 @@ restic backup --compression auto --tag automated {insecure_flag} {' '.join(exclu
             ssh_cmd + [remote_cmd],
             capture_output=True,
             text=True,
-            timeout=job.get('timeout', 7200)  # 2 hour default timeout
+            timeout=job.get('timeout', 28800)  # 8 hour default timeout
         )
 
         update_job_progress(job_id, 90, 'Finalizing backup...')
@@ -1780,7 +1780,7 @@ exit $RESTIC_EXIT
             ssh_cmd + [remote_cmd],
             capture_output=True,
             text=True,
-            timeout=job.get('timeout', 7200)  # 2 hour default timeout
+            timeout=job.get('timeout', 28800)  # 8 hour default timeout
         )
 
         update_job_progress(job_id, 90, 'Finalizing backup...')

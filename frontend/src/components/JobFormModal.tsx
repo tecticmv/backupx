@@ -59,7 +59,7 @@ const defaultFormData: JobFormData = {
   retention_daily: 7,
   retention_weekly: 4,
   retention_monthly: 12,
-  timeout: 7200,
+  timeout: 28800,
 };
 
 interface JobFormModalProps {
