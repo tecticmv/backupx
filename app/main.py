@@ -9,7 +9,6 @@ import sys
 import json
 import subprocess
 import threading
-import sqlite3
 import logging
 import smtplib
 import ssl
@@ -312,8 +311,6 @@ def add_security_headers(response):
 CONFIG_DIR = Path('/app/config')
 LOGS_DIR = Path('/app/logs')
 DATA_DIR = Path('/app/data')
-DATABASE = DATA_DIR / 'backupx.db'
-
 # Legacy JSON file paths (for migration)
 JOBS_FILE = DATA_DIR / 'jobs.json'
 HISTORY_FILE = DATA_DIR / 'history.json'
@@ -419,352 +416,28 @@ def reinit_scheduler_with_db_timezone():
 # =============================================================================
 
 def get_db():
-    """Get database connection for the current request"""
-    if 'db' not in g:
-        g.db = sqlite3.connect(DATABASE)
-        g.db.row_factory = sqlite3.Row
-    return g.db
+    """Get the PostgreSQL database backend"""
+    from .db.factory import get_database
+    return get_database()
 
 
 def get_db_connection():
-    """Get a new database connection (for use outside request context)"""
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-@app.teardown_appcontext
-def close_db(exception):
-    """Close database connection at end of request"""
-    db = g.pop('db', None)
-    if db is not None:
-        db.close()
+    """Get the PostgreSQL database backend (alias for get_db for compatibility)"""
+    return get_db()
 
 
 def init_db():
-    """Initialize database schema"""
-    conn = get_db_connection()
-    conn.executescript('''
-        -- Servers table
-        CREATE TABLE IF NOT EXISTS servers (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            host TEXT NOT NULL,
-            ssh_port INTEGER DEFAULT 22,
-            ssh_user TEXT,
-            ssh_key TEXT DEFAULT '/home/backupx/.ssh/id_rsa',
-            status TEXT DEFAULT 'active',
-            created_at TEXT NOT NULL,
-            updated_at TEXT
-        );
-
-        -- S3 configurations table
-        CREATE TABLE IF NOT EXISTS s3_configs (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            endpoint TEXT NOT NULL,
-            bucket TEXT NOT NULL,
-            access_key TEXT NOT NULL,
-            secret_key TEXT NOT NULL,
-            region TEXT DEFAULT '',
-            skip_ssl_verify INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'active',
-            created_at TEXT NOT NULL,
-            updated_at TEXT
-        );
-
-        -- Database configurations table
-        CREATE TABLE IF NOT EXISTS db_configs (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            type TEXT DEFAULT 'mysql',
-            host TEXT NOT NULL,
-            port INTEGER DEFAULT 3306,
-            username TEXT NOT NULL,
-            password TEXT NOT NULL,
-            databases TEXT DEFAULT '*',
-            docker_container TEXT,
-            status TEXT DEFAULT 'active',
-            created_at TEXT NOT NULL,
-            updated_at TEXT
-        );
-
-        -- Jobs table
-        CREATE TABLE IF NOT EXISTS jobs (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            backup_type TEXT DEFAULT 'filesystem',
-            server_id TEXT,
-            s3_config_id TEXT,
-            remote_host TEXT,
-            ssh_port INTEGER DEFAULT 22,
-            ssh_key TEXT,
-            s3_endpoint TEXT,
-            s3_bucket TEXT,
-            s3_access_key TEXT,
-            s3_secret_key TEXT,
-            directories TEXT,
-            excludes TEXT,
-            database_config_id TEXT,
-            restic_password TEXT,
-            backup_prefix TEXT,
-            schedule_enabled INTEGER DEFAULT 0,
-            schedule_cron TEXT DEFAULT '0 2 * * *',
-            retention_hourly INTEGER DEFAULT 24,
-            retention_daily INTEGER DEFAULT 7,
-            retention_weekly INTEGER DEFAULT 4,
-            retention_monthly INTEGER DEFAULT 12,
-            timeout INTEGER DEFAULT 7200,
-            skip_ssl_verify INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            updated_at TEXT,
-            last_run TEXT,
-            last_success TEXT,
-            FOREIGN KEY (server_id) REFERENCES servers(id),
-            FOREIGN KEY (s3_config_id) REFERENCES s3_configs(id),
-            FOREIGN KEY (database_config_id) REFERENCES db_configs(id)
-        );
-
-        -- History table
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            job_id TEXT NOT NULL,
-            job_name TEXT NOT NULL,
-            status TEXT NOT NULL,
-            message TEXT,
-            duration REAL DEFAULT 0
-        );
-
-        -- Notification channels table
-        CREATE TABLE IF NOT EXISTS notification_channels (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            type TEXT NOT NULL,
-            enabled INTEGER DEFAULT 1,
-            config TEXT NOT NULL,
-            notify_on_success INTEGER DEFAULT 1,
-            notify_on_failure INTEGER DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT
-        );
-
-        -- Audit log table (enterprise feature)
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
-            user_id TEXT,
-            user_name TEXT,
-            action TEXT NOT NULL,
-            resource_type TEXT NOT NULL,
-            resource_id TEXT,
-            resource_name TEXT,
-            changes TEXT,
-            ip_address TEXT,
-            user_agent TEXT,
-            status TEXT DEFAULT 'success',
-            error_message TEXT
-        );
-
-        -- Scheduler tables for distributed mode (enterprise feature)
-        CREATE TABLE IF NOT EXISTS scheduler_lock (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            leader_instance TEXT,
-            acquired_at TEXT,
-            heartbeat_at TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS scheduled_jobs (
-            job_id TEXT PRIMARY KEY,
-            cron_expression TEXT NOT NULL,
-            next_run TEXT,
-            last_run TEXT,
-            is_active INTEGER DEFAULT 1,
-            FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
-        );
-
-        -- Indexes
-        CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp DESC);
-        CREATE INDEX IF NOT EXISTS idx_history_job_id ON history(job_id);
-        CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp DESC);
-        CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id);
-        CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_log(resource_type, resource_id);
-        CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
-        CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_next_run ON scheduled_jobs(next_run);
-    ''')
-    conn.commit()
-
-    # Add new columns if they don't exist (migration for existing databases)
-    try:
-        conn = get_db_connection()
-        # Check and add connection_type column to servers
-        cursor = conn.execute("PRAGMA table_info(servers)")
-        columns = [col[1] for col in cursor.fetchall()]
-
-        # Check and add status column to db_configs
-        cursor = conn.execute("PRAGMA table_info(db_configs)")
-        db_columns = [col[1] for col in cursor.fetchall()]
-
-        if 'status' not in db_columns:
-            conn.execute("ALTER TABLE db_configs ADD COLUMN status TEXT DEFAULT 'active'")
-            logger.info("Added status column to db_configs table")
-
-        if 'docker_container' not in db_columns:
-            conn.execute("ALTER TABLE db_configs ADD COLUMN docker_container TEXT")
-            logger.info("Added docker_container column to db_configs table")
-
-        # Check and add status column to servers
-        if 'status' not in columns:
-            conn.execute("ALTER TABLE servers ADD COLUMN status TEXT DEFAULT 'active'")
-            logger.info("Added status column to servers table")
-
-        # Check and add status column to s3_configs
-        cursor = conn.execute("PRAGMA table_info(s3_configs)")
-        s3_columns = [col[1] for col in cursor.fetchall()]
-
-        if 'status' not in s3_columns:
-            conn.execute("ALTER TABLE s3_configs ADD COLUMN status TEXT DEFAULT 'active'")
-            logger.info("Added status column to s3_configs table")
-
-        # Check and add SSH auth columns to servers
-        if 'ssh_auth_type' not in columns:
-            conn.execute("ALTER TABLE servers ADD COLUMN ssh_auth_type TEXT DEFAULT 'key_path'")
-            logger.info("Added ssh_auth_type column to servers table")
-        if 'ssh_password' not in columns:
-            conn.execute("ALTER TABLE servers ADD COLUMN ssh_password TEXT")
-            logger.info("Added ssh_password column to servers table")
-        if 'ssh_key_content' not in columns:
-            conn.execute("ALTER TABLE servers ADD COLUMN ssh_key_content TEXT")
-            logger.info("Added ssh_key_content column to servers table")
-
-        # Check and add progress columns to jobs
-        cursor = conn.execute("PRAGMA table_info(jobs)")
-        job_columns = [col[1] for col in cursor.fetchall()]
-
-        if 'progress' not in job_columns:
-            conn.execute("ALTER TABLE jobs ADD COLUMN progress INTEGER DEFAULT 0")
-            logger.info("Added progress column to jobs table")
-        if 'progress_message' not in job_columns:
-            conn.execute("ALTER TABLE jobs ADD COLUMN progress_message TEXT")
-            logger.info("Added progress_message column to jobs table")
-
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.warning(f"Migration check failed: {e}")
-
-    conn.close()
+    """Initialize PostgreSQL database schema via the database backend"""
+    from .db import init_database
+    init_database()
+    logger.info("PostgreSQL database initialized")
 
 
-def migrate_json_to_sqlite():
-    """Migrate existing JSON data to SQLite (runs once on startup)"""
-    conn = get_db_connection()
-
-    # Check if migration is needed (check if any data exists)
-    # Use allowlisted table names to prevent SQL injection
-    allowed_tables = {'servers', 's3_configs', 'db_configs', 'jobs', 'history'}
-    has_data = False
-    for table in allowed_tables:
-        count = conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
-        if count > 0:
-            has_data = True
-            break
-
-    if has_data:
-        conn.close()
-        return  # Already has data, skip migration
-
-    logger.info("Migrating JSON data to SQLite...")
-
-    # Migrate servers
-    if SERVERS_FILE.exists():
-        try:
-            with open(SERVERS_FILE) as f:
-                servers = json.load(f)
-            for s in servers:
-                conn.execute('''
-                    INSERT INTO servers (id, name, host, ssh_port, ssh_user, ssh_key, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (s['id'], s['name'], s['host'],
-                      s.get('ssh_port', 22), s.get('ssh_user'), s.get('ssh_key', '/home/backupx/.ssh/id_rsa'),
-                      s.get('created_at', utc_isoformat()), s.get('updated_at')))
-            logger.info(f"  Migrated {len(servers)} servers")
-        except Exception as e:
-            logger.error(f"  Error migrating servers: {e}")
-
-    # Migrate S3 configs
-    if S3_CONFIGS_FILE.exists():
-        try:
-            with open(S3_CONFIGS_FILE) as f:
-                configs = json.load(f)
-            for c in configs:
-                conn.execute('''
-                    INSERT INTO s3_configs (id, name, endpoint, bucket, access_key, secret_key, region, skip_ssl_verify, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (c['id'], c['name'], c['endpoint'], c['bucket'], c['access_key'], c['secret_key'],
-                      c.get('region', ''), c.get('skip_ssl_verify', 0), c.get('created_at', utc_isoformat()), c.get('updated_at')))
-            logger.info(f"  Migrated {len(configs)} S3 configs")
-        except Exception as e:
-            logger.error(f"  Error migrating S3 configs: {e}")
-
-    # Migrate database configs
-    if DB_CONFIGS_FILE.exists():
-        try:
-            with open(DB_CONFIGS_FILE) as f:
-                configs = json.load(f)
-            for c in configs:
-                conn.execute('''
-                    INSERT INTO db_configs (id, name, type, host, port, username, password, databases, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (c['id'], c['name'], c.get('type', 'mysql'), c['host'], c.get('port', 3306),
-                      c['username'], c['password'], c.get('databases', '*'),
-                      c.get('created_at', utc_isoformat()), c.get('updated_at')))
-            logger.info(f"  Migrated {len(configs)} database configs")
-        except Exception as e:
-            logger.error(f"  Error migrating database configs: {e}")
-
-    # Migrate jobs
-    if JOBS_FILE.exists():
-        try:
-            with open(JOBS_FILE) as f:
-                jobs = json.load(f)
-            for job_id, j in jobs.items():
-                conn.execute('''
-                    INSERT INTO jobs (id, name, backup_type, server_id, s3_config_id, remote_host, ssh_port, ssh_key,
-                        s3_endpoint, s3_bucket, s3_access_key, s3_secret_key, directories, excludes, database_config_id,
-                        restic_password, backup_prefix, schedule_enabled, schedule_cron, retention_hourly, retention_daily,
-                        retention_weekly, retention_monthly, timeout, status, created_at, updated_at, last_run, last_success)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (job_id, j['name'], j.get('backup_type', 'filesystem'), j.get('server_id'), j.get('s3_config_id'),
-                      j.get('remote_host'), j.get('ssh_port', 22), j.get('ssh_key'),
-                      j.get('s3_endpoint'), j.get('s3_bucket'), j.get('s3_access_key'), j.get('s3_secret_key'),
-                      json.dumps(j.get('directories', [])), json.dumps(j.get('excludes', [])), j.get('database_config_id'),
-                      j.get('restic_password'), j.get('backup_prefix'), 1 if j.get('schedule_enabled') else 0,
-                      j.get('schedule_cron', '0 2 * * *'), j.get('retention_hourly', 24), j.get('retention_daily', 7),
-                      j.get('retention_weekly', 4), j.get('retention_monthly', 12), j.get('timeout', 7200),
-                      j.get('status', 'pending'), j.get('created_at', utc_isoformat()), j.get('updated_at'),
-                      j.get('last_run'), j.get('last_success')))
-            logger.info(f"  Migrated {len(jobs)} jobs")
-        except Exception as e:
-            logger.error(f"  Error migrating jobs: {e}")
-
-    # Migrate history
-    if HISTORY_FILE.exists():
-        try:
-            with open(HISTORY_FILE) as f:
-                history = json.load(f)
-            for h in history:
-                conn.execute('''
-                    INSERT INTO history (timestamp, job_id, job_name, status, message, duration)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (h['timestamp'], h['job_id'], h['job_name'], h['status'], h.get('message', ''), h.get('duration', 0)))
-            logger.info(f"  Migrated {len(history)} history entries")
-        except Exception as e:
-            logger.error(f"  Error migrating history: {e}")
-
-    conn.commit()
-    conn.close()
+def migrate_json_to_db():
+    """Migrate legacy JSON data to PostgreSQL (runs once on startup)"""
+    from .db.migrate import migrate_json_to_database
+    db = get_db()
+    migrate_json_to_database(str(DATA_DIR), db)
     logger.info("Migration complete!")
 
 
@@ -805,8 +478,8 @@ def _decrypt_job(job):
 def load_jobs():
     """Load all backup jobs from database"""
     conn = get_db_connection()
-    rows = conn.execute('SELECT * FROM jobs').fetchall()
-    conn.close()
+    rows = conn.fetchall('SELECT * FROM jobs')
+
 
     jobs = {}
     for row in rows:
@@ -825,8 +498,8 @@ def load_jobs():
 def get_job(job_id):
     """Get a single job by ID"""
     conn = get_db_connection()
-    row = conn.execute('SELECT * FROM jobs WHERE id = ?', (job_id,)).fetchone()
-    conn.close()
+    row = conn.fetchone('SELECT * FROM jobs WHERE id = ?', (job_id,))
+
 
     if row:
         job = _decrypt_job(dict(row))
@@ -847,7 +520,7 @@ def save_job(job_id, job):
     encrypted_restic_password = encrypt_credential(job.get('restic_password', '') or '')
 
     # Check if job exists
-    exists = conn.execute('SELECT 1 FROM jobs WHERE id = ?', (job_id,)).fetchone()
+    exists = conn.fetchone('SELECT 1 FROM jobs WHERE id = ?', (job_id,))
 
     if exists:
         conn.execute('''
@@ -883,7 +556,7 @@ def save_job(job_id, job):
               job.get('last_run'), job.get('last_success')))
 
     conn.commit()
-    conn.close()
+
 
 
 def delete_job_from_db(job_id):
@@ -891,7 +564,7 @@ def delete_job_from_db(job_id):
     conn = get_db_connection()
     conn.execute('DELETE FROM jobs WHERE id = ?', (job_id,))
     conn.commit()
-    conn.close()
+
 
 
 def update_job_status(job_id, status, last_run=None, last_success=None):
@@ -907,7 +580,7 @@ def update_job_status(job_id, status, last_run=None, last_success=None):
         conn.execute('UPDATE jobs SET status=?, updated_at=? WHERE id=?',
                      (status, utc_isoformat(), job_id))
     conn.commit()
-    conn.close()
+
 
 
 def update_job_progress(job_id, progress, message):
@@ -916,7 +589,7 @@ def update_job_progress(job_id, progress, message):
     conn.execute('UPDATE jobs SET progress=?, progress_message=?, updated_at=? WHERE id=?',
                  (progress, message, utc_isoformat(), job_id))
     conn.commit()
-    conn.close()
+
 
 
 # --- History ---
@@ -924,8 +597,8 @@ def update_job_progress(job_id, progress, message):
 def load_history():
     """Load backup history from database"""
     conn = get_db_connection()
-    rows = conn.execute('SELECT * FROM history ORDER BY timestamp DESC LIMIT 100').fetchall()
-    conn.close()
+    rows = conn.fetchall('SELECT * FROM history ORDER BY timestamp DESC LIMIT 100')
+
     return [dict(row) for row in rows]
 
 
@@ -944,7 +617,7 @@ def add_history(job_id, job_name, status, message, duration=0):
         )
     ''')
     conn.commit()
-    conn.close()
+
 
 
 # --- S3 Configs ---
@@ -961,16 +634,16 @@ def _decrypt_s3_config(config):
 def load_s3_configs():
     """Load S3 configurations from database"""
     conn = get_db_connection()
-    rows = conn.execute('SELECT * FROM s3_configs').fetchall()
-    conn.close()
+    rows = conn.fetchall('SELECT * FROM s3_configs')
+
     return [_decrypt_s3_config(dict(row)) for row in rows]
 
 
 def get_s3_config(config_id):
     """Get a single S3 config by ID"""
     conn = get_db_connection()
-    row = conn.execute('SELECT * FROM s3_configs WHERE id = ?', (config_id,)).fetchone()
-    conn.close()
+    row = conn.fetchone('SELECT * FROM s3_configs WHERE id = ?', (config_id,))
+
     return _decrypt_s3_config(dict(row)) if row else None
 
 
@@ -985,7 +658,7 @@ def create_s3_config(config):
           config.get('region', ''), 1 if config.get('skip_ssl_verify') else 0,
           config.get('status', 'active'), config.get('created_at', utc_isoformat()), config.get('updated_at')))
     conn.commit()
-    conn.close()
+
 
 
 def update_s3_config(config_id, config):
@@ -999,7 +672,7 @@ def update_s3_config(config_id, config):
           config.get('region', ''), 1 if config.get('skip_ssl_verify') else 0,
           config.get('status', 'active'), utc_isoformat(), config_id))
     conn.commit()
-    conn.close()
+
 
 
 def delete_s3_config(config_id):
@@ -1007,7 +680,7 @@ def delete_s3_config(config_id):
     conn = get_db_connection()
     conn.execute('DELETE FROM s3_configs WHERE id = ?', (config_id,))
     conn.commit()
-    conn.close()
+
 
 
 # --- Servers ---
@@ -1020,16 +693,16 @@ def _decrypt_server(server):
 def load_servers():
     """Load servers from database"""
     conn = get_db_connection()
-    rows = conn.execute('SELECT * FROM servers').fetchall()
-    conn.close()
+    rows = conn.fetchall('SELECT * FROM servers')
+
     return [_decrypt_server(dict(row)) for row in rows]
 
 
 def get_server(server_id):
     """Get a single server by ID"""
     conn = get_db_connection()
-    row = conn.execute('SELECT * FROM servers WHERE id = ?', (server_id,)).fetchone()
-    conn.close()
+    row = conn.fetchone('SELECT * FROM servers WHERE id = ?', (server_id,))
+
     return _decrypt_server(dict(row)) if row else None
 
 
@@ -1044,7 +717,7 @@ def create_server(server):
           server.get('ssh_auth_type', 'key_path'), server.get('ssh_password'), server.get('ssh_key_content'),
           server.get('status', 'active'), server.get('created_at', utc_isoformat()), server.get('updated_at')))
     conn.commit()
-    conn.close()
+
 
 
 def update_server_in_db(server_id, server):
@@ -1058,7 +731,7 @@ def update_server_in_db(server_id, server):
           server.get('ssh_auth_type', 'key_path'), server.get('ssh_password'), server.get('ssh_key_content'),
           server.get('status', 'active'), utc_isoformat(), server_id))
     conn.commit()
-    conn.close()
+
 
 
 def delete_server_from_db(server_id):
@@ -1066,7 +739,7 @@ def delete_server_from_db(server_id):
     conn = get_db_connection()
     conn.execute('DELETE FROM servers WHERE id = ?', (server_id,))
     conn.commit()
-    conn.close()
+
 
 
 # --- Database Configs ---
@@ -1081,16 +754,16 @@ def _decrypt_db_config(config):
 def load_db_configs():
     """Load database configurations from database"""
     conn = get_db_connection()
-    rows = conn.execute('SELECT * FROM db_configs').fetchall()
-    conn.close()
+    rows = conn.fetchall('SELECT * FROM db_configs')
+
     return [_decrypt_db_config(dict(row)) for row in rows]
 
 
 def get_db_config(config_id):
     """Get a single database config by ID"""
     conn = get_db_connection()
-    row = conn.execute('SELECT * FROM db_configs WHERE id = ?', (config_id,)).fetchone()
-    conn.close()
+    row = conn.fetchone('SELECT * FROM db_configs WHERE id = ?', (config_id,))
+
     return _decrypt_db_config(dict(row)) if row else None
 
 
@@ -1105,7 +778,7 @@ def create_db_config(config):
           config.get('docker_container') or None,
           config.get('status', 'active'), config.get('created_at', utc_isoformat()), config.get('updated_at')))
     conn.commit()
-    conn.close()
+
 
 
 def update_db_config_in_db(config_id, config):
@@ -1119,7 +792,7 @@ def update_db_config_in_db(config_id, config):
           config.get('docker_container') or None,
           config.get('status', 'active'), utc_isoformat(), config_id))
     conn.commit()
-    conn.close()
+
 
 
 def delete_db_config_from_db(config_id):
@@ -1127,7 +800,7 @@ def delete_db_config_from_db(config_id):
     conn = get_db_connection()
     conn.execute('DELETE FROM db_configs WHERE id = ?', (config_id,))
     conn.commit()
-    conn.close()
+
 
 
 # --- Notification Channels ---
@@ -1135,8 +808,8 @@ def delete_db_config_from_db(config_id):
 def load_notification_channels():
     """Load all notification channels from database"""
     conn = get_db_connection()
-    rows = conn.execute('SELECT * FROM notification_channels').fetchall()
-    conn.close()
+    rows = conn.fetchall('SELECT * FROM notification_channels')
+
     channels = []
     for row in rows:
         channel = dict(row)
@@ -1151,8 +824,8 @@ def load_notification_channels():
 def get_notification_channel(channel_id):
     """Get a single notification channel by ID"""
     conn = get_db_connection()
-    row = conn.execute('SELECT * FROM notification_channels WHERE id = ?', (channel_id,)).fetchone()
-    conn.close()
+    row = conn.fetchone('SELECT * FROM notification_channels WHERE id = ?', (channel_id,))
+
     if row:
         channel = dict(row)
         channel['config'] = json.loads(channel['config'] or '{}')
@@ -1174,7 +847,7 @@ def create_notification_channel(channel):
           1 if channel.get('notify_on_failure', True) else 0, channel.get('created_at', utc_isoformat()),
           channel.get('updated_at')))
     conn.commit()
-    conn.close()
+
 
 
 def update_notification_channel(channel_id, channel):
@@ -1187,7 +860,7 @@ def update_notification_channel(channel_id, channel):
           json.dumps(channel.get('config', {})), 1 if channel.get('notify_on_success', True) else 0,
           1 if channel.get('notify_on_failure', True) else 0, utc_isoformat(), channel_id))
     conn.commit()
-    conn.close()
+
 
 
 def delete_notification_channel(channel_id):
@@ -1195,7 +868,7 @@ def delete_notification_channel(channel_id):
     conn = get_db_connection()
     conn.execute('DELETE FROM notification_channels WHERE id = ?', (channel_id,))
     conn.commit()
-    conn.close()
+
 
 
 # --- Notification Senders ---
@@ -5115,17 +4788,9 @@ def init_app():
     """Initialize the application"""
     logger.info("Initializing BackupX application...")
 
-    # Initialize database
+    # Initialize PostgreSQL database
     init_db()
-    migrate_json_to_sqlite()
-
-    # Initialize PostgreSQL database and run migrations
-    try:
-        from .db import init_database
-        init_database()
-        logger.info("PostgreSQL database initialized and migrations applied")
-    except Exception as e:
-        logger.warning(f"PostgreSQL initialization skipped: {e}")
+    migrate_json_to_db()
 
     # Re-initialize scheduler with timezone from database
     reinit_scheduler_with_db_timezone()
@@ -5133,40 +4798,7 @@ def init_app():
     # Initialize audit logging
     try:
         from .audit.logger import init_audit_logger
-        from .db import get_database
-        # Use a simple wrapper to make db compatible with audit logger
-        class DBWrapper:
-            def execute(self, query, params=None):
-                conn = get_db_connection()
-                if params:
-                    conn.execute(query, params)
-                else:
-                    conn.execute(query)
-                conn.commit()
-                conn.close()
-            def commit(self):
-                pass  # Handled in execute
-            def fetchall(self, query, params=None):
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                if params:
-                    cursor.execute(query, params)
-                else:
-                    cursor.execute(query)
-                rows = cursor.fetchall()
-                conn.close()
-                return [dict(row) for row in rows]
-            def fetchone(self, query, params=None):
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                if params:
-                    cursor.execute(query, params)
-                else:
-                    cursor.execute(query)
-                row = cursor.fetchone()
-                conn.close()
-                return dict(row) if row else None
-        init_audit_logger(DBWrapper())
+        init_audit_logger(get_db())
         logger.info("Audit logging initialized")
     except Exception as e:
         logger.warning(f"Audit logging not available: {e}")
@@ -5177,9 +4809,9 @@ def init_app():
     # Reset any jobs stuck in 'running' state from a previous crash/restart
     try:
         conn = get_db_connection()
-        stuck_jobs = conn.execute(
+        stuck_jobs = conn.fetchall(
             "SELECT id, name FROM jobs WHERE status = 'running'"
-        ).fetchall()
+        )
         for row in stuck_jobs:
             conn.execute(
                 "UPDATE jobs SET status='failed', progress=0, progress_message='Interrupted by server restart', updated_at=? WHERE id=?",
@@ -5188,7 +4820,7 @@ def init_app():
             logger.warning(f"Reset stuck job: {row['id']} ({row['name']})")
         if stuck_jobs:
             conn.commit()
-        conn.close()
+    
     except Exception as e:
         logger.warning(f"Failed to reset stuck jobs: {e}")
 
