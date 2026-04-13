@@ -21,7 +21,7 @@ A modern backup management system with a web UI. Orchestrates [Restic](https://r
 ## Quick Start
 
 ```bash
-git clone https://github.com/SaiphMuhammad/backupx.git
+git clone https://github.com/tecticmv/backupx.git
 cd backupx
 cp .env.example .env
 # Edit .env — at minimum set SECRET_KEY, ADMIN_PASSWORD, DATABASE_PASSWORD
