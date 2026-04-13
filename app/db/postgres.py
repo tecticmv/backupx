@@ -217,8 +217,12 @@ class PostgresBackend(DatabaseBackend):
                 ssh_port INTEGER DEFAULT 22,
                 ssh_user TEXT,
                 ssh_key TEXT DEFAULT '/home/backupx/.ssh/id_rsa',
+                ssh_auth_type TEXT DEFAULT 'key_path',
+                ssh_password TEXT,
+                ssh_key_content TEXT,
                 agent_port INTEGER DEFAULT 8090,
                 agent_api_key TEXT,
+                status TEXT DEFAULT 'active',
                 created_at TIMESTAMP NOT NULL,
                 updated_at TIMESTAMP
             );
@@ -232,6 +236,8 @@ class PostgresBackend(DatabaseBackend):
                 access_key TEXT NOT NULL,
                 secret_key TEXT NOT NULL,
                 region TEXT DEFAULT '',
+                skip_ssl_verify BOOLEAN DEFAULT FALSE,
+                status TEXT DEFAULT 'active',
                 created_at TIMESTAMP NOT NULL,
                 updated_at TIMESTAMP
             );
@@ -246,6 +252,8 @@ class PostgresBackend(DatabaseBackend):
                 username TEXT NOT NULL,
                 password TEXT NOT NULL,
                 databases TEXT DEFAULT '*',
+                docker_container TEXT,
+                status TEXT DEFAULT 'active',
                 created_at TIMESTAMP NOT NULL,
                 updated_at TIMESTAMP
             );
@@ -276,6 +284,9 @@ class PostgresBackend(DatabaseBackend):
                 retention_weekly INTEGER DEFAULT 4,
                 retention_monthly INTEGER DEFAULT 12,
                 timeout INTEGER DEFAULT 7200,
+                skip_ssl_verify BOOLEAN DEFAULT FALSE,
+                progress INTEGER DEFAULT 0,
+                progress_message TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP NOT NULL,
                 updated_at TIMESTAMP,
@@ -362,7 +373,7 @@ class PostgresBackend(DatabaseBackend):
 
     def migrate_schema(self) -> None:
         """Run schema migrations for existing databases."""
-        # Check and add columns to servers table
+        # Servers table migrations
         columns = self.get_table_columns('servers')
         if 'connection_type' not in columns:
             self.add_column('servers', 'connection_type', 'TEXT', "'ssh'")
@@ -370,19 +381,37 @@ class PostgresBackend(DatabaseBackend):
             self.add_column('servers', 'agent_port', 'INTEGER', '8090')
         if 'agent_api_key' not in columns:
             self.add_column('servers', 'agent_api_key', 'TEXT')
-
-        # Add SSH auth columns to servers table
         if 'ssh_auth_type' not in columns:
             self.add_column('servers', 'ssh_auth_type', 'TEXT', "'key_path'")
         if 'ssh_password' not in columns:
             self.add_column('servers', 'ssh_password', 'TEXT')
         if 'ssh_key_content' not in columns:
             self.add_column('servers', 'ssh_key_content', 'TEXT')
+        if 'status' not in columns:
+            self.add_column('servers', 'status', 'TEXT', "'active'")
 
-        # Add docker_container column to db_configs for docker-exec backups
+        # S3 configs migrations
+        s3_columns = self.get_table_columns('s3_configs')
+        if 'skip_ssl_verify' not in s3_columns:
+            self.add_column('s3_configs', 'skip_ssl_verify', 'BOOLEAN', 'FALSE')
+        if 'status' not in s3_columns:
+            self.add_column('s3_configs', 'status', 'TEXT', "'active'")
+
+        # DB configs migrations
         db_columns = self.get_table_columns('db_configs')
         if 'docker_container' not in db_columns:
             self.add_column('db_configs', 'docker_container', 'TEXT')
+        if 'status' not in db_columns:
+            self.add_column('db_configs', 'status', 'TEXT', "'active'")
+
+        # Jobs migrations
+        job_columns = self.get_table_columns('jobs')
+        if 'skip_ssl_verify' not in job_columns:
+            self.add_column('jobs', 'skip_ssl_verify', 'BOOLEAN', 'FALSE')
+        if 'progress' not in job_columns:
+            self.add_column('jobs', 'progress', 'INTEGER', '0')
+        if 'progress_message' not in job_columns:
+            self.add_column('jobs', 'progress_message', 'TEXT')
 
         # Create app_settings table if it doesn't exist
         self.executescript('''
