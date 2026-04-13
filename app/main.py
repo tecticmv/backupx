@@ -1521,6 +1521,73 @@ def ensure_restic_installed(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/
         return False, f"Error checking restic: {sanitize_error_message(str(e))}"
 
 
+def _format_bytes(num_bytes):
+    """Format bytes into human-readable size"""
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if abs(num_bytes) < 1024:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} PB"
+
+
+def _stream_restic_progress(proc, job_id, timeout):
+    """Stream restic --json output, parse progress, update job progress in DB.
+
+    Returns (returncode, stderr_text).
+    """
+    import time
+
+    stderr_lines = []
+    deadline = time.monotonic() + timeout
+
+    for line in proc.stdout:
+        if time.monotonic() > deadline:
+            proc.kill()
+            proc.wait()
+            raise subprocess.TimeoutExpired(cmd='restic', timeout=timeout)
+
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            # Non-JSON output (e.g. "Initializing new restic repository...")
+            continue
+
+        msg_type = msg.get('message_type')
+
+        if msg_type == 'status':
+            pct = msg.get('percent_done', 0)
+            total = msg.get('total_bytes', 0)
+            done = msg.get('bytes_done', 0)
+            # Map restic 0-100% into our 30-90% progress range
+            progress = 30 + int(pct * 60)
+            if total > 0:
+                status_msg = f"Backing up: {_format_bytes(done)} / {_format_bytes(total)} ({pct:.0%})"
+            else:
+                status_msg = f"Backing up: {_format_bytes(done)} ({pct:.0%})"
+            update_job_progress(job_id, progress, status_msg)
+
+        elif msg_type == 'summary':
+            total = msg.get('total_bytes_processed', 0)
+            added = msg.get('data_added', 0)
+            files_new = msg.get('files_new', 0)
+            files_changed = msg.get('files_changed', 0)
+            duration = msg.get('total_duration', 0)
+            update_job_progress(job_id, 90,
+                f"Done: {_format_bytes(total)} processed, {_format_bytes(added)} added, "
+                f"{files_new} new / {files_changed} changed files in {duration:.1f}s")
+
+    # Collect stderr
+    if proc.stderr:
+        stderr_lines = proc.stderr.readlines()
+
+    proc.wait()
+    return proc.returncode, ''.join(stderr_lines)
+
+
 def run_filesystem_backup(job_id, job):
     """Execute a filesystem backup job"""
     start_time = utc_now()
@@ -1576,23 +1643,28 @@ if ! restic cat config {insecure_flag} >/dev/null 2>&1; then
     restic init {insecure_flag} 2>&1 || true
 fi
 
-restic backup --compression auto --tag automated {insecure_flag} {' '.join(exclude_args)} {directories}
+restic backup --json --compression auto --tag automated {insecure_flag} {' '.join(exclude_args)} {directories}
 """
 
-        # Execute
+        # Execute with streaming progress
         update_job_progress(job_id, 20, 'Connecting to remote server...')
-        update_job_progress(job_id, 30, 'Running backup on remote server...')
-        result = subprocess.run(
+        update_job_progress(job_id, 30, 'Starting backup on remote server...')
+        backup_timeout = job.get('timeout', 28800)  # 8 hour default timeout
+        proc = subprocess.Popen(
             ssh_cmd + [remote_cmd],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=job.get('timeout', 28800)  # 8 hour default timeout
         )
 
-        update_job_progress(job_id, 90, 'Finalizing backup...')
+        try:
+            returncode, stderr_text = _stream_restic_progress(proc, job_id, backup_timeout)
+        except subprocess.TimeoutExpired:
+            raise
+
         duration = (utc_now() - start_time).total_seconds()
 
-        if result.returncode == 0:
+        if returncode == 0:
             update_job_progress(job_id, 100, 'Backup completed successfully')
             invalidate_snapshot_cache(job_id)
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
@@ -1601,7 +1673,7 @@ restic backup --compression auto --tag automated {insecure_flag} {' '.join(exclu
             logger.info(f"Filesystem backup completed successfully: {job_id} (duration: {duration:.1f}s)")
             return True, "Backup completed successfully"
         else:
-            error_msg = sanitize_error_message(result.stderr)
+            error_msg = sanitize_error_message(stderr_text)
             update_job_status(job_id, 'failed')
             add_history(job_id, job['name'], 'failed', error_msg, duration)
             send_notification(job_id, job['name'], 'failed', error_msg, duration)
@@ -1764,7 +1836,7 @@ if [ $? -ne 0 ]; then
 fi
 
 # Backup to restic repository
-restic backup --compression auto --tag automated --tag {backup_tag} {insecure_flag} "$BACKUP_FILE"
+restic backup --json --compression auto --tag automated --tag {backup_tag} {insecure_flag} "$BACKUP_FILE"
 RESTIC_EXIT=$?
 
 # Cleanup
@@ -1773,30 +1845,35 @@ rm -rf "$BACKUP_DIR"
 exit $RESTIC_EXIT
 """
 
-        # Execute
+        # Execute with streaming progress
         update_job_progress(job_id, 20, 'Connecting to remote server...')
         update_job_progress(job_id, 30, 'Dumping database...')
-        result = subprocess.run(
+        backup_timeout = job.get('timeout', 28800)  # 8 hour default timeout
+        proc = subprocess.Popen(
             ssh_cmd + [remote_cmd],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=job.get('timeout', 28800)  # 8 hour default timeout
         )
 
-        update_job_progress(job_id, 90, 'Finalizing backup...')
+        try:
+            returncode, stderr_text = _stream_restic_progress(proc, job_id, backup_timeout)
+        except subprocess.TimeoutExpired:
+            raise
+
         duration = (utc_now() - start_time).total_seconds()
 
-        if result.returncode == 0:
+        if returncode == 0:
             update_job_progress(job_id, 100, 'Database backup completed successfully')
             invalidate_snapshot_cache(job_id)
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
-            message = f'MySQL backup completed successfully ({databases})'
+            message = f'Database backup completed successfully ({databases})'
             add_history(job_id, job['name'], 'success', message, duration)
             send_notification(job_id, job['name'], 'success', message, duration)
             logger.info(f"Database backup completed successfully: {job_id} (duration: {duration:.1f}s)")
             return True, "Database backup completed successfully"
         else:
-            error_msg = sanitize_error_message(result.stderr)
+            error_msg = sanitize_error_message(stderr_text)
             update_job_status(job_id, 'failed')
             add_history(job_id, job['name'], 'failed', error_msg, duration)
             send_notification(job_id, job['name'], 'failed', error_msg, duration)
