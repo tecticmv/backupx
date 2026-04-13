@@ -55,4 +55,4 @@ USER backupx
 EXPOSE 9090
 
 # Run the application with gunicorn
-CMD sh -c 'gunicorn --bind "0.0.0.0:${LISTEN_PORT:-9090}" --workers 2 --threads 4 --access-logfile - --error-logfile - app.main:app'
+CMD sh -c 'gunicorn --bind "0.0.0.0:${LISTEN_PORT:-9090}" --workers 2 --threads 4 --timeout 300 --graceful-timeout 120 --access-logfile - --error-logfile - app.main:app'

@@ -2425,6 +2425,7 @@ def api_change_password():
 # API Routes
 @app.route('/api/jobs')
 @login_required
+@limiter.exempt
 def api_jobs():
     jobs = load_jobs()
     return jsonify(jobs)
@@ -2468,6 +2469,7 @@ def api_reveal_restic_password(job_id):
 
 @app.route('/api/jobs/<job_id>/status')
 @login_required
+@limiter.exempt
 def api_job_status(job_id):
     job = get_job(job_id)
     if job:
@@ -2740,8 +2742,8 @@ def api_run_job(job_id):
     except Exception as e:
         logger.debug(f"Audit logging failed: {e}")
 
-    # Run in background
-    thread = threading.Thread(target=run_backup, args=[job_id])
+    # Run in background (non-daemon so it survives worker shutdowns if possible)
+    thread = threading.Thread(target=run_backup, args=[job_id], daemon=False)
     thread.start()
 
     return jsonify({'success': True, 'message': 'Backup started'})
@@ -2791,6 +2793,7 @@ def api_init_job_repo(job_id):
 
 @app.route('/api/jobs/<job_id>/snapshots')
 @login_required
+@limiter.exempt
 def api_job_snapshots(job_id):
     """Get snapshots for a job"""
     job = get_job(job_id)
@@ -3559,6 +3562,7 @@ def api_dashboard_stats():
 # S3 Configuration API Routes
 @app.route('/api/s3-configs', methods=['GET'])
 @login_required
+@limiter.exempt
 def api_get_s3_configs():
     """Get all S3 configurations"""
     configs = load_s3_configs()
@@ -3893,6 +3897,7 @@ def api_download_s3_file(config_id):
 # Server API Routes
 @app.route('/api/servers', methods=['GET'])
 @login_required
+@limiter.exempt
 def api_get_servers():
     """Get all servers"""
     servers = load_servers()
@@ -4424,6 +4429,7 @@ def api_browse_server_directories(server_id):
 # Database Configuration API Routes
 @app.route('/api/databases', methods=['GET'])
 @login_required
+@limiter.exempt
 def api_get_db_configs():
     """Get all database configurations"""
     configs = load_db_configs()
@@ -5167,6 +5173,24 @@ def init_app():
 
     # Initialize schedules
     init_schedules()
+
+    # Reset any jobs stuck in 'running' state from a previous crash/restart
+    try:
+        conn = get_db_connection()
+        stuck_jobs = conn.execute(
+            "SELECT id, name FROM jobs WHERE status = 'running'"
+        ).fetchall()
+        for row in stuck_jobs:
+            conn.execute(
+                "UPDATE jobs SET status='failed', progress=0, progress_message='Interrupted by server restart', updated_at=? WHERE id=?",
+                (utc_isoformat(), row['id'])
+            )
+            logger.warning(f"Reset stuck job: {row['id']} ({row['name']})")
+        if stuck_jobs:
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Failed to reset stuck jobs: {e}")
 
     logger.info("BackupX application initialized successfully")
 
