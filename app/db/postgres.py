@@ -113,50 +113,70 @@ class PostgresBackend(DatabaseBackend):
         conn = self.get_connection()
         cursor = conn.cursor()
         converted_query = self.convert_query(query)
-        if params:
-            cursor.execute(converted_query, params)
-        else:
-            cursor.execute(converted_query)
-        return cursor
+        try:
+            if params:
+                cursor.execute(converted_query, params)
+            else:
+                cursor.execute(converted_query)
+            return cursor
+        except Exception:
+            conn.rollback()
+            raise
 
     def executemany(self, query: str, params_list: List[Tuple]):
         """Execute a query multiple times with different parameters."""
         conn = self.get_connection()
         cursor = conn.cursor()
         converted_query = self.convert_query(query)
-        cursor.executemany(converted_query, params_list)
-        return cursor
+        try:
+            cursor.executemany(converted_query, params_list)
+            return cursor
+        except Exception:
+            conn.rollback()
+            raise
 
     def executescript(self, script: str) -> None:
         """Execute multiple SQL statements."""
         conn = self.get_connection()
         cursor = conn.cursor()
-        # PostgreSQL can execute multiple statements in one execute call
-        cursor.execute(script)
+        try:
+            # PostgreSQL can execute multiple statements in one execute call
+            cursor.execute(script)
+        except Exception:
+            conn.rollback()
+            raise
 
     def fetchone(self, query: str, params: Optional[Tuple] = None) -> Optional[Dict[str, Any]]:
         """Execute a query and fetch one result as a dictionary."""
         conn = self.get_connection()
         cursor = conn.cursor()
         converted_query = self.convert_query(query)
-        if params:
-            cursor.execute(converted_query, params)
-        else:
-            cursor.execute(converted_query)
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        try:
+            if params:
+                cursor.execute(converted_query, params)
+            else:
+                cursor.execute(converted_query)
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except Exception:
+            conn.rollback()
+            raise
 
     def fetchall(self, query: str, params: Optional[Tuple] = None) -> List[Dict[str, Any]]:
         """Execute a query and fetch all results as dictionaries."""
         conn = self.get_connection()
         cursor = conn.cursor()
         converted_query = self.convert_query(query)
-        if params:
-            cursor.execute(converted_query, params)
-        else:
-            cursor.execute(converted_query)
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
+        try:
+            if params:
+                cursor.execute(converted_query, params)
+            else:
+                cursor.execute(converted_query)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            conn.rollback()
+            raise
 
     def commit(self) -> None:
         """Commit the current transaction."""
