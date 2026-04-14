@@ -533,7 +533,7 @@ def save_job(job_id, job):
               job.get('remote_host'), job.get('ssh_port', 22), job.get('ssh_key'),
               job.get('s3_endpoint'), job.get('s3_bucket'), encrypted_s3_access_key, encrypted_s3_secret_key,
               json.dumps(job.get('directories', [])), json.dumps(job.get('excludes', [])), job.get('database_config_id'),
-              encrypted_restic_password, job.get('backup_prefix'), 1 if job.get('schedule_enabled') else 0,
+              encrypted_restic_password, job.get('backup_prefix'), bool(job.get('schedule_enabled')),
               job.get('schedule_cron', '0 2 * * *'), job.get('retention_hourly', 24), job.get('retention_daily', 7),
               job.get('retention_weekly', 4), job.get('retention_monthly', 12), job.get('timeout', 7200),
               job.get('status', 'pending'), job.get('updated_at'), job.get('last_run'), job.get('last_success'),
@@ -549,7 +549,7 @@ def save_job(job_id, job):
               job.get('remote_host'), job.get('ssh_port', 22), job.get('ssh_key'),
               job.get('s3_endpoint'), job.get('s3_bucket'), encrypted_s3_access_key, encrypted_s3_secret_key,
               json.dumps(job.get('directories', [])), json.dumps(job.get('excludes', [])), job.get('database_config_id'),
-              encrypted_restic_password, job.get('backup_prefix'), 1 if job.get('schedule_enabled') else 0,
+              encrypted_restic_password, job.get('backup_prefix'), bool(job.get('schedule_enabled')),
               job.get('schedule_cron', '0 2 * * *'), job.get('retention_hourly', 24), job.get('retention_daily', 7),
               job.get('retention_weekly', 4), job.get('retention_monthly', 12), job.get('timeout', 7200),
               job.get('status', 'pending'), job.get('created_at', utc_isoformat()), job.get('updated_at'),
@@ -655,7 +655,7 @@ def create_s3_config(config):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (config['id'], config['name'], config['endpoint'], config['bucket'],
           encrypt_credential(config['access_key']), encrypt_credential(config['secret_key']),
-          config.get('region', ''), 1 if config.get('skip_ssl_verify') else 0,
+          config.get('region', ''), bool(config.get('skip_ssl_verify')),
           config.get('status', 'active'), config.get('created_at', utc_isoformat()), config.get('updated_at')))
     conn.commit()
 
@@ -669,7 +669,7 @@ def update_s3_config(config_id, config):
         WHERE id=?
     ''', (config['name'], config['endpoint'], config['bucket'],
           encrypt_credential(config['access_key']), encrypt_credential(config['secret_key']),
-          config.get('region', ''), 1 if config.get('skip_ssl_verify') else 0,
+          config.get('region', ''), bool(config.get('skip_ssl_verify')),
           config.get('status', 'active'), utc_isoformat(), config_id))
     conn.commit()
 
@@ -842,9 +842,9 @@ def create_notification_channel(channel):
     conn.execute('''
         INSERT INTO notification_channels (id, name, type, enabled, config, notify_on_success, notify_on_failure, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (channel['id'], channel['name'], channel['type'], 1 if channel.get('enabled', True) else 0,
-          json.dumps(channel.get('config', {})), 1 if channel.get('notify_on_success', True) else 0,
-          1 if channel.get('notify_on_failure', True) else 0, channel.get('created_at', utc_isoformat()),
+    ''', (channel['id'], channel['name'], channel['type'], bool(channel.get('enabled', True)),
+          json.dumps(channel.get('config', {})), bool(channel.get('notify_on_success', True)),
+          bool(channel.get('notify_on_failure', True)), channel.get('created_at', utc_isoformat()),
           channel.get('updated_at')))
     conn.commit()
 
@@ -856,9 +856,9 @@ def update_notification_channel(channel_id, channel):
     conn.execute('''
         UPDATE notification_channels SET name=?, type=?, enabled=?, config=?, notify_on_success=?, notify_on_failure=?, updated_at=?
         WHERE id=?
-    ''', (channel['name'], channel['type'], 1 if channel.get('enabled', True) else 0,
-          json.dumps(channel.get('config', {})), 1 if channel.get('notify_on_success', True) else 0,
-          1 if channel.get('notify_on_failure', True) else 0, utc_isoformat(), channel_id))
+    ''', (channel['name'], channel['type'], bool(channel.get('enabled', True)),
+          json.dumps(channel.get('config', {})), bool(channel.get('notify_on_success', True)),
+          bool(channel.get('notify_on_failure', True)), utc_isoformat(), channel_id))
     conn.commit()
 
 
