@@ -1076,7 +1076,11 @@ def send_telegram_notification(channel, job_name, status, message, duration):
                 logger.info(f"Telegram notification sent for job {job_name}")
             else:
                 logger.warning(f"Telegram API error: {result.get('description', 'Unknown error')}")
-    except (URLError, HTTPError) as e:
+    except HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')
+        logger.error(f"Failed to send Telegram notification: {e} — {body}")
+        raise
+    except URLError as e:
         logger.error(f"Failed to send Telegram notification: {e}")
         raise
 
