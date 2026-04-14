@@ -1051,12 +1051,9 @@ def send_telegram_notification(channel, job_name, status, message, duration):
     emoji = get_status_emoji(status)
 
     # Format message for Telegram (using HTML parse mode)
-    text = f"""<b>{emoji} Backup Job: {job_name}</b>
-
-<b>Status:</b> {status.upper()}
-<b>Duration:</b> {format_duration(duration)}
-
-<pre>{message[:3000] if message else 'No additional details'}</pre>"""
+    text = f"""{emoji} <b>{job_name}</b> — {status.upper()}
+Duration: {format_duration(duration)}
+{message[:3000] if message else ''}"""
 
     api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
