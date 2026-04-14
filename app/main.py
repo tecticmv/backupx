@@ -519,6 +519,11 @@ def save_job(job_id, job):
     encrypted_s3_secret_key = encrypt_credential(job.get('s3_secret_key', '') or '')
     encrypted_restic_password = encrypt_credential(job.get('restic_password', '') or '')
 
+    # Convert empty string foreign keys to None for PostgreSQL
+    server_id = job.get('server_id') or None
+    s3_config_id = job.get('s3_config_id') or None
+    database_config_id = job.get('database_config_id') or None
+
     # Check if job exists
     exists = conn.fetchone('SELECT 1 FROM jobs WHERE id = ?', (job_id,))
 
@@ -529,10 +534,10 @@ def save_job(job_id, job):
                 restic_password=?, backup_prefix=?, schedule_enabled=?, schedule_cron=?, retention_hourly=?, retention_daily=?,
                 retention_weekly=?, retention_monthly=?, timeout=?, status=?, updated_at=?, last_run=?, last_success=?
             WHERE id=?
-        ''', (job['name'], job.get('backup_type', 'filesystem'), job.get('server_id'), job.get('s3_config_id'),
+        ''', (job['name'], job.get('backup_type', 'filesystem'), server_id, s3_config_id,
               job.get('remote_host'), job.get('ssh_port', 22), job.get('ssh_key'),
               job.get('s3_endpoint'), job.get('s3_bucket'), encrypted_s3_access_key, encrypted_s3_secret_key,
-              json.dumps(job.get('directories', [])), json.dumps(job.get('excludes', [])), job.get('database_config_id'),
+              json.dumps(job.get('directories', [])), json.dumps(job.get('excludes', [])), database_config_id,
               encrypted_restic_password, job.get('backup_prefix'), bool(job.get('schedule_enabled')),
               job.get('schedule_cron', '0 2 * * *'), job.get('retention_hourly', 24), job.get('retention_daily', 7),
               job.get('retention_weekly', 4), job.get('retention_monthly', 12), job.get('timeout', 7200),
@@ -545,10 +550,10 @@ def save_job(job_id, job):
                 restic_password, backup_prefix, schedule_enabled, schedule_cron, retention_hourly, retention_daily,
                 retention_weekly, retention_monthly, timeout, status, created_at, updated_at, last_run, last_success)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (job_id, job['name'], job.get('backup_type', 'filesystem'), job.get('server_id'), job.get('s3_config_id'),
+        ''', (job_id, job['name'], job.get('backup_type', 'filesystem'), server_id, s3_config_id,
               job.get('remote_host'), job.get('ssh_port', 22), job.get('ssh_key'),
               job.get('s3_endpoint'), job.get('s3_bucket'), encrypted_s3_access_key, encrypted_s3_secret_key,
-              json.dumps(job.get('directories', [])), json.dumps(job.get('excludes', [])), job.get('database_config_id'),
+              json.dumps(job.get('directories', [])), json.dumps(job.get('excludes', [])), database_config_id,
               encrypted_restic_password, job.get('backup_prefix'), bool(job.get('schedule_enabled')),
               job.get('schedule_cron', '0 2 * * *'), job.get('retention_hourly', 24), job.get('retention_daily', 7),
               job.get('retention_weekly', 4), job.get('retention_monthly', 12), job.get('timeout', 7200),
