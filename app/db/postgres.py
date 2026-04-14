@@ -443,4 +443,9 @@ class PostgresBackend(DatabaseBackend):
         ''')
         self.commit()
 
+        # Sync SERIAL sequences with existing data to prevent duplicate key errors
+        for table, seq in [('history', 'history_id_seq'), ('audit_log', 'audit_log_id_seq')]:
+            self.execute(f"SELECT setval('{seq}', COALESCE((SELECT MAX(id) FROM {table}), 0))")
+        self.commit()
+
         logger.info("PostgreSQL schema migration completed")
