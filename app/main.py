@@ -3187,17 +3187,23 @@ def api_dashboard_stats():
     running_jobs = sum(1 for j in jobs_list if j.get('status') == 'running')
     scheduled_jobs = sum(1 for j in jobs_list if j.get('schedule_enabled'))
 
+    # Parse entry timestamp — handles both datetime objects (PostgreSQL) and strings
+    def parse_entry_time(entry):
+        ts = entry.get('timestamp')
+        if isinstance(ts, datetime):
+            return ts.replace(tzinfo=None)
+        if isinstance(ts, str):
+            return datetime.fromisoformat(ts.replace('Z', '+00:00')).replace(tzinfo=None)
+        return None
+
     # Calculate success rate from last 7 days history
     now = datetime.now()
     seven_days_ago = now - timedelta(days=7)
     recent_history = []
     for entry in history:
-        try:
-            entry_time = datetime.fromisoformat(entry.get('timestamp', '').replace('Z', '+00:00'))
-            if entry_time.replace(tzinfo=None) >= seven_days_ago:
-                recent_history.append(entry)
-        except (ValueError, TypeError):
-            pass
+        entry_time = parse_entry_time(entry)
+        if entry_time and entry_time >= seven_days_ago:
+            recent_history.append(entry)
 
     total_recent = len(recent_history)
     successful_recent = sum(1 for e in recent_history if e.get('status') == 'success')
@@ -3207,12 +3213,9 @@ def api_dashboard_stats():
     twenty_four_hours_ago = now - timedelta(hours=24)
     last_24h = []
     for entry in history:
-        try:
-            entry_time = datetime.fromisoformat(entry.get('timestamp', '').replace('Z', '+00:00'))
-            if entry_time.replace(tzinfo=None) >= twenty_four_hours_ago:
-                last_24h.append(entry)
-        except (ValueError, TypeError):
-            pass
+        entry_time = parse_entry_time(entry)
+        if entry_time and entry_time >= twenty_four_hours_ago:
+            last_24h.append(entry)
 
     last_24h_success = sum(1 for e in last_24h if e.get('status') == 'success')
     last_24h_failed = sum(1 for e in last_24h if e.get('status') == 'failed')
@@ -3226,13 +3229,9 @@ def api_dashboard_stats():
 
         day_entries = []
         for entry in history:
-            try:
-                entry_time = datetime.fromisoformat(entry.get('timestamp', '').replace('Z', '+00:00'))
-                entry_time_naive = entry_time.replace(tzinfo=None)
-                if day_start <= entry_time_naive < day_end:
-                    day_entries.append(entry)
-            except (ValueError, TypeError):
-                pass
+            entry_time = parse_entry_time(entry)
+            if entry_time and day_start <= entry_time < day_end:
+                day_entries.append(entry)
 
         daily_stats.append({
             'date': day_start.strftime('%Y-%m-%d'),
@@ -3275,16 +3274,12 @@ def api_dashboard_stats():
         day_success = 0
         day_failed = 0
         for entry in history:
-            try:
-                entry_time = datetime.fromisoformat(entry.get('timestamp', '').replace('Z', '+00:00'))
-                entry_time_naive = entry_time.replace(tzinfo=None)
-                if day_start <= entry_time_naive < day_end:
-                    if entry.get('status') == 'success':
-                        day_success += 1
-                    elif entry.get('status') == 'failed':
-                        day_failed += 1
-            except (ValueError, TypeError):
-                pass
+            entry_time = parse_entry_time(entry)
+            if entry_time and day_start <= entry_time < day_end:
+                if entry.get('status') == 'success':
+                    day_success += 1
+                elif entry.get('status') == 'failed':
+                    day_failed += 1
 
         contribution_data.append({
             'date': day_start.strftime('%Y-%m-%d'),
