@@ -398,7 +398,7 @@ def reinit_scheduler_with_db_timezone():
     try:
         from .db import get_database
         db = get_database()
-        result = db.fetchone('SELECT value FROM app_settings WHERE key = %s', ('timezone',))
+        result = db.fetchone('SELECT value FROM app_settings WHERE key = ?', ('timezone',))
         db_tz = result['value'] if result else None
         timezone = db_tz or os.environ.get('TZ', 'UTC')
 
@@ -2301,7 +2301,7 @@ def api_create_job():
         'directories': data.get('directories', []),
         'excludes': data.get('excludes', []),
         # Database backup fields
-        'database_config_id': data.get('database_config_id'),
+        'database_config_id': data.get('database_config_id') or None,
         # Common fields
         'restic_password': data.get('restic_password'),
         'backup_prefix': data.get('backup_prefix', job_id),
@@ -2390,7 +2390,7 @@ def api_update_job(job_id):
         'directories': data.get('directories', job.get('directories', [])),
         'excludes': data.get('excludes', job.get('excludes', [])),
         # Database backup fields
-        'database_config_id': data.get('database_config_id', job.get('database_config_id')),
+        'database_config_id': data.get('database_config_id', job.get('database_config_id')) or None,
         # Common fields
         'backup_prefix': data.get('backup_prefix', job.get('backup_prefix', job_id)),
         'schedule_enabled': data.get('schedule_enabled', job.get('schedule_enabled', False)),
@@ -4733,7 +4733,7 @@ def get_app_setting(key: str, default: str = '') -> str:
     try:
         from .db import get_database
         db = get_database()
-        result = db.fetchone('SELECT value FROM app_settings WHERE key = %s', (key,))
+        result = db.fetchone('SELECT value FROM app_settings WHERE key = ?', (key,))
         return result['value'] if result else default
     except Exception as e:
         logger.error(f"Error getting app setting {key}: {e}")
@@ -4753,7 +4753,7 @@ def set_app_setting(key: str, value: str) -> tuple[bool, str]:
         # Upsert the setting
         db.execute('''
             INSERT INTO app_settings (key, value, updated_at)
-            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
         ''', (key, value))
         db.commit()
