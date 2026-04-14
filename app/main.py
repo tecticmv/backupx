@@ -1868,7 +1868,7 @@ exit $RESTIC_EXIT
             update_job_progress(job_id, 100, 'Database backup completed successfully')
             invalidate_snapshot_cache(job_id)
             update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
-            message = f'Database backup completed successfully ({databases})'
+            message = 'Database backup completed successfully'
             add_history(job_id, job['name'], 'success', message, duration)
             send_notification(job_id, job['name'], 'success', message, duration)
             logger.info(f"Database backup completed successfully: {job_id} (duration: {duration:.1f}s)")
