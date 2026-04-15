@@ -247,7 +247,7 @@ if rate_limit_storage == 'memory://' and is_production_mode():
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"],
+    default_limits=["5000 per hour"],
     storage_uri=rate_limit_storage,
 )
 
@@ -3164,6 +3164,7 @@ def api_snapshot_download_zip(job_id, snapshot_id):
 
 @app.route('/api/history')
 @login_required
+@limiter.exempt
 def api_history():
     """Get backup history"""
     history = load_history()
