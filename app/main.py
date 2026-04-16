@@ -3936,6 +3936,44 @@ def api_test_server_connection():
         return jsonify({'error': str(e)}), 500
 
 
+_ping_cache = {}  # server_id -> (timestamp, result)
+_PING_CACHE_TTL = 30  # seconds
+
+
+@app.route('/api/servers/<server_id>/ping', methods=['GET'])
+@login_required
+@limiter.exempt
+def api_ping_server(server_id):
+    """Fast TCP reachability check for a server (cached for 30s)."""
+    import socket
+    import time as _time
+
+    # Serve from cache if fresh
+    cached = _ping_cache.get(server_id)
+    if cached and (_time.time() - cached[0]) < _PING_CACHE_TTL:
+        return jsonify(cached[1])
+
+    server = get_server(server_id)
+    if not server:
+        return jsonify({'error': 'Server not found'}), 404
+
+    host = server.get('host')
+    port = int(server.get('ssh_port') or 22)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(3)
+    try:
+        sock.connect((host, port))
+        result = {'status': 'online'}
+    except (socket.timeout, socket.error):
+        result = {'status': 'offline'}
+    finally:
+        sock.close()
+
+    _ping_cache[server_id] = (_time.time(), result)
+    return jsonify(result)
+
+
 @app.route('/api/servers/<server_id>/test', methods=['POST'])
 @login_required
 @csrf.exempt

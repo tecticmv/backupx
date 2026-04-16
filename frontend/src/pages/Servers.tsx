@@ -117,6 +117,27 @@ export default function Servers() {
     }
   };
 
+  // Fast TCP-only reachability check for page load (cached server-side)
+  const pingServer = async (serverId: string): Promise<ServerStatus> => {
+    setServerStatuses((prev) => ({
+      ...prev,
+      [serverId]: { status: "checking" },
+    }));
+
+    try {
+      const response = await fetch(`/api/servers/${serverId}/ping`);
+      const data = await response.json();
+      const status: ServerStatus = { status: data.status === "online" ? "online" : "offline" };
+      setServerStatuses((prev) => ({ ...prev, [serverId]: status }));
+      return status;
+    } catch {
+      const status: ServerStatus = { status: "offline", message: "Connection failed" };
+      setServerStatuses((prev) => ({ ...prev, [serverId]: status }));
+      return status;
+    }
+  };
+
+  // Full SSH test with Restic version check (used by manual "Test" button)
   const checkServerConnection = async (serverId: string): Promise<ServerStatus> => {
     setServerStatuses((prev) => ({
       ...prev,
@@ -154,7 +175,7 @@ export default function Servers() {
 
   const checkAllConnections = async () => {
     setIsRefreshingAll(true);
-    await Promise.all(servers.map((server) => checkServerConnection(server.id)));
+    await Promise.all(servers.map((server) => pingServer(server.id)));
     setIsRefreshingAll(false);
   };
 
