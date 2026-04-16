@@ -32,7 +32,7 @@ class PostgresBackend(DatabaseBackend):
         user: str = 'backupx',
         password: str = '',
         pool_min: int = 2,
-        pool_max: int = 10,
+        pool_max: int = 30,
         ssl_mode: str = 'prefer'
     ):
         """

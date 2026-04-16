@@ -426,6 +426,15 @@ def get_db_connection():
     return get_db()
 
 
+@app.teardown_appcontext
+def release_db_connection(exception=None):
+    """Release the thread's DB connection back to the pool after each request."""
+    try:
+        get_db().close()
+    except Exception as e:
+        logger.debug(f"Error releasing DB connection: {e}")
+
+
 def init_db():
     """Initialize PostgreSQL database schema via the database backend"""
     from .db import init_database
@@ -1151,6 +1160,17 @@ def send_notification(job_id, job_name, status, message, duration):
 
 def run_backup(job_id):
     """Execute a backup job"""
+    try:
+        return _run_backup_inner(job_id)
+    finally:
+        # Release this thread's DB connection back to the pool
+        try:
+            get_db().close()
+        except Exception:
+            pass
+
+
+def _run_backup_inner(job_id):
     job = get_job(job_id)
     if not job:
         return False, "Job not found"
