@@ -1802,19 +1802,36 @@ def run_database_backup(job_id, job):
         if use_docker:
             # Use the db_type from the config directly - it was set when the user picked
             # the container (either manually or via "Pick from server")
+            docker_detect = 'if docker ps >/dev/null 2>&1; then DOCKER="docker"; else DOCKER="sudo -n docker"; fi'
+
             if is_postgres:
-                dump_inner = f'pg_dumpall -U postgres'
+                # The cluster superuser is often not named "postgres" (it follows
+                # POSTGRES_USER in the official image), and pg_dumpall connects to a
+                # "postgres" database by default which may not exist either. Prefer the
+                # configured username, otherwise read both from the container's own env.
+                if (db_config.get('username') or '').strip():
+                    user_line = f'PG_USER={db_user}'
+                else:
+                    user_line = (f'PG_USER=$($DOCKER exec {safe_container} printenv POSTGRES_USER 2>/dev/null); '
+                                 f'[ -n "$PG_USER" ] || PG_USER=postgres')
+                db_line = (f'PG_DB=$($DOCKER exec {safe_container} printenv POSTGRES_DB 2>/dev/null); '
+                           f'[ -n "$PG_DB" ] || PG_DB=postgres')
+                dump_body = f'$DOCKER exec {safe_container} pg_dumpall -U "$PG_USER" -l "$PG_DB"'
+                resolve_lines = f'{user_line}\n{db_line}'
                 backup_tag = 'postgres-backup'
                 dump_error_msg = 'pg_dumpall failed'
             else:
-                dump_inner = f'mysqldump --all-databases --single-transaction --routines --triggers'
+                dump_body = (f'$DOCKER exec {safe_container} mysqldump --all-databases '
+                             f'--single-transaction --routines --triggers')
+                resolve_lines = ''
                 backup_tag = 'mysql-backup'
                 dump_error_msg = 'mysqldump failed'
 
-            dump_cmd = f'''sh -c '
-if docker ps >/dev/null 2>&1; then DOCKER="docker"; else DOCKER="sudo -n docker"; fi
-$DOCKER exec {safe_container} {dump_inner}
-' '''
+            dump_cmd = f'''
+{docker_detect}
+{resolve_lines}
+{dump_body}
+'''
         elif is_postgres:
             # Direct connection from jump server
             if databases == '*':
@@ -1852,11 +1869,23 @@ fi
 BACKUP_DIR=$(mktemp -d)
 BACKUP_FILE="$BACKUP_DIR/{backup_filename}"
 
-# Dump database
+# Dump database.
+# pipefail matters here: without it $? reports gzip's status, and gzip happily turns a
+# failed dump into a valid 20-byte empty archive that then gets stored as a "successful"
+# backup. Not every /bin/sh supports it, so the emptiness guard below is the real net.
+set -o pipefail 2>/dev/null || true
 ( {dump_cmd} ) | gzip > "$BACKUP_FILE"
+DUMP_RC=$?
 
-if [ $? -ne 0 ]; then
+if [ $DUMP_RC -ne 0 ]; then
     echo "{dump_error_msg}"
+    rm -rf "$BACKUP_DIR"
+    exit 1
+fi
+
+# Refuse to store a dump that produced no data at all
+if [ -z "$(gzip -dc "$BACKUP_FILE" 2>/dev/null | head -c 1)" ]; then
+    echo "{dump_error_msg}: dump produced no output - refusing to store an empty backup"
     rm -rf "$BACKUP_DIR"
     exit 1
 fi
