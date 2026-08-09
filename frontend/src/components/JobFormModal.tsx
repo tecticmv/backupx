@@ -352,7 +352,7 @@ export default function JobFormModal({
                         <SelectItem value="database">
                           <div className="flex items-center gap-2">
                             <Database className="h-4 w-4" />
-                            MySQL Database Backup
+                            Database Backup
                           </div>
                         </SelectItem>
                       </SelectContent>
