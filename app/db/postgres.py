@@ -443,9 +443,14 @@ class PostgresBackend(DatabaseBackend):
         ''')
         self.commit()
 
-        # Sync SERIAL sequences with existing data to prevent duplicate key errors
+        # Sync SERIAL sequences with existing data to prevent duplicate key errors.
+        # The is_called flag is false when the table is empty, so the sequence stays
+        # at 1 for the first row — setval(seq, 0) would be out of bounds.
         for table, seq in [('history', 'history_id_seq'), ('audit_log', 'audit_log_id_seq')]:
-            self.execute(f"SELECT setval('{seq}', COALESCE((SELECT MAX(id) FROM {table}), 0))")
+            self.execute(
+                f"SELECT setval('{seq}', COALESCE((SELECT MAX(id) FROM {table}), 1), "
+                f"(SELECT MAX(id) FROM {table}) IS NOT NULL)"
+            )
         self.commit()
 
         logger.info("PostgreSQL schema migration completed")

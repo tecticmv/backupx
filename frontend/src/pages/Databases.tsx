@@ -298,7 +298,7 @@ export default function Databases() {
           <CardContent>
             <div className="text-2xl font-bold">{configs.length}</div>
             <p className="text-xs text-muted-foreground">
-              MySQL databases configured
+              MySQL / PostgreSQL databases configured
             </p>
           </CardContent>
         </Card>
@@ -324,7 +324,7 @@ export default function Databases() {
           <div>
             <CardTitle>Database Configurations</CardTitle>
             <CardDescription>
-              Configure MySQL database connections for backup jobs
+              Configure MySQL / PostgreSQL database connections for backup jobs
             </CardDescription>
           </div>
           <Button onClick={openNewDialog}>
@@ -338,7 +338,7 @@ export default function Databases() {
               <Database className="h-12 w-12 text-muted-foreground/50 mb-4" />
               <h3 className="font-medium">No database configurations</h3>
               <p className="text-sm text-muted-foreground mt-1 mb-4">
-                Add your first MySQL database to get started
+                Add your first MySQL or PostgreSQL database to get started
               </p>
               <Button onClick={openNewDialog}>
                 <Plus className="h-4 w-4 mr-2" />
@@ -424,8 +424,8 @@ export default function Databases() {
                 {editingConfig ? "Edit Database" : "Add Database"}
               </DialogTitle>
               <DialogDescription>
-                Configure your MySQL database connection for backups. The database
-                will be accessed via SSH from a configured server.
+                Configure your MySQL or PostgreSQL database connection for backups.
+                The database will be accessed via SSH from a configured server.
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-4 py-4">
@@ -607,7 +607,7 @@ export default function Databases() {
                   </SelectContent>
                 </Select>
                 <p className="text-xs text-muted-foreground">
-                  MySQL connection will be tested via SSH from the selected server
+                  Database connection will be tested via SSH from the selected server
                 </p>
               </div>
             </div>

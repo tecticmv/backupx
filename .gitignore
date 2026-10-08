@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*.local
+.env.s3
 *.env
 
 # Python
@@ -64,3 +65,5 @@ config/*.yaml
 *.key
 credentials.json
 secrets.yaml
+
+todo.md

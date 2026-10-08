@@ -61,9 +61,13 @@ export default function Jobs() {
   const [initializingJobs, setInitializingJobs] = useState<Set<string>>(new Set());
   const [jobModalOpen, setJobModalOpen] = useState(false);
   const [editingJobId, setEditingJobId] = useState<string | undefined>(undefined);
+  // Maps database config id -> engine, so a job's badge can name the real engine
+  // instead of assuming MySQL
+  const [dbEngines, setDbEngines] = useState<Record<string, string>>({});
 
   useEffect(() => {
     fetchJobs();
+    fetchDbEngines();
   }, []);
 
   // Poll for updates when jobs are running
@@ -89,6 +93,29 @@ export default function Jobs() {
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const fetchDbEngines = async () => {
+    try {
+      const response = await fetch("/api/databases");
+      if (response.ok) {
+        const configs = await response.json();
+        const map: Record<string, string> = {};
+        for (const c of Array.isArray(configs) ? configs : Object.values(configs)) {
+          if (c?.id) map[c.id] = c.type;
+        }
+        setDbEngines(map);
+      }
+    } catch {
+      // Non-fatal - the badge falls back to a generic "Database" label
+    }
+  };
+
+  const engineLabel = (dbConfigId?: string | null) => {
+    const type = dbConfigId ? dbEngines[dbConfigId] : undefined;
+    if (type === "postgres" || type === "postgresql") return "PostgreSQL";
+    if (type === "mysql") return "MySQL";
+    return "Database";
   };
 
   const runBackup = async (jobId: string) => {
@@ -331,7 +358,7 @@ export default function Jobs() {
                         {job.backup_type === "database" ? (
                           <>
                             <Database className="h-3 w-3" />
-                            MySQL
+                            {engineLabel(job.database_config_id)}
                           </>
                         ) : (
                           <>
