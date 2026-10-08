@@ -481,7 +481,27 @@ def _decrypt_job(job):
         job['s3_access_key'] = decrypt_credential(job.get('s3_access_key', '') or '')
         job['s3_secret_key'] = decrypt_credential(job.get('s3_secret_key', '') or '')
         job['restic_password'] = decrypt_credential(job.get('restic_password', '') or '')
+        _apply_linked_s3_config(job)
     return job
+
+
+def _apply_linked_s3_config(job):
+    """Use the linked S3 config's current endpoint/bucket/credentials.
+
+    Jobs keep a copy of these fields from when they were created or last
+    edited. Without this, rotating a key on the S3 config never reaches the
+    jobs, and they keep signing with the old secret (SignatureDoesNotMatch).
+    """
+    s3_config_id = job.get('s3_config_id')
+    if not s3_config_id:
+        return
+    s3_config = get_s3_config(s3_config_id)
+    if not s3_config:
+        return
+    job['s3_endpoint'] = s3_config['endpoint']
+    job['s3_bucket'] = s3_config['bucket']
+    job['s3_access_key'] = s3_config['access_key']
+    job['s3_secret_key'] = s3_config['secret_key']
 
 
 def load_jobs():
