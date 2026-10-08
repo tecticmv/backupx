@@ -1825,19 +1825,32 @@ def run_database_backup(job_id, job):
             docker_detect = 'if docker ps >/dev/null 2>&1; then DOCKER="docker"; else DOCKER="sudo -n docker"; fi'
 
             if is_postgres:
-                # The cluster superuser is often not named "postgres" (it follows
-                # POSTGRES_USER in the official image), and pg_dumpall connects to a
-                # "postgres" database by default which may not exist either. Prefer the
-                # configured username, otherwise read both from the container's own env.
-                if (db_config.get('username') or '').strip():
-                    user_line = f'PG_USER={db_user}'
-                else:
-                    user_line = (f'PG_USER=$($DOCKER exec {safe_container} printenv POSTGRES_USER 2>/dev/null); '
-                                 f'[ -n "$PG_USER" ] || PG_USER=postgres')
+                # pg_dumpall must run as a superuser: it reads every role from pg_authid.
+                # The configured username is often the application's own role (e.g. the
+                # DSpace user), which isn't one. Inside the container we connect over the
+                # local socket, so try the configured user, then the image's bootstrap
+                # superuser (POSTGRES_USER), then "postgres", and use the first superuser.
+                # pg_dumpall also connects to a "postgres" database by default, which may
+                # not exist, so use POSTGRES_DB from the container's env instead.
                 db_line = (f'PG_DB=$($DOCKER exec {safe_container} printenv POSTGRES_DB 2>/dev/null); '
                            f'[ -n "$PG_DB" ] || PG_DB=postgres')
+                user_line = (
+                    f'PG_USER=""\n'
+                    f'for u in {db_user} "$($DOCKER exec {safe_container} printenv POSTGRES_USER 2>/dev/null)" postgres; do\n'
+                    f'    [ -n "$u" ] || continue\n'
+                    f'    if [ "$($DOCKER exec {safe_container} psql -U "$u" -d "$PG_DB" -tAc '
+                    f'"select rolsuper from pg_roles where rolname = current_user" 2>/dev/null)" = "t" ]; then\n'
+                    f'        PG_USER="$u"; break\n'
+                    f'    fi\n'
+                    f'done\n'
+                    f'if [ -z "$PG_USER" ]; then\n'
+                    f'    echo "pg_dumpall needs a PostgreSQL superuser; none of the configured user, '
+                    f'POSTGRES_USER or postgres is one in this container" >&2\n'
+                    f'    exit 1\n'
+                    f'fi'
+                )
                 dump_body = f'$DOCKER exec {safe_container} pg_dumpall -U "$PG_USER" -l "$PG_DB"'
-                resolve_lines = f'{user_line}\n{db_line}'
+                resolve_lines = f'{db_line}\n{user_line}'
                 backup_tag = 'postgres-backup'
                 dump_error_msg = 'pg_dumpall failed'
             else:
