@@ -197,6 +197,8 @@ docker compose ps
    - Bucket: Your backup bucket name
    - Access Key / Secret Key: S3 credentials
    - Region: e.g., `us-east-1` (optional for some providers)
+   - Jobs linked to an S3 config always use its current endpoint, bucket and keys,
+     so rotating a key here applies to every job without re-saving them
 
 4. **Add Database Configs** (Configuration > Databases) - Optional
    - For MySQL database backups
