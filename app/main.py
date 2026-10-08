@@ -1868,7 +1868,26 @@ def run_database_backup(job_id, job):
         elif is_postgres:
             # Direct connection from jump server
             if databases == '*':
-                dump_cmd = f'PGPASSWORD={db_pass} pg_dumpall -h {db_host} -p {db_port} -U {db_user}'
+                # pg_dumpall reads every role from pg_authid, which needs a superuser. An
+                # application role (e.g. DSpace's) can't, so for non-superusers dump the
+                # globals without passwords, then every database the user owns (directly
+                # or through its owner role). --create keeps the pg_dumpall layout (CREATE DATABASE + \connect per DB).
+                conn = f'-h {db_host} -p {db_port} -U {db_user}'
+                dump_cmd = f'''
+export PGPASSWORD={db_pass}
+IS_SUPER=$(psql {conn} -d template1 -tAc "select rolsuper from pg_roles where rolname = current_user")
+if [ "$IS_SUPER" = "t" ]; then
+    pg_dumpall {conn}
+else
+    echo "-- {db_user} is not a superuser: role passwords omitted, per-database dumps" >&2
+    pg_dumpall {conn} --globals-only --no-role-passwords || exit 1
+    DBS=$(psql {conn} -d template1 -tAc "select datname from pg_database where datallowconn and not datistemplate and pg_has_role(datdba, 'MEMBER') order by 1") || exit 1
+    [ -n "$DBS" ] || {{ echo "no databases accessible to {db_user}" >&2; exit 1; }}
+    for db in $DBS; do
+        pg_dump {conn} --create "$db" || exit 1
+    done
+fi
+'''
             else:
                 db_list_raw = [db.strip() for db in databases.split(',') if db.strip()]
                 if len(db_list_raw) == 1:
