@@ -20,6 +20,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
+import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import type { Job, JobFormData } from "@/types/job";
 import type { S3Config } from "@/types/s3";
@@ -39,6 +40,7 @@ import {
   Eye,
   EyeOff,
   Copy,
+  Star,
 } from "lucide-react";
 import DirectoryBrowser from "@/components/DirectoryBrowser";
 
@@ -50,7 +52,7 @@ const defaultFormData: JobFormData = {
   directories: "",
   excludes: "",
   database_config_id: "",
-  s3_config_id: "",
+  s3_config_ids: [],
   restic_password: "",
   backup_prefix: "",
   schedule_enabled: false,
@@ -154,7 +156,11 @@ export default function JobFormModal({
             directories: (job.directories || []).join("\n"),
             excludes: (job.excludes || []).join("\n"),
             database_config_id: job.database_config_id || "",
-            s3_config_id: job.s3_config_id || "",
+            s3_config_ids: job.s3_config_ids?.length
+              ? job.s3_config_ids
+              : job.s3_config_id
+                ? [job.s3_config_id]
+                : [],
             restic_password: "",
             backup_prefix: job.backup_prefix,
             schedule_enabled: job.schedule_enabled,
@@ -227,8 +233,8 @@ export default function JobFormModal({
       return;
     }
 
-    if (!formData.s3_config_id) {
-      toast.error("Please select an S3 storage configuration");
+    if (formData.s3_config_ids.length === 0) {
+      toast.error("Please select at least one S3 storage");
       return;
     }
 
@@ -275,7 +281,22 @@ export default function JobFormModal({
   };
 
   const selectedServer = servers.find((s) => s.id === formData.server_id);
-  const selectedS3Config = s3Configs.find((c) => c.id === formData.s3_config_id);
+
+  const toggleS3Config = (id: string, selected: boolean) => {
+    setFormData((prev) => ({
+      ...prev,
+      s3_config_ids: selected
+        ? [...prev.s3_config_ids, id]
+        : prev.s3_config_ids.filter((c) => c !== id),
+    }));
+  };
+
+  const makePrimaryS3Config = (id: string) => {
+    setFormData((prev) => ({
+      ...prev,
+      s3_config_ids: [id, ...prev.s3_config_ids.filter((c) => c !== id)],
+    }));
+  };
   const selectedDbConfig = dbConfigs.find((c) => c.id === formData.database_config_id);
 
   return (
@@ -552,46 +573,73 @@ export default function JobFormModal({
                   </div>
                   <div className="space-y-4">
                     <div className="space-y-2">
-                      <Label>S3 Storage Configuration</Label>
-                      <Select
-                        value={formData.s3_config_id}
-                        onValueChange={(value) =>
-                          setFormData((prev) => ({ ...prev, s3_config_id: value }))
-                        }
-                      >
-                        <SelectTrigger>
-                          <SelectValue placeholder="Select an S3 storage configuration" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {s3Configs.length === 0 ? (
-                            <SelectItem value="_empty" disabled>
-                              No S3 configurations available
-                            </SelectItem>
-                          ) : (
-                            s3Configs.map((config) => (
-                              <SelectItem key={config.id} value={config.id}>
-                                {config.name} ({config.bucket})
-                              </SelectItem>
-                            ))
-                          )}
-                        </SelectContent>
-                      </Select>
-                      {s3Configs.length === 0 && (
+                      <Label>Storage Destinations</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Each backup is stored on every selected storage. Snapshots
+                        and restores use the primary unless you pick another.
+                      </p>
+                      {s3Configs.length === 0 ? (
                         <p className="text-xs text-amber-600">
                           Please configure S3 storage in Settings first
                         </p>
+                      ) : (
+                        <div className="rounded-lg border divide-y">
+                          {s3Configs.map((config) => {
+                            const index = formData.s3_config_ids.indexOf(config.id);
+                            const selected = index !== -1;
+                            return (
+                              <div
+                                key={config.id}
+                                className="flex items-center gap-3 p-3 text-sm"
+                              >
+                                <Switch
+                                  id={`s3-${config.id}`}
+                                  checked={selected}
+                                  onCheckedChange={(checked) =>
+                                    toggleS3Config(config.id, checked)
+                                  }
+                                />
+                                <label
+                                  htmlFor={`s3-${config.id}`}
+                                  className="flex-1 min-w-0 cursor-pointer"
+                                >
+                                  <div className="flex items-center gap-2">
+                                    <span className="font-medium truncate">
+                                      {config.name}
+                                    </span>
+                                    {config.status === "inactive" && (
+                                      <Badge variant="outline" className="text-xs">
+                                        Inactive
+                                      </Badge>
+                                    )}
+                                  </div>
+                                  <div className="font-mono text-xs text-muted-foreground truncate">
+                                    {config.endpoint}/{config.bucket}
+                                  </div>
+                                </label>
+                                {selected &&
+                                  (index === 0 ? (
+                                    <Badge variant="secondary" className="gap-1 shrink-0">
+                                      <Star className="h-3 w-3" />
+                                      Primary
+                                    </Badge>
+                                  ) : (
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="sm"
+                                      className="h-7 text-xs shrink-0"
+                                      onClick={() => makePrimaryS3Config(config.id)}
+                                    >
+                                      Make primary
+                                    </Button>
+                                  ))}
+                              </div>
+                            );
+                          })}
+                        </div>
                       )}
                     </div>
-                    {selectedS3Config && (
-                      <div className="rounded-lg border bg-muted/50 p-3 text-sm">
-                        <div className="grid grid-cols-2 gap-2 text-muted-foreground">
-                          <span>Endpoint:</span>
-                          <span className="font-mono">{selectedS3Config.endpoint}</span>
-                          <span>Bucket:</span>
-                          <span className="font-mono">{selectedS3Config.bucket}</span>
-                        </div>
-                      </div>
-                    )}
                     <div className="grid gap-4 md:grid-cols-2">
                       <div className="space-y-2">
                         <Label htmlFor="backup_prefix">Backup Prefix</Label>

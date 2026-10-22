@@ -75,16 +75,19 @@ export default function SnapshotBrowser() {
   const [isRestoring, setIsRestoring] = useState(false);
 
   const currentPath = searchParams.get("path") || "/";
+  // Storage chosen on the snapshots page; empty means the job's primary
+  const storageId = searchParams.get("storage") || "";
+  const storageQuery = storageId ? `&storage=${encodeURIComponent(storageId)}` : "";
 
   useEffect(() => {
     fetchFiles();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId, snapshotId, currentPath]);
+  }, [jobId, snapshotId, currentPath, storageId]);
 
   const fetchFiles = async () => {
     setIsLoading(true);
     try {
-      const url = `/api/jobs/${jobId}/snapshots/${snapshotId}/files?path=${encodeURIComponent(currentPath)}`;
+      const url = `/api/jobs/${jobId}/snapshots/${snapshotId}/files?path=${encodeURIComponent(currentPath)}${storageQuery}`;
       const response = await fetch(url);
       if (response.ok) {
         const data: SnapshotFilesResponse = await response.json();
@@ -101,7 +104,7 @@ export default function SnapshotBrowser() {
   };
 
   const navigateToPath = (path: string) => {
-    setSearchParams({ path });
+    setSearchParams(storageId ? { path, storage: storageId } : { path });
   };
 
   const handleRowClick = (item: SnapshotFile) => {
@@ -116,7 +119,7 @@ export default function SnapshotBrowser() {
     setDownloadingFiles((prev) => new Set(prev).add(item.path));
 
     try {
-      const url = `/api/jobs/${jobId}/snapshots/${snapshotId}/download?path=${encodeURIComponent(item.path)}`;
+      const url = `/api/jobs/${jobId}/snapshots/${snapshotId}/download?path=${encodeURIComponent(item.path)}${storageQuery}`;
       const response = await fetch(url);
 
       if (!response.ok) {
@@ -152,7 +155,7 @@ export default function SnapshotBrowser() {
     setDownloadingZip((prev) => new Set(prev).add(item.path));
 
     try {
-      const url = `/api/jobs/${jobId}/snapshots/${snapshotId}/download-zip?path=${encodeURIComponent(item.path)}`;
+      const url = `/api/jobs/${jobId}/snapshots/${snapshotId}/download-zip?path=${encodeURIComponent(item.path)}${storageQuery}`;
       const response = await fetch(url);
 
       if (!response.ok) {
@@ -201,6 +204,7 @@ export default function SnapshotBrowser() {
         body: JSON.stringify({
           source_path: restoreItem.path,
           target_path: targetPath,
+          storage: storageId || undefined,
         }),
       });
 
@@ -253,7 +257,11 @@ export default function SnapshotBrowser() {
           <Button
             variant="ghost"
             size="icon"
-            onClick={() => navigate(`/jobs/${jobId}/snapshots`)}
+            onClick={() =>
+              navigate(
+                `/jobs/${jobId}/snapshots${storageId ? `?storage=${encodeURIComponent(storageId)}` : ""}`
+              )
+            }
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>

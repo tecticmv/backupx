@@ -47,6 +47,11 @@ import {
   FolderSearch,
 } from "lucide-react";
 
+interface EndpointError {
+  message: string;
+  suggested?: string;
+}
+
 const initialFormData: S3ConfigFormData = {
   name: "",
   endpoint: "",
@@ -67,6 +72,7 @@ export default function Storage() {
   const [formData, setFormData] = useState<S3ConfigFormData>(initialFormData);
   const [isSaving, setIsSaving] = useState(false);
   const [isTestingConnection, setIsTestingConnection] = useState(false);
+  const [endpointError, setEndpointError] = useState<EndpointError | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
@@ -110,6 +116,9 @@ export default function Storage() {
 
       if (!response.ok) {
         const data = await response.json();
+        if (data.error_kind === "scheme") {
+          setEndpointError({ message: data.error, suggested: data.suggested_endpoint });
+        }
         throw new Error(data.error || "Failed to save S3 configuration");
       }
 
@@ -141,6 +150,7 @@ export default function Storage() {
       skip_ssl_verify: config.skip_ssl_verify || false,
       status: config.status || "active",
     });
+    setEndpointError(null);
     setIsDialogOpen(true);
   };
 
@@ -165,6 +175,7 @@ export default function Storage() {
 
   const handleTestConnection = async () => {
     setIsTestingConnection(true);
+    setEndpointError(null);
     try {
       // Include config ID when editing so backend can look up stored secret_key
       const testData = editingConfig
@@ -180,10 +191,13 @@ export default function Storage() {
       const data = await response.json();
 
       if (!response.ok) {
+        if (data.error_kind) {
+          setEndpointError({ message: data.error, suggested: data.suggested_endpoint });
+        }
         throw new Error(data.error || "Connection test failed");
       }
 
-      toast.success("S3 connection successful!");
+      toast.success(data.message || "S3 connection successful!");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Connection test failed");
     } finally {
@@ -194,6 +208,7 @@ export default function Storage() {
   const openNewDialog = () => {
     setEditingConfig(null);
     setFormData(initialFormData);
+    setEndpointError(null);
     setIsDialogOpen(true);
   };
 
@@ -363,9 +378,39 @@ export default function Storage() {
                   name="endpoint"
                   placeholder="s3.amazonaws.com or minio.example.com:9000"
                   value={formData.endpoint}
-                  onChange={handleInputChange}
+                  onChange={(e) => {
+                    setEndpointError(null);
+                    handleInputChange(e);
+                  }}
+                  aria-invalid={!!endpointError}
                   required
                 />
+                {endpointError ? (
+                  <div className="rounded-md border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive space-y-2">
+                    <p>{endpointError.message}</p>
+                    {endpointError.suggested && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-xs"
+                        onClick={() => {
+                          setFormData((prev) => ({
+                            ...prev,
+                            endpoint: endpointError.suggested!,
+                          }));
+                          setEndpointError(null);
+                        }}
+                      >
+                        Use {endpointError.suggested}
+                      </Button>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Uses HTTPS by default. Prefix with http:// for a server without TLS.
+                  </p>
+                )}
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="grid gap-2">

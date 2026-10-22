@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { useParams, useNavigate, Link } from "react-router-dom";
+import { useParams, useNavigate, useSearchParams, Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -34,8 +34,15 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { toast } from "sonner";
-import type { Job, Snapshot, RepoStats } from "@/types/job";
+import type { Job, JobStorage, Snapshot, RepoStats } from "@/types/job";
 import {
   ArrowLeft,
   Play,
@@ -56,8 +63,14 @@ import {
 export default function Snapshots() {
   const { jobId } = useParams<{ jobId: string }>();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const storageId = searchParams.get("storage") || "";
+  // Query string for the selected storage; empty means the job's primary
+  const storageQuery = storageId ? `storage=${encodeURIComponent(storageId)}` : "";
 
   const [job, setJob] = useState<Job | null>(null);
+  const [storages, setStorages] = useState<JobStorage[]>([]);
+  const [snapshotsError, setSnapshotsError] = useState<string | null>(null);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
   const [stats, setStats] = useState<RepoStats | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -82,13 +95,15 @@ export default function Snapshots() {
   useEffect(() => {
     fetchData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobId]);
+  }, [jobId, storageId]);
 
   const fetchData = async () => {
+    setStats(null);
     try {
-      const [jobsRes, snapshotsRes] = await Promise.all([
+      const [jobsRes, snapshotsRes, storagesRes] = await Promise.all([
         fetch("/api/jobs"),
-        fetch(`/api/jobs/${jobId}/snapshots`),
+        fetch(`/api/jobs/${jobId}/snapshots?${storageQuery}`),
+        fetch(`/api/jobs/${jobId}/storages`),
       ]);
 
       if (jobsRes.ok) {
@@ -98,13 +113,22 @@ export default function Snapshots() {
         }
       }
 
+      if (storagesRes.ok) {
+        const data = await storagesRes.json();
+        setStorages(data.storages || []);
+      }
+
+      const data = await snapshotsRes.json();
       if (snapshotsRes.ok) {
-        const data = await snapshotsRes.json();
         setSnapshots(data.snapshots || []);
+        setSnapshotsError(data.error || null);
+      } else {
+        setSnapshots([]);
+        setSnapshotsError(data.error || "Failed to load snapshots");
       }
 
       // Fetch stats in the background (slower)
-      fetch(`/api/jobs/${jobId}/snapshots/stats`)
+      fetch(`/api/jobs/${jobId}/snapshots/stats?${storageQuery}`)
         .then((res) => res.ok ? res.json() : null)
         .then((data) => data && setStats(data.stats))
         .catch(() => {});
@@ -160,6 +184,7 @@ export default function Snapshots() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             target_database: targetDatabase || undefined,
+            storage: storageId || undefined,
           }),
         }
       );
@@ -190,6 +215,7 @@ export default function Snapshots() {
         body: JSON.stringify({
           source_path: "/",
           target_path: targetPath,
+          storage: storageId || undefined,
         }),
       });
 
@@ -213,7 +239,7 @@ export default function Snapshots() {
 
     try {
       // Download the root path of the snapshot as ZIP
-      const url = `/api/jobs/${jobId}/snapshots/${snapshot.id}/download-zip?path=/`;
+      const url = `/api/jobs/${jobId}/snapshots/${snapshot.id}/download-zip?path=/&${storageQuery}`;
       const response = await fetch(url);
 
       if (!response.ok) {
@@ -359,9 +385,38 @@ export default function Snapshots() {
             <CardTitle>Snapshots</CardTitle>
             <CardDescription>All backup snapshots in the repository</CardDescription>
           </div>
+          {storages.length > 1 && (
+            <Select
+              value={storageId || storages[0]?.id || ""}
+              onValueChange={(value) =>
+                setSearchParams(value === storages[0]?.id ? {} : { storage: value })
+              }
+            >
+              <SelectTrigger className="w-64">
+                <SelectValue placeholder="Storage" />
+              </SelectTrigger>
+              <SelectContent>
+                {storages.map((storage) => (
+                  <SelectItem key={storage.id ?? ""} value={storage.id ?? ""}>
+                    {storage.name}
+                    {storage.primary ? " (primary)" : ""}
+                    {storage.status === "inactive" ? " (inactive)" : ""}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
         </CardHeader>
         <CardContent>
+          {snapshotsError && (
+            <Alert variant="destructive" className="mb-4">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>Could not read snapshots from this storage</AlertTitle>
+              <AlertDescription className="break-all">{snapshotsError}</AlertDescription>
+            </Alert>
+          )}
           {snapshots.length === 0 ? (
+            snapshotsError ? null : (
             <div className="flex flex-col items-center justify-center py-10 text-center">
               <Camera className="h-12 w-12 text-muted-foreground/50 mb-4" />
               <h3 className="font-medium">No snapshots yet</h3>
@@ -377,6 +432,7 @@ export default function Snapshots() {
                 Run First Backup
               </Button>
             </div>
+            )
           ) : (
             <Table>
               <TableHeader>
@@ -430,7 +486,11 @@ export default function Snapshots() {
                         <Button
                           variant="ghost"
                           size="icon"
-                          onClick={() => navigate(`/jobs/${jobId}/snapshots/${snapshot.id}/files`)}
+                          onClick={() =>
+                            navigate(
+                              `/jobs/${jobId}/snapshots/${snapshot.id}/files${storageQuery ? `?${storageQuery}` : ""}`
+                            )
+                          }
                           title="Browse files"
                         >
                           <FolderOpen className="h-4 w-4" />

@@ -285,6 +285,7 @@ class PostgresBackend(DatabaseBackend):
                 backup_type TEXT DEFAULT 'filesystem',
                 server_id TEXT REFERENCES servers(id),
                 s3_config_id TEXT REFERENCES s3_configs(id),
+                s3_config_ids TEXT,
                 remote_host TEXT,
                 ssh_port INTEGER DEFAULT 22,
                 ssh_key TEXT,
@@ -432,6 +433,9 @@ class PostgresBackend(DatabaseBackend):
             self.add_column('jobs', 'progress', 'INTEGER', '0')
         if 'progress_message' not in job_columns:
             self.add_column('jobs', 'progress_message', 'TEXT')
+        if 's3_config_ids' not in job_columns:
+            # JSON list of storage IDs, primary first; s3_config_id keeps the primary
+            self.add_column('jobs', 's3_config_ids', 'TEXT')
 
         # Create app_settings table if it doesn't exist
         self.executescript('''

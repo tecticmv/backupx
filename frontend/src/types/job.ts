@@ -11,8 +11,9 @@ export interface Job {
   excludes: string[];
   // Database backup fields
   database_config_id?: string;
-  // S3 storage config
+  // S3 storage config: primary storage, plus every storage the job backs up to (primary first)
   s3_config_id: string;
+  s3_config_ids: string[];
   // Legacy fields for backwards compatibility (populated from s3 config)
   s3_endpoint?: string;
   s3_bucket?: string;
@@ -47,6 +48,15 @@ export interface HistoryEntry {
   status: "success" | "failed" | "timeout" | "error";
   message: string;
   duration: number;
+}
+
+export interface JobStorage {
+  id: string | null;
+  name: string;
+  endpoint: string;
+  bucket: string;
+  status: "active" | "inactive";
+  primary: boolean;
 }
 
 export interface Snapshot {
@@ -86,8 +96,8 @@ export interface JobFormData {
   excludes: string;
   // Database backup fields
   database_config_id: string;
-  // S3 storage config
-  s3_config_id: string;
+  // S3 storages to back up to, primary first
+  s3_config_ids: string[];
   restic_password: string;
   backup_prefix: string;
   schedule_enabled: boolean;

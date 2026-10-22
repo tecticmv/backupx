@@ -370,13 +370,170 @@ def validate_cron(cron_expr: str) -> bool:
     return all(cron_pattern.match(p) for p in parts)
 
 
+def normalize_s3_endpoint(endpoint: str) -> str:
+    """Normalize a user-entered S3 endpoint for storage.
+
+    HTTPS is the default and is stored bare ("host[:port]"); plain HTTP must be
+    explicit, so it keeps its "http://" prefix. Trailing slashes are dropped.
+    """
+    endpoint = (endpoint or '').strip().rstrip('/')
+    lowered = endpoint.lower()
+    if lowered.startswith('https://'):
+        return endpoint[len('https://'):]
+    if lowered.startswith('http://'):
+        return 'http://' + endpoint[len('http://'):]
+    return endpoint
+
+
 def validate_s3_endpoint(endpoint: str) -> bool:
-    """Validate S3 endpoint format"""
+    """Validate S3 endpoint format (host[:port], optionally prefixed with http:// or https://)"""
     if not endpoint:
         return False
-    # Allow domain:port or just domain
+    host = normalize_s3_endpoint(endpoint)
+    if host.startswith('http://'):
+        host = host[len('http://'):]
     endpoint_pattern = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9\-\.]*[a-zA-Z0-9](:\d+)?$')
-    return bool(endpoint_pattern.match(endpoint))
+    return bool(endpoint_pattern.match(host))
+
+
+S3_ENDPOINT_FORMAT_ERROR = ('Invalid S3 endpoint. Use a host name with an optional port, such as '
+                            's3.example.com or minio.local:9000. Prefix it with http:// for a server '
+                            'without TLS; paths are not allowed.')
+
+
+def s3_endpoint_url(endpoint: str) -> str:
+    """Full URL for a stored endpoint: HTTPS unless it was saved with http://"""
+    endpoint = normalize_s3_endpoint(endpoint)
+    return endpoint if endpoint.startswith('http://') else f'https://{endpoint}'
+
+
+def restic_repo_url(endpoint: str, bucket: str, prefix: str) -> str:
+    return f"s3:{s3_endpoint_url(endpoint)}/{bucket}/{prefix}"
+
+
+def _speaks_plain_http(host, port, timeout):
+    import http.client
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.request('HEAD', '/')
+        conn.getresponse()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def _speaks_tls(host, port, timeout):
+    import socket
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host):
+                return True
+    except Exception:
+        return False
+
+
+def probe_s3_endpoint(endpoint, skip_ssl_verify=False, timeout=8):
+    """Check that an endpoint is reachable with the scheme it was given.
+
+    Returns (kind, message): kind is 'ok', 'scheme' (HTTPS/HTTP mismatch, with
+    the endpoint to use instead), 'tls' (certificate problem) or 'network'.
+    """
+    import socket
+    from urllib.parse import urlparse
+
+    url = s3_endpoint_url(endpoint)
+    parsed = urlparse(url)
+    host = parsed.hostname
+    use_tls = parsed.scheme == 'https'
+    port = parsed.port or (443 if use_tls else 80)
+    host_port = f"{host}:{parsed.port}" if parsed.port else host
+
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except socket.gaierror:
+        return 'network', f"Cannot resolve host '{host}'. Check the endpoint name."
+    except (socket.timeout, TimeoutError):
+        return 'network', f"Timed out connecting to {host}:{port}. Check the address, port and firewall."
+    except ConnectionRefusedError:
+        return 'network', f"Connection refused by {host}:{port}. Nothing is listening on that port."
+    except OSError as e:
+        return 'network', f"Cannot connect to {host}:{port}: {e.strerror or e}"
+
+    if not use_tls:
+        sock.close()
+        # Some HTTPS servers answer plain HTTP with a 400 page, so check for TLS directly
+        if _speaks_tls(host, port, timeout):
+            return 'scheme', (f"{host}:{port} only accepts HTTPS, but the endpoint is set to plain HTTP. "
+                              f"Remove the http:// prefix and use {host_port}.")
+        return 'ok', None
+
+    ctx = ssl.create_default_context()
+    if skip_ssl_verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with ctx.wrap_socket(sock, server_hostname=host):
+            return 'ok', None
+    except ssl.SSLCertVerificationError as e:
+        reason = getattr(e, 'verify_message', None) or str(e)
+        return 'tls', (f"The TLS certificate of {host} could not be verified ({reason}). "
+                       f"If it is self-signed, enable Skip SSL.")
+    except (ssl.SSLError, OSError) as e:
+        sock.close()
+        if _speaks_plain_http(host, port, timeout):
+            return 'scheme', (f"{host}:{port} does not support HTTPS; it answered over plain HTTP. "
+                              f"Set the endpoint to http://{host_port}.")
+        return 'network', f"TLS handshake with {host}:{port} failed: {e}"
+
+
+def _toggle_endpoint_scheme(endpoint):
+    """The same endpoint with the other scheme (HTTPS is stored without a prefix)."""
+    endpoint = normalize_s3_endpoint(endpoint)
+    return endpoint[len('http://'):] if endpoint.startswith('http://') else f'http://{endpoint}'
+
+
+def _endpoint_scheme_error(endpoint, skip_ssl_verify):
+    """Error response if the endpoint is reachable but only with the other scheme, else None.
+
+    Other failures don't block saving: the storage is used from the backed-up
+    servers, which may reach it when BackupX itself cannot.
+    """
+    try:
+        kind, message = probe_s3_endpoint(endpoint, skip_ssl_verify, timeout=5)
+    except Exception as e:
+        logger.debug(f"Endpoint probe failed for {endpoint}: {e}")
+        return None
+    if kind != 'scheme':
+        return None
+    return {'error': message, 'error_kind': kind, 'suggested_endpoint': _toggle_endpoint_scheme(endpoint)}
+
+
+def explain_rclone_error(stderr):
+    """Turn rclone's S3 error output into a short, actionable message."""
+    text = stderr or ''
+    known = [
+        ('InvalidAccessKeyId', 'The access key is not recognized by this endpoint.'),
+        ('SignatureDoesNotMatch', 'The secret key is wrong for this access key.'),
+        ('AccessDenied', 'Access denied. The credentials are valid but lack permission for this bucket.'),
+        ('NoSuchBucket', 'The bucket does not exist on this endpoint.'),
+        ('AuthorizationHeaderMalformed', 'The region does not match the bucket. Check the Region field.'),
+        ('PermanentRedirect', 'The bucket lives in a different region or endpoint. Check the Region and Endpoint.'),
+        ('server gave HTTP response to HTTPS client', 'The endpoint does not support HTTPS. Prefix it with http://.'),
+        ('x509', 'The TLS certificate could not be verified. If it is self-signed, enable Skip SSL.'),
+    ]
+    for needle, message in known:
+        if needle in text:
+            return message
+    # Drop rclone's timestamps/levels and keep the last meaningful line
+    lines = [re.sub(r'^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} (ERROR|NOTICE|INFO)\s*:\s*', '', l).strip()
+             for l in text.splitlines()]
+    lines = [l for l in lines if l]
+    return sanitize_error_message(lines[-1]) if lines else 'Connection failed'
 
 
 def validate_bucket_name(name: str) -> bool:
@@ -504,6 +661,17 @@ def _apply_linked_s3_config(job):
     job['s3_secret_key'] = s3_config['secret_key']
 
 
+def _parse_s3_config_ids(job):
+    """Ordered storage IDs for a job (primary first). Older rows only have s3_config_id."""
+    try:
+        ids = json.loads(job.get('s3_config_ids') or '[]')
+    except (TypeError, ValueError):
+        ids = []
+    if not ids and job.get('s3_config_id'):
+        ids = [job['s3_config_id']]
+    return ids
+
+
 def load_jobs():
     """Load all backup jobs from database"""
     conn = get_db_connection()
@@ -516,6 +684,7 @@ def load_jobs():
         # Convert JSON strings to lists
         job['directories'] = json.loads(job['directories'] or '[]')
         job['excludes'] = json.loads(job['excludes'] or '[]')
+        job['s3_config_ids'] = _parse_s3_config_ids(job)
         # Convert integer to boolean
         job['schedule_enabled'] = bool(job['schedule_enabled'])
         # Remove the 'id' from the job dict since it's the key
@@ -534,6 +703,7 @@ def get_job(job_id):
         job = _decrypt_job(dict(row))
         job['directories'] = json.loads(job['directories'] or '[]')
         job['excludes'] = json.loads(job['excludes'] or '[]')
+        job['s3_config_ids'] = _parse_s3_config_ids(job)
         job['schedule_enabled'] = bool(job['schedule_enabled'])
         return job
     return None
@@ -588,6 +758,9 @@ def save_job(job_id, job):
               job.get('retention_weekly', 4), job.get('retention_monthly', 12), job.get('timeout', 7200),
               job.get('status', 'pending'), job.get('created_at', utc_isoformat()), job.get('updated_at'),
               job.get('last_run'), job.get('last_success')))
+
+    s3_config_ids = job.get('s3_config_ids') or ([s3_config_id] if s3_config_id else [])
+    conn.execute('UPDATE jobs SET s3_config_ids=? WHERE id=?', (json.dumps(s3_config_ids), job_id))
 
     conn.commit()
 
@@ -714,6 +887,69 @@ def delete_s3_config(config_id):
     conn = get_db_connection()
     conn.execute('DELETE FROM s3_configs WHERE id = ?', (config_id,))
     conn.commit()
+
+
+# --- Job storage targets ---
+
+def get_job_storage_targets(job, include_inactive=False):
+    """Resolve the S3 storages a job writes to, primary first.
+
+    Inactive storages are skipped for backups but still readable, so their
+    snapshots can be browsed and restored. Jobs created before storage configs
+    existed carry their S3 credentials inline and get a single unnamed target.
+    """
+    targets = []
+    for config_id in job.get('s3_config_ids') or []:
+        config = get_s3_config(config_id)
+        if not config:
+            logger.warning(f"Job {job.get('name')} references missing S3 config {config_id}")
+            continue
+        if not include_inactive and config.get('status') == 'inactive':
+            continue
+        targets.append({
+            'id': config['id'],
+            'name': config['name'],
+            'endpoint': config['endpoint'],
+            'bucket': config['bucket'],
+            'access_key': config['access_key'],
+            'secret_key': config['secret_key'],
+            'skip_ssl_verify': config.get('skip_ssl_verify', False),
+            'status': config.get('status', 'active'),
+        })
+    if not job.get('s3_config_ids') and job.get('s3_endpoint'):
+        targets.append({
+            'id': None,
+            'name': job['s3_endpoint'],
+            'endpoint': job['s3_endpoint'],
+            'bucket': job.get('s3_bucket'),
+            'access_key': job.get('s3_access_key'),
+            'secret_key': job.get('s3_secret_key'),
+            'skip_ssl_verify': job.get('skip_ssl_verify', False),
+            'status': 'active',
+        })
+    return targets
+
+
+def resolve_job_storage(job, storage_id=None):
+    """Pick the storage to read snapshots from: the requested one, else the primary."""
+    targets = get_job_storage_targets(job, include_inactive=True)
+    if storage_id:
+        return next((t for t in targets if t['id'] == storage_id), None)
+    return targets[0] if targets else None
+
+
+def job_repo_url(job, target):
+    return restic_repo_url(target['endpoint'], target['bucket'], job.get('backup_prefix') or job.get('id', ''))
+
+
+def job_restic_env(job, target):
+    """Local environment for running restic against one of a job's storages."""
+    env = os.environ.copy()
+    env['AWS_ACCESS_KEY_ID'] = target['access_key'] or ''
+    env['AWS_SECRET_ACCESS_KEY'] = target['secret_key'] or ''
+    env['RESTIC_PASSWORD'] = job['restic_password']
+    env['RESTIC_REPOSITORY'] = job_repo_url(job, target)
+    return env
 
 
 
@@ -1195,12 +1431,14 @@ def _run_backup_inner(job_id):
     if not job:
         return False, "Job not found"
 
-    # Get S3 config to get skip_ssl_verify setting
-    s3_config_id = job.get('s3_config_id')
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if s3_config:
-            job['skip_ssl_verify'] = s3_config.get('skip_ssl_verify', False)
+    targets = get_job_storage_targets(job)
+    if not targets:
+        error_msg = "No active S3 storage is configured for this job"
+        update_job_status(job_id, 'error')
+        add_history(job_id, job['name'], 'error', error_msg, 0)
+        send_notification(job_id, job['name'], 'error', error_msg, 0)
+        logger.error(f"Backup aborted - {error_msg}: {job_id}")
+        return False, error_msg
 
     server_id = job.get('server_id')
     server = get_server(server_id) if server_id else None
@@ -1228,9 +1466,9 @@ def _run_backup_inner(job_id):
             return False, error_msg
 
     if backup_type == 'database':
-        return run_database_backup(job_id, job)
+        return run_database_backup(job_id, job, targets)
     else:
-        return run_filesystem_backup(job_id, job)
+        return run_filesystem_backup(job_id, job, targets)
 
 
 def sanitize_error_message(error: str, max_length: int = 500) -> str:
@@ -1576,15 +1814,27 @@ def _format_bytes(num_bytes):
     return f"{num_bytes:.1f} PB"
 
 
-def _stream_restic_progress(proc, job_id, timeout):
-    """Stream restic --json output, parse progress, update job progress in DB.
+def _stream_restic_progress(proc, job_id, timeout, target_names):
+    """Stream the output of a multi-storage backup script and track progress.
 
-    Returns (returncode, stderr_text).
+    The script brackets each storage with backupx_target / backupx_target_done
+    JSON markers and merges restic's stderr into stdout, so each storage's
+    output can be attributed to it. Restic's 0-100% for storage i of n is
+    mapped into its slice of our 30-90% progress range.
+
+    Returns (returncode, stderr_text, preamble_lines, target_results), where
+    target_results[i] is {'exit_code': int or None, 'output': [lines]}.
     """
     import time
 
-    stderr_lines = []
+    count = max(len(target_names), 1)
+    results = [{'exit_code': None, 'output': []} for _ in target_names]
+    preamble = []
+    current = None
     deadline = time.monotonic() + timeout
+
+    def label(text):
+        return f"{target_names[current]}: {text}" if count > 1 and current is not None else text
 
     for line in proc.stdout:
         if time.monotonic() > deadline:
@@ -1598,23 +1848,33 @@ def _stream_restic_progress(proc, job_id, timeout):
 
         try:
             msg = json.loads(line)
-        except json.JSONDecodeError:
-            # Non-JSON output (e.g. "Initializing new restic repository...")
+            if not isinstance(msg, dict):
+                raise ValueError
+        except ValueError:
+            # Plain text (e.g. "Initializing new restic repository..." or an error)
+            (results[current]['output'] if current is not None else preamble).append(line)
             continue
 
         msg_type = msg.get('message_type')
 
-        if msg_type == 'status':
+        if msg_type == 'backupx_target':
+            current = msg.get('index')
+            update_job_progress(job_id, 30 + int(current * 60 / count),
+                                label('Connecting to storage...'))
+
+        elif msg_type == 'backupx_target_done':
+            results[msg['index']]['exit_code'] = msg.get('exit_code')
+
+        elif msg_type == 'status':
             pct = msg.get('percent_done', 0)
             total = msg.get('total_bytes', 0)
             done = msg.get('bytes_done', 0)
-            # Map restic 0-100% into our 30-90% progress range
-            progress = 30 + int(pct * 60)
+            progress = 30 + int(((current or 0) + pct) * 60 / count)
             if total > 0:
                 status_msg = f"Backing up: {_format_bytes(done)} / {_format_bytes(total)} ({pct:.0%})"
             else:
                 status_msg = f"Backing up: {_format_bytes(done)} ({pct:.0%})"
-            update_job_progress(job_id, progress, status_msg)
+            update_job_progress(job_id, progress, label(status_msg))
 
         elif msg_type == 'summary':
             total = msg.get('total_bytes_processed', 0)
@@ -1622,20 +1882,104 @@ def _stream_restic_progress(proc, job_id, timeout):
             files_new = msg.get('files_new', 0)
             files_changed = msg.get('files_changed', 0)
             duration = msg.get('total_duration', 0)
-            update_job_progress(job_id, 90,
-                f"Done: {_format_bytes(total)} processed, {_format_bytes(added)} added, "
-                f"{files_new} new / {files_changed} changed files in {duration:.1f}s")
+            update_job_progress(job_id, 30 + int(((current or 0) + 1) * 60 / count),
+                label(f"Done: {_format_bytes(total)} processed, {_format_bytes(added)} added, "
+                      f"{files_new} new / {files_changed} changed files in {duration:.1f}s"))
 
-    # Collect stderr
-    if proc.stderr:
-        stderr_lines = proc.stderr.readlines()
+        elif msg_type in ('error', 'exit_error'):
+            # restic --json reports errors as JSON; keep them as readable text
+            error = msg.get('error')
+            if isinstance(error, dict):
+                error = error.get('message')
+            error = msg.get('message') or error or line
+            if msg.get('item'):
+                error = f"{msg['item']}: {error}"
+            (results[current]['output'] if current is not None else preamble).append(str(error))
 
+    stderr_text = proc.stderr.read() if proc.stderr else ''
     proc.wait()
-    return proc.returncode, ''.join(stderr_lines)
+    return proc.returncode, stderr_text, preamble, results
 
 
-def run_filesystem_backup(job_id, job):
-    """Execute a filesystem backup job"""
+def _restic_target_blocks(job, targets, backup_cmd):
+    """Shell for running one backup command against each storage in turn.
+
+    Each storage is independent: a failure on one does not stop the others,
+    and the script exits non-zero if any of them failed.
+    """
+    blocks = []
+    for index, target in enumerate(targets):
+        insecure_flag = '--insecure-tls' if target.get('skip_ssl_verify') else ''
+        blocks.append(f"""
+printf '{{"message_type":"backupx_target","index":{index}}}\\n'
+export AWS_ACCESS_KEY_ID={shlex.quote(target['access_key'] or '')}
+export AWS_SECRET_ACCESS_KEY={shlex.quote(target['secret_key'] or '')}
+export RESTIC_REPOSITORY={shlex.quote(job_repo_url(job, target))}
+
+# Ensure repository exists (init if needed, ignore "already initialized" errors)
+if ! restic cat config {insecure_flag} >/dev/null 2>&1; then
+    echo "Initializing new restic repository..."
+    restic init {insecure_flag} 2>&1 || true
+fi
+
+{backup_cmd} {insecure_flag} 2>&1
+RC=$?
+printf '{{"message_type":"backupx_target_done","index":{index},"exit_code":%d}}\\n' "$RC"
+[ $RC -eq 0 ] || BACKUPX_FAILED=1
+""")
+    return 'BACKUPX_FAILED=0\n' + ''.join(blocks)
+
+
+def _target_error(result):
+    """Short error text for one storage from its captured output."""
+    lines = [l for l in result['output'] if not l.startswith('Initializing new restic repository')]
+    if result['exit_code'] is None:
+        return 'did not run'
+    return ' '.join(lines[-3:]) if lines else f'restic exited with code {result["exit_code"]}'
+
+
+def _finish_backup(job_id, job, targets, start_time, returncode, stderr_text, preamble, results, label):
+    """Record the outcome of a (possibly multi-storage) backup run."""
+    duration = (utc_now() - start_time).total_seconds()
+    succeeded = [t['name'] for t, r in zip(targets, results) if r['exit_code'] == 0]
+    failed = [(t['name'], _target_error(r)) for t, r in zip(targets, results) if r['exit_code'] != 0]
+
+    if returncode == 0 and not failed:
+        message = f'{label} completed successfully'
+        if len(targets) > 1:
+            message += f" on all {len(targets)} storages ({', '.join(succeeded)})"
+        update_job_progress(job_id, 100, message)
+        invalidate_snapshot_cache(job_id)
+        update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
+        add_history(job_id, job['name'], 'success', message, duration)
+        send_notification(job_id, job['name'], 'success', message, duration)
+        logger.info(f"{label} completed successfully: {job_id} (duration: {duration:.1f}s)")
+        return True, message
+
+    if not any(r['exit_code'] is not None for r in results):
+        # Failed before reaching any storage (SSH, database dump, ...)
+        error_msg = '\n'.join(filter(None, [stderr_text.strip(), '\n'.join(preamble)])) or f'{label} failed'
+    elif len(targets) == 1:
+        error_msg = _target_error(results[0])
+    else:
+        details = '; '.join(f'{name}: {error}' for name, error in failed)
+        if succeeded:
+            error_msg = f"Stored on {', '.join(succeeded)} but failed on {len(failed)} of {len(targets)} storages - {details}"
+        else:
+            error_msg = f'Failed on all {len(targets)} storages - {details}'
+    error_msg = sanitize_error_message(error_msg)
+
+    if succeeded:
+        invalidate_snapshot_cache(job_id)
+    update_job_status(job_id, 'failed')
+    add_history(job_id, job['name'], 'failed', error_msg, duration)
+    send_notification(job_id, job['name'], 'failed', error_msg, duration)
+    logger.error(f"{label} failed: {job_id} - {error_msg[:200]}")
+    return False, error_msg
+
+
+def run_filesystem_backup(job_id, job, targets):
+    """Execute a filesystem backup job against each storage target"""
     start_time = utc_now()
     logger.info(f"Starting filesystem backup job: {job_id} ({job['name']})")
 
@@ -1656,13 +2000,7 @@ def run_filesystem_backup(job_id, job):
         # Build directory list with proper escaping
         directories = ' '.join(shlex.quote(d) for d in job['directories'])
 
-        # Escape all values for shell
-        s3_access_key = shlex.quote(job['s3_access_key'])
-        s3_secret_key = shlex.quote(job['s3_secret_key'])
         restic_password = shlex.quote(job['restic_password'])
-        s3_endpoint = shlex.quote(job['s3_endpoint'])
-        s3_bucket = shlex.quote(job['s3_bucket'])
-        backup_prefix = shlex.quote(job['backup_prefix'])
 
         # Run backup via SSH on remote
         if server:
@@ -1675,21 +2013,12 @@ def run_filesystem_backup(job_id, job):
                 job.get('ssh_key', '/home/backupx/.ssh/id_rsa'))
 
         # Build remote command with proper escaping
-        insecure_flag = '--insecure-tls' if job.get('skip_ssl_verify') else ''
+        backup_cmd = f"restic backup --json --compression auto --tag automated {' '.join(exclude_args)} {directories}"
         remote_cmd = f"""
 export PATH="$HOME/.local/bin:$PATH"
-export AWS_ACCESS_KEY_ID={s3_access_key}
-export AWS_SECRET_ACCESS_KEY={s3_secret_key}
 export RESTIC_PASSWORD={restic_password}
-export RESTIC_REPOSITORY="s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
-
-# Ensure repository exists (init if needed)
-if ! restic cat config {insecure_flag} >/dev/null 2>&1; then
-    echo "Initializing new restic repository..."
-    restic init {insecure_flag} 2>&1 || true
-fi
-
-restic backup --json --compression auto --tag automated {insecure_flag} {' '.join(exclude_args)} {directories}
+{_restic_target_blocks(job, targets, backup_cmd)}
+exit $BACKUPX_FAILED
 """
 
         # Execute with streaming progress
@@ -1703,28 +2032,10 @@ restic backup --json --compression auto --tag automated {insecure_flag} {' '.joi
             text=True,
         )
 
-        try:
-            returncode, stderr_text = _stream_restic_progress(proc, job_id, backup_timeout)
-        except subprocess.TimeoutExpired:
-            raise
-
-        duration = (utc_now() - start_time).total_seconds()
-
-        if returncode == 0:
-            update_job_progress(job_id, 100, 'Backup completed successfully')
-            invalidate_snapshot_cache(job_id)
-            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
-            add_history(job_id, job['name'], 'success', 'Backup completed successfully', duration)
-            send_notification(job_id, job['name'], 'success', 'Backup completed successfully', duration)
-            logger.info(f"Filesystem backup completed successfully: {job_id} (duration: {duration:.1f}s)")
-            return True, "Backup completed successfully"
-        else:
-            error_msg = sanitize_error_message(stderr_text)
-            update_job_status(job_id, 'failed')
-            add_history(job_id, job['name'], 'failed', error_msg, duration)
-            send_notification(job_id, job['name'], 'failed', error_msg, duration)
-            logger.error(f"Filesystem backup failed: {job_id} - {error_msg[:200]}")
-            return False, error_msg
+        returncode, stderr_text, preamble, results = _stream_restic_progress(
+            proc, job_id, backup_timeout, [t['name'] for t in targets])
+        return _finish_backup(job_id, job, targets, start_time, returncode, stderr_text,
+                              preamble, results, 'Backup')
 
     except subprocess.TimeoutExpired:
         update_job_status(job_id, 'timeout')
@@ -1741,8 +2052,8 @@ restic backup --json --compression auto --tag automated {insecure_flag} {' '.joi
         return False, error_msg
 
 
-def run_database_backup(job_id, job):
-    """Execute a MySQL database backup job"""
+def run_database_backup(job_id, job, targets):
+    """Execute a database backup job: dump once, then store it on each storage target"""
     start_time = utc_now()
     logger.info(f"Starting database backup job: {job_id} ({job['name']})")
 
@@ -1808,8 +2119,6 @@ def run_database_backup(job_id, job):
         backup_filename = f"{prefix}_backup_{timestamp}.sql.gz"
 
         # Escape all values for shell
-        s3_access_key = shlex.quote(job['s3_access_key'])
-        s3_secret_key = shlex.quote(job['s3_secret_key'])
         restic_password = shlex.quote(job['restic_password'])
         db_host = shlex.quote(db_config['host'] or '')
         default_port = 5432 if is_postgres else 3306
@@ -1903,19 +2212,10 @@ fi
             dump_error_msg = 'mysqldump failed'
 
         # Build remote command with proper escaping
-        insecure_flag = '--insecure-tls' if job.get('skip_ssl_verify') else ''
+        backup_cmd = f'restic backup --json --compression auto --tag automated --tag {backup_tag} "$BACKUP_FILE"'
         remote_cmd = f"""
 export PATH="$HOME/.local/bin:$PATH"
-export AWS_ACCESS_KEY_ID={s3_access_key}
-export AWS_SECRET_ACCESS_KEY={s3_secret_key}
 export RESTIC_PASSWORD={restic_password}
-export RESTIC_REPOSITORY="s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
-
-# Ensure repository exists (init if needed, ignore "already initialized" errors)
-if ! restic cat config {insecure_flag} >/dev/null 2>&1; then
-    echo "Initializing new restic repository..."
-    restic init {insecure_flag} 2>&1 || true
-fi
 
 # Create temp directory for backup
 BACKUP_DIR=$(mktemp -d)
@@ -1942,14 +2242,13 @@ if [ -z "$(gzip -dc "$BACKUP_FILE" 2>/dev/null | head -c 1)" ]; then
     exit 1
 fi
 
-# Backup to restic repository
-restic backup --json --compression auto --tag automated --tag {backup_tag} {insecure_flag} "$BACKUP_FILE"
-RESTIC_EXIT=$?
+# Store the same dump on every storage
+{_restic_target_blocks(job, targets, backup_cmd)}
 
 # Cleanup
 rm -rf "$BACKUP_DIR"
 
-exit $RESTIC_EXIT
+exit $BACKUPX_FAILED
 """
 
         # Execute with streaming progress
@@ -1963,29 +2262,10 @@ exit $RESTIC_EXIT
             text=True,
         )
 
-        try:
-            returncode, stderr_text = _stream_restic_progress(proc, job_id, backup_timeout)
-        except subprocess.TimeoutExpired:
-            raise
-
-        duration = (utc_now() - start_time).total_seconds()
-
-        if returncode == 0:
-            update_job_progress(job_id, 100, 'Database backup completed successfully')
-            invalidate_snapshot_cache(job_id)
-            update_job_status(job_id, 'success', last_run=start_time.isoformat(), last_success=utc_isoformat())
-            message = 'Database backup completed successfully'
-            add_history(job_id, job['name'], 'success', message, duration)
-            send_notification(job_id, job['name'], 'success', message, duration)
-            logger.info(f"Database backup completed successfully: {job_id} (duration: {duration:.1f}s)")
-            return True, "Database backup completed successfully"
-        else:
-            error_msg = sanitize_error_message(stderr_text)
-            update_job_status(job_id, 'failed')
-            add_history(job_id, job['name'], 'failed', error_msg, duration)
-            send_notification(job_id, job['name'], 'failed', error_msg, duration)
-            logger.error(f"Database backup failed: {job_id} - {error_msg[:200]}")
-            return False, error_msg
+        returncode, stderr_text, preamble, results = _stream_restic_progress(
+            proc, job_id, backup_timeout, [t['name'] for t in targets])
+        return _finish_backup(job_id, job, targets, start_time, returncode, stderr_text,
+                              preamble, results, 'Database backup')
 
     except subprocess.TimeoutExpired:
         update_job_status(job_id, 'timeout')
@@ -2010,108 +2290,45 @@ _stats_cache_ttl = 300  # 5 minutes
 
 
 def invalidate_snapshot_cache(job_id):
-    """Invalidate cached snapshots/stats for a job (call after backup/restore)"""
-    _snapshot_cache.pop(job_id, None)
-    _stats_cache.pop(job_id, None)
+    """Invalidate cached snapshots/stats for a job on every storage (call after backup/restore)"""
+    for cache in (_snapshot_cache, _stats_cache):
+        for key in [k for k in cache if k[0] == job_id]:
+            cache.pop(key, None)
 
 
-def get_snapshots(job, server=None):
-    """Get list of snapshots for a job"""
+def _run_restic_json(job, target, args, cache, ttl):
+    """Run a read-only restic command locally against one storage, with a TTL cache."""
     import time
-    job_id = job.get('id')
-    # Check cache
-    if job_id and job_id in _snapshot_cache:
-        cached_at, cached_data = _snapshot_cache[job_id]
-        if time.time() - cached_at < _snapshot_cache_ttl:
+    key = (job.get('id'), target.get('id'))
+    if key[0] and key in cache:
+        cached_at, cached_data = cache[key]
+        if time.time() - cached_at < ttl:
             return cached_data
 
-    # Get skip_ssl_verify from S3 config
-    s3_config_id = job.get('s3_config_id')
-    skip_ssl_verify = False
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if s3_config:
-            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+    cmd = ['restic', *args]
+    if target.get('skip_ssl_verify'):
+        cmd.append('--insecure-tls')
+    result = subprocess.run(cmd, capture_output=True, text=True, env=job_restic_env(job, target), timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f'restic {args[0]} failed')
+    data = json.loads(result.stdout)
+    if key[0]:
+        cache[key] = (time.time(), data)
+    return data
 
-    # Run restic command to list snapshots
+
+def get_snapshots(job, target):
+    """Get list of snapshots for a job on one storage, newest first. Raises on restic errors."""
+    snapshots = _run_restic_json(job, target, ['snapshots', '--json'], _snapshot_cache, _snapshot_cache_ttl)
+    return sorted(snapshots or [], key=lambda x: x.get('time', ''), reverse=True)
+
+
+def get_repo_stats(job, target):
+    """Get repository statistics for a job on one storage"""
     try:
-        env = os.environ.copy()
-        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
-        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
-        env['RESTIC_PASSWORD'] = job['restic_password']
-        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
-
-        cmd = ['restic', 'snapshots', '--json']
-        if skip_ssl_verify:
-            cmd.append('--insecure-tls')
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=60
-        )
-
-        if result.returncode == 0:
-            snapshots = json.loads(result.stdout)
-            # Sort by time, newest first
-            snapshots.sort(key=lambda x: x.get('time', ''), reverse=True)
-            # Cache result
-            if job_id:
-                _snapshot_cache[job_id] = (time.time(), snapshots)
-            return snapshots
-        return []
+        return _run_restic_json(job, target, ['stats', '--json', '--mode', 'raw-data'], _stats_cache, _stats_cache_ttl)
     except Exception as e:
-        logger.error(f"Failed to get snapshots: {e}")
-        return []
-
-
-def get_repo_stats(job, server=None):
-    import time
-    job_id = job.get('id')
-    # Check cache
-    if job_id and job_id in _stats_cache:
-        cached_at, cached_data = _stats_cache[job_id]
-        if time.time() - cached_at < _stats_cache_ttl:
-            return cached_data
-    """Get repository statistics"""
-    # Get skip_ssl_verify from S3 config
-    s3_config_id = job.get('s3_config_id')
-    skip_ssl_verify = False
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if s3_config:
-            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
-
-    # Run restic command to get stats
-    try:
-        env = os.environ.copy()
-        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
-        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
-        env['RESTIC_PASSWORD'] = job['restic_password']
-        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
-
-        cmd = ['restic', 'stats', '--json', '--mode', 'raw-data']
-        if skip_ssl_verify:
-            cmd.append('--insecure-tls')
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=60
-        )
-
-        if result.returncode == 0:
-            stats = json.loads(result.stdout)
-            if job_id:
-                _stats_cache[job_id] = (time.time(), stats)
-            return stats
-        return None
-    except Exception as e:
-        logger.error(f"Failed to get repo stats: {e}")
+        logger.error(f"Failed to get repo stats from {target.get('name')}: {e}")
         return None
 
 
@@ -2338,6 +2555,28 @@ def api_job_status(job_id):
     return jsonify({'error': 'Job not found'}), 404
 
 
+def _resolve_job_s3_configs(data):
+    """Validate the storages chosen for a job.
+
+    Accepts s3_config_ids (ordered, primary first) or the single s3_config_id
+    older clients send. Returns (ids, primary_config, error).
+    """
+    ids = data.get('s3_config_ids')
+    if ids is None:
+        ids = [data['s3_config_id']] if data.get('s3_config_id') else []
+    if not isinstance(ids, list) or not all(isinstance(i, str) and i for i in ids):
+        return [], None, 's3_config_ids must be a list of storage IDs'
+    ids = list(dict.fromkeys(ids))  # drop duplicates, keep order
+
+    configs = []
+    for config_id in ids:
+        config = get_s3_config(config_id)
+        if not config:
+            return [], None, f'S3 configuration not found: {config_id}'
+        configs.append(config)
+    return ids, (configs[0] if configs else None), None
+
+
 @app.route('/api/jobs', methods=['POST'])
 @login_required
 @csrf.exempt
@@ -2366,20 +2605,18 @@ def api_create_job():
 
     # Resolve server and S3 config
     server_id = data.get('server_id')
-    s3_config_id = data.get('s3_config_id')
 
     server = None
-    s3_config = None
 
     if server_id:
         server = get_server(server_id)
         if not server:
             return jsonify({'error': 'Server not found'}), 400
 
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if not s3_config:
-            return jsonify({'error': 'S3 configuration not found'}), 400
+    s3_config_ids, s3_config, error = _resolve_job_s3_configs(data)
+    if error:
+        return jsonify({'error': error}), 400
+    s3_config_id = s3_config_ids[0] if s3_config_ids else None
 
     # Get backup type
     backup_type = data.get('backup_type', 'filesystem')
@@ -2389,6 +2626,7 @@ def api_create_job():
         'backup_type': backup_type,
         'server_id': server_id,
         's3_config_id': s3_config_id,
+        's3_config_ids': s3_config_ids,
         # Store resolved values for backup execution
         'remote_host': f"{server['ssh_user']}@{server['host']}" if server else data.get('remote_host'),
         'ssh_port': (server.get('ssh_port') or 22) if server else int(data.get('ssh_port', 22)),
@@ -2459,26 +2697,27 @@ def api_update_job(job_id):
 
     # Resolve server and S3 config if provided
     server_id = data.get('server_id', job.get('server_id'))
-    s3_config_id = data.get('s3_config_id', job.get('s3_config_id'))
 
     server = None
-    s3_config = None
 
     if server_id:
         server = get_server(server_id)
         if not server:
             return jsonify({'error': 'Server not found'}), 400
 
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if not s3_config:
-            return jsonify({'error': 'S3 configuration not found'}), 400
+    if 's3_config_ids' not in data and 's3_config_id' not in data:
+        data['s3_config_ids'] = job.get('s3_config_ids', [])
+    s3_config_ids, s3_config, error = _resolve_job_s3_configs(data)
+    if error:
+        return jsonify({'error': error}), 400
+    s3_config_id = s3_config_ids[0] if s3_config_ids else None
 
     job.update({
         'name': data.get('name', job['name']),
         'backup_type': data.get('backup_type', job.get('backup_type', 'filesystem')),
         'server_id': server_id,
         's3_config_id': s3_config_id,
+        's3_config_ids': s3_config_ids,
         # Store resolved values for backup execution
         'remote_host': f"{server['ssh_user']}@{server['host']}" if server else job.get('remote_host'),
         'ssh_port': (server.get('ssh_port') or 22) if server else job.get('ssh_port', 22),
@@ -2610,63 +2849,90 @@ def api_run_job(job_id):
 @login_required
 @csrf.exempt
 def api_init_job_repo(job_id):
-    """Initialize restic repository for a job"""
+    """Initialize the restic repository on each of a job's storages"""
     job = get_job(job_id)
     if not job:
         return jsonify({'success': False, 'error': 'Job not found'}), 404
 
-    # Get S3 config to get skip_ssl_verify setting
-    s3_config_id = job.get('s3_config_id')
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if s3_config:
-            job['skip_ssl_verify'] = s3_config.get('skip_ssl_verify', False)
+    targets = get_job_storage_targets(job)
+    if not targets:
+        return jsonify({'success': False, 'error': 'No active S3 storage is configured for this job'}), 400
 
-    try:
-        env = os.environ.copy()
-        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
-        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
-        env['RESTIC_PASSWORD'] = job['restic_password']
-        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job.get('backup_prefix', job_id)}"
-
+    messages, errors = [], []
+    for target in targets:
         cmd = ['restic', 'init']
-        if job.get('skip_ssl_verify'):
+        if target.get('skip_ssl_verify'):
             cmd.append('--insecure-tls')
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, env=job_restic_env(job, target), timeout=60)
+        except subprocess.TimeoutExpired:
+            errors.append(f"{target['name']}: initialization timed out")
+            continue
+        except Exception as e:
+            errors.append(f"{target['name']}: {e}")
+            continue
 
-        result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
-
+        stderr = result.stderr.lower()
         if result.returncode == 0:
-            return jsonify({'success': True, 'message': 'Repository initialized'})
-        elif 'already initialized' in result.stderr.lower() or 'already exists' in result.stderr.lower():
-            return jsonify({'success': True, 'message': 'Repository already initialized'})
+            messages.append(f"{target['name']}: repository initialized")
+        elif 'already initialized' in stderr or 'already exists' in stderr:
+            messages.append(f"{target['name']}: repository already initialized")
         else:
-            return jsonify({'success': False, 'error': result.stderr or 'Failed to initialize repository'}), 400
+            errors.append(f"{target['name']}: {result.stderr.strip() or 'failed to initialize repository'}")
 
-    except subprocess.TimeoutExpired:
-        return jsonify({'success': False, 'error': 'Initialization timed out'}), 400
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+    if len(targets) == 1:
+        messages = [m.split(': ', 1)[1].capitalize() for m in messages]
+    if errors:
+        return jsonify({'success': False, 'error': '; '.join(errors), 'message': '; '.join(messages)}), 400
+    return jsonify({'success': True, 'message': '; '.join(messages)})
+
+
+def _job_storage_from_request(job):
+    """The storage a snapshot request targets (?storage=<id>), defaulting to the job's primary."""
+    storage_id = request.args.get('storage') or (request.get_json(silent=True) or {}).get('storage')
+    return resolve_job_storage(job, storage_id)
+
+
+@app.route('/api/jobs/<job_id>/storages')
+@login_required
+def api_job_storages(job_id):
+    """List the storages a job backs up to, primary first"""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify({'storages': [
+        {'id': t['id'], 'name': t['name'], 'endpoint': t['endpoint'], 'bucket': t['bucket'],
+         'status': t['status'], 'primary': i == 0}
+        for i, t in enumerate(get_job_storage_targets(job, include_inactive=True))
+    ]})
 
 
 @app.route('/api/jobs/<job_id>/snapshots')
 @login_required
 @limiter.exempt
 def api_job_snapshots(job_id):
-    """Get snapshots for a job"""
+    """Get snapshots for a job from one of its storages"""
     job = get_job(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
 
-    # Get server details
-    server_id = job.get('server_id')
-    server = get_server(server_id) if server_id else None
+    target = _job_storage_from_request(job)
+    if not target:
+        return jsonify({'error': 'Storage not found for this job'}), 404
 
     # Only fetch snapshots (fast). Stats is fetched separately on-demand.
-    snapshots = get_snapshots(job, server)
+    try:
+        snapshots = get_snapshots(job, target)
+        error = None
+    except Exception as e:
+        logger.error(f"Failed to get snapshots for {job_id} from {target['name']}: {e}")
+        snapshots, error = [], sanitize_error_message(str(e))
 
     return jsonify({
         'snapshots': snapshots,
-        'stats': None
+        'stats': None,
+        'storage': {'id': target['id'], 'name': target['name']},
+        'error': error,
     })
 
 
@@ -2678,11 +2944,11 @@ def api_job_snapshot_stats(job_id):
     if not job:
         return jsonify({'error': 'Job not found'}), 404
 
-    server_id = job.get('server_id')
-    server = get_server(server_id) if server_id else None
+    target = _job_storage_from_request(job)
+    if not target:
+        return jsonify({'error': 'Storage not found for this job'}), 404
 
-    stats = get_repo_stats(job, server)
-    return jsonify({'stats': stats})
+    return jsonify({'stats': get_repo_stats(job, target)})
 
 
 @app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/files')
@@ -2700,20 +2966,13 @@ def api_snapshot_files(job_id, snapshot_id):
     if '..' in normalized_path or normalized_path.startswith('/etc') or normalized_path.startswith('/root'):
         return jsonify({'error': 'Invalid path'}), 400
 
-    # Get skip_ssl_verify from S3 config
-    s3_config_id = job.get('s3_config_id')
-    skip_ssl_verify = False
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if s3_config:
-            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+    target = _job_storage_from_request(job)
+    if not target:
+        return jsonify({'error': 'Storage not found for this job'}), 404
+    skip_ssl_verify = target.get('skip_ssl_verify', False)
 
     try:
-        env = os.environ.copy()
-        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
-        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
-        env['RESTIC_PASSWORD'] = job['restic_password']
-        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+        env = job_restic_env(job, target)
 
         # Use restic ls to list files in the snapshot at the given path
         cmd = ['restic', 'ls', '--json', snapshot_id, path]
@@ -2829,21 +3088,14 @@ def api_snapshot_download(job_id, snapshot_id):
     if '..' in normalized_path or normalized_path.startswith('/etc') or normalized_path.startswith('/root'):
         return jsonify({'error': 'Invalid path'}), 400
 
-    # Get skip_ssl_verify from S3 config
-    s3_config_id = job.get('s3_config_id')
-    skip_ssl_verify = False
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if s3_config:
-            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+    target = _job_storage_from_request(job)
+    if not target:
+        return jsonify({'error': 'Storage not found for this job'}), 404
+    skip_ssl_verify = target.get('skip_ssl_verify', False)
 
     try:
         import tempfile
-        env = os.environ.copy()
-        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
-        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
-        env['RESTIC_PASSWORD'] = job['restic_password']
-        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+        env = job_restic_env(job, target)
 
         # Use restic dump to get file contents
         cmd = ['restic', 'dump', snapshot_id, file_path]
@@ -2915,17 +3167,14 @@ def api_snapshot_restore(job_id, snapshot_id):
     if not server:
         return jsonify({'error': 'Server not found'}), 404
 
-    # Get skip_ssl_verify from S3 config
-    s3_config_id = job.get('s3_config_id')
-    skip_ssl_verify = False
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if s3_config:
-            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+    target = _job_storage_from_request(job)
+    if not target:
+        return jsonify({'error': 'Storage not found for this job'}), 404
+    skip_ssl_verify = target.get('skip_ssl_verify', False)
 
     try:
         # Build restic restore command
-        repo = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+        repo = job_repo_url(job, target)
 
         # Escape values for shell
         safe_snapshot = shlex.quote(snapshot_id)
@@ -2939,8 +3188,8 @@ def api_snapshot_restore(job_id, snapshot_id):
         # Environment variables for restic
         full_cmd = f"""
 export PATH="$HOME/.local/bin:$PATH"
-export AWS_ACCESS_KEY_ID={shlex.quote(job['s3_access_key'])}
-export AWS_SECRET_ACCESS_KEY={shlex.quote(job['s3_secret_key'])}
+export AWS_ACCESS_KEY_ID={shlex.quote(target['access_key'] or '')}
+export AWS_SECRET_ACCESS_KEY={shlex.quote(target['secret_key'] or '')}
 export RESTIC_PASSWORD={shlex.quote(job['restic_password'])}
 export RESTIC_REPOSITORY={shlex.quote(repo)}
 mkdir -p {safe_target}
@@ -3025,16 +3274,13 @@ def api_snapshot_restore_db(job_id, snapshot_id):
     if not ok:
         return jsonify({'error': f'{client_type} client not available on jump server: {msg}'}), 400
 
-    # Get skip_ssl_verify
-    s3_config_id = job.get('s3_config_id')
-    skip_ssl_verify = False
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if s3_config:
-            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+    target = _job_storage_from_request(job)
+    if not target:
+        return jsonify({'error': 'Storage not found for this job'}), 404
+    skip_ssl_verify = target.get('skip_ssl_verify', False)
 
     try:
-        repo = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+        repo = job_repo_url(job, target)
         insecure_flag = ' --insecure-tls' if skip_ssl_verify else ''
 
         # Escape values
@@ -3100,8 +3346,8 @@ IMPORT_EXIT=$?
 
         remote_cmd = f"""
 export PATH="$HOME/.local/bin:$PATH"
-export AWS_ACCESS_KEY_ID={shlex.quote(job['s3_access_key'])}
-export AWS_SECRET_ACCESS_KEY={shlex.quote(job['s3_secret_key'])}
+export AWS_ACCESS_KEY_ID={shlex.quote(target['access_key'] or '')}
+export AWS_SECRET_ACCESS_KEY={shlex.quote(target['secret_key'] or '')}
 export RESTIC_PASSWORD={shlex.quote(job['restic_password'])}
 export RESTIC_REPOSITORY={shlex.quote(repo)}
 
@@ -3178,24 +3424,17 @@ def api_snapshot_download_zip(job_id, snapshot_id):
     if '..' in normalized_path or normalized_path.startswith('/etc') or normalized_path.startswith('/root'):
         return jsonify({'error': 'Invalid path'}), 400
 
-    # Get skip_ssl_verify from S3 config
-    s3_config_id = job.get('s3_config_id')
-    skip_ssl_verify = False
-    if s3_config_id:
-        s3_config = get_s3_config(s3_config_id)
-        if s3_config:
-            skip_ssl_verify = s3_config.get('skip_ssl_verify', False)
+    target = _job_storage_from_request(job)
+    if not target:
+        return jsonify({'error': 'Storage not found for this job'}), 404
+    skip_ssl_verify = target.get('skip_ssl_verify', False)
 
     try:
         import tempfile
         import zipfile
         import shutil
 
-        env = os.environ.copy()
-        env['AWS_ACCESS_KEY_ID'] = job['s3_access_key']
-        env['AWS_SECRET_ACCESS_KEY'] = job['s3_secret_key']
-        env['RESTIC_PASSWORD'] = job['restic_password']
-        env['RESTIC_REPOSITORY'] = f"s3:https://{job['s3_endpoint']}/{job['s3_bucket']}/{job['backup_prefix']}"
+        env = job_restic_env(job, target)
 
         # Create a temporary directory for restore
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3445,7 +3684,11 @@ def api_create_s3_config_route():
 
     # Validate endpoint format
     if not validate_s3_endpoint(data['endpoint']):
-        return jsonify({'error': 'Invalid S3 endpoint format'}), 400
+        return jsonify({'error': S3_ENDPOINT_FORMAT_ERROR}), 400
+    endpoint = normalize_s3_endpoint(data['endpoint'])
+    scheme_error = _endpoint_scheme_error(endpoint, bool(data.get('skip_ssl_verify', False)))
+    if scheme_error:
+        return jsonify(scheme_error), 400
 
     # Validate bucket name
     if not validate_bucket_name(data['bucket']):
@@ -3459,7 +3702,7 @@ def api_create_s3_config_route():
     new_config = {
         'id': generate_id(),
         'name': name,
-        'endpoint': data['endpoint'].strip(),
+        'endpoint': endpoint,
         'bucket': data['bucket'].strip().lower(),
         'access_key': data['access_key'].strip(),
         'secret_key': data['secret_key'],
@@ -3492,6 +3735,17 @@ def api_update_s3_config_route(config_id):
     if not config:
         return jsonify({'error': 'Configuration not found'}), 404
 
+    if 'endpoint' in data:
+        if not validate_s3_endpoint(data['endpoint']):
+            return jsonify({'error': S3_ENDPOINT_FORMAT_ERROR}), 400
+        endpoint = normalize_s3_endpoint(data['endpoint'])
+        if endpoint != config['endpoint']:
+            scheme_error = _endpoint_scheme_error(
+                endpoint, bool(data.get('skip_ssl_verify', config.get('skip_ssl_verify', False))))
+            if scheme_error:
+                return jsonify(scheme_error), 400
+        data['endpoint'] = endpoint
+
     # Update fields
     config['name'] = data.get('name', config['name'])
     config['endpoint'] = data.get('endpoint', config['endpoint'])
@@ -3521,6 +3775,11 @@ def api_delete_s3_config_route(config_id):
     config = get_s3_config(config_id)
     if not config:
         return jsonify({'error': 'Configuration not found'}), 404
+
+    users = [job['name'] for job in load_jobs().values() if config_id in job.get('s3_config_ids', [])]
+    if users:
+        return jsonify({'error': f"Storage is used by backup job(s): {', '.join(users)}. "
+                                 f"Remove it from those jobs first."}), 400
 
     delete_s3_config(config_id)
 
@@ -3554,6 +3813,19 @@ def api_test_s3_connection():
     if not all([endpoint, bucket, access_key, secret_key]):
         return jsonify({'error': 'Missing required fields'}), 400
 
+    if not validate_s3_endpoint(endpoint):
+        return jsonify({'error': S3_ENDPOINT_FORMAT_ERROR}), 400
+    endpoint = normalize_s3_endpoint(endpoint)
+
+    # Diagnose reachability first: rclone's errors for a wrong scheme or a bad
+    # certificate are cryptic, and a precise message here saves guesswork.
+    kind, message = probe_s3_endpoint(endpoint, bool(skip_ssl_verify))
+    if kind != 'ok':
+        response = {'error': message, 'error_kind': kind}
+        if kind == 'scheme':
+            response['suggested_endpoint'] = _toggle_endpoint_scheme(endpoint)
+        return jsonify(response), 400
+
     try:
         # Use rclone to test connection
         env = os.environ.copy()
@@ -3561,7 +3833,7 @@ def api_test_s3_connection():
         env['RCLONE_CONFIG_TEST_PROVIDER'] = 'Other'
         env['RCLONE_CONFIG_TEST_ACCESS_KEY_ID'] = access_key
         env['RCLONE_CONFIG_TEST_SECRET_ACCESS_KEY'] = secret_key
-        env['RCLONE_CONFIG_TEST_ENDPOINT'] = f'https://{endpoint}'
+        env['RCLONE_CONFIG_TEST_ENDPOINT'] = s3_endpoint_url(endpoint)
         env['RCLONE_CONFIG_TEST_REGION'] = region
 
         # Build command with optional SSL skip
@@ -3578,12 +3850,13 @@ def api_test_s3_connection():
         )
 
         if result.returncode == 0:
-            return jsonify({'success': True, 'message': 'Connection successful'})
+            scheme = 'HTTPS' if s3_endpoint_url(endpoint).startswith('https://') else 'plain HTTP'
+            return jsonify({'success': True, 'message': f'Connection successful over {scheme}'})
         else:
-            return jsonify({'error': result.stderr or 'Connection failed'}), 400
+            return jsonify({'error': explain_rclone_error(result.stderr), 'details': sanitize_error_message(result.stderr, 2000)}), 400
 
     except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Connection timed out'}), 400
+        return jsonify({'error': 'The endpoint accepted the connection but did not answer S3 requests within 30 seconds'}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -3610,7 +3883,7 @@ def api_browse_s3_config(config_id):
         env['RCLONE_CONFIG_BROWSE_PROVIDER'] = 'Other'
         env['RCLONE_CONFIG_BROWSE_ACCESS_KEY_ID'] = config['access_key']
         env['RCLONE_CONFIG_BROWSE_SECRET_ACCESS_KEY'] = config['secret_key']
-        env['RCLONE_CONFIG_BROWSE_ENDPOINT'] = f"https://{config['endpoint']}"
+        env['RCLONE_CONFIG_BROWSE_ENDPOINT'] = s3_endpoint_url(config['endpoint'])
         env['RCLONE_CONFIG_BROWSE_REGION'] = config.get('region', 'us-east-1')
 
         # Build the remote path
@@ -3691,7 +3964,7 @@ def api_download_s3_file(config_id):
         env['RCLONE_CONFIG_DL_PROVIDER'] = 'Other'
         env['RCLONE_CONFIG_DL_ACCESS_KEY_ID'] = config['access_key']
         env['RCLONE_CONFIG_DL_SECRET_ACCESS_KEY'] = config['secret_key']
-        env['RCLONE_CONFIG_DL_ENDPOINT'] = f"https://{config['endpoint']}"
+        env['RCLONE_CONFIG_DL_ENDPOINT'] = s3_endpoint_url(config['endpoint'])
         env['RCLONE_CONFIG_DL_REGION'] = config.get('region', 'us-east-1')
 
         # Create temp file for download

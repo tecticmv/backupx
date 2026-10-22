@@ -96,6 +96,36 @@ class TestInputValidation:
 
         assert validate_s3_endpoint('') == False
         assert validate_s3_endpoint('-invalid.com') == False
+        assert validate_s3_endpoint('https://s3.example.com/bucket') == False
+        assert validate_s3_endpoint('ftp://s3.example.com') == False
+
+    def test_validate_s3_endpoint_with_scheme(self):
+        """Endpoints may carry an http:// or https:// prefix"""
+        from app.main import validate_s3_endpoint
+
+        assert validate_s3_endpoint('https://s3.example.com') == True
+        assert validate_s3_endpoint('http://minio.local:9000/') == True
+        assert validate_s3_endpoint('HTTPS://s3.example.com') == True
+
+    def test_normalize_s3_endpoint(self):
+        """HTTPS is stored bare, plain HTTP keeps its prefix"""
+        from app.main import normalize_s3_endpoint, s3_endpoint_url, restic_repo_url
+
+        assert normalize_s3_endpoint('https://s3.example.com/') == 's3.example.com'
+        assert normalize_s3_endpoint(' s3.example.com ') == 's3.example.com'
+        assert normalize_s3_endpoint('HTTP://minio.local:9000') == 'http://minio.local:9000'
+        assert s3_endpoint_url('s3.example.com') == 'https://s3.example.com'
+        assert s3_endpoint_url('http://minio.local:9000') == 'http://minio.local:9000'
+        assert restic_repo_url('http://minio.local:9000', 'b', 'p') == 's3:http://minio.local:9000/b/p'
+        assert restic_repo_url('s3.example.com', 'b', 'p') == 's3:https://s3.example.com/b/p'
+
+    def test_explain_rclone_error(self):
+        """Known S3 failures map to actionable messages"""
+        from app.main import explain_rclone_error
+
+        assert 'secret key' in explain_rclone_error('ERROR : SignatureDoesNotMatch: ...')
+        assert 'http://' in explain_rclone_error('http: server gave HTTP response to HTTPS client')
+        assert explain_rclone_error('2024/01/01 10:00:00 ERROR : something odd\n') == 'something odd'
 
     def test_validate_bucket_name_valid(self):
         """Test bucket name validation with valid inputs"""
