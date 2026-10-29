@@ -12,6 +12,8 @@ from typing import Callable, Dict, Optional, List
 
 from croniter import croniter
 
+from ..cron import cron_fields
+
 logger = logging.getLogger(__name__)
 
 # Global scheduler instance
@@ -143,12 +145,8 @@ class DistributedScheduler:
                 'cron',
                 args=[job_id],
                 id=job_id,
-                minute=parts[0],
-                hour=parts[1],
-                day=parts[2],
-                month=parts[3],
-                day_of_week=parts[4],
-                replace_existing=True
+                replace_existing=True,
+                **cron_fields(cron_expression)  # crontab weekdays (0 = Sunday)
             )
             logger.debug(f"APScheduler job scheduled: {job_id} ({cron_expression})")
 

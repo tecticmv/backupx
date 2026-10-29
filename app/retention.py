@@ -47,8 +47,8 @@ def settings():
         'enabled': _env_bool('RETENTION_ENABLED', False),
         # Log what would be removed / freed without removing anything
         'dry_run': _env_bool('RETENTION_DRY_RUN', False),
-        # APScheduler cron, in the scheduler timezone. Use day names: APScheduler
-        # counts day_of_week numbers from Monday (0 = mon), unlike crontab.
+        # Crontab expression in the scheduler timezone (day of week 0/7 = Sunday,
+        # or day names); app.cron translates it for APScheduler.
         'prune_cron': (os.environ.get('RETENTION_PRUNE_CRON') or '0 4 * * sun').strip(),
         'prune_max_unused': (os.environ.get('RETENTION_PRUNE_MAX_UNUSED') or '10%').strip(),
         # How long restic waits for another process's repository lock

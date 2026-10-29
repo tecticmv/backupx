@@ -35,6 +35,7 @@ import humanize
 
 from .scheduler.locks import SchedulerLeader, job_run_lock, job_is_running
 from . import retention
+from .cron import cron_fields, cron_trigger
 
 # =============================================================================
 # Logging Configuration
@@ -661,7 +662,6 @@ def sync_schedules():
         for job_id, cron in desired.items():
             if _scheduled_crons.get(job_id) == cron:
                 continue
-            minute, hour, day, month, day_of_week = cron.split()
             try:
                 scheduler.add_job(
                     run_backup,
@@ -669,11 +669,7 @@ def sync_schedules():
                     args=[job_id],
                     id=job_id,
                     replace_existing=True,
-                    minute=minute,
-                    hour=hour,
-                    day=day,
-                    month=month,
-                    day_of_week=day_of_week
+                    **cron_fields(cron)  # crontab weekdays (0 = Sunday), not APScheduler's
                 )
             except Exception as e:
                 logger.error(f"Invalid schedule for job {job_id} ({cron}): {e}")
@@ -704,12 +700,10 @@ def _sync_prune_schedule():
             pass
         _scheduled_prune['cron'] = None
     if desired:
-        minute, hour, day, month, day_of_week = desired.split()
         try:
             scheduler.add_job(
                 run_retention_maintenance, 'cron', id=retention.PRUNE_SCHEDULE_ID,
-                executor='maintenance', replace_existing=True,
-                minute=minute, hour=hour, day=day, month=month, day_of_week=day_of_week)
+                executor='maintenance', replace_existing=True, **cron_fields(desired))
         except Exception as e:
             logger.error(f"Invalid RETENTION_PRUNE_CRON {desired!r}: {e}")
             return
@@ -3240,19 +3234,15 @@ def job_overdue_since(job, tz_name='UTC', now=None, grace=None):
     Takes the latest fire time at least `grace` seconds in the past (so queued
     and slow runs aren't flagged) and returns it if the job's last run started
     before it. Returns None when the job is on time, unscheduled or running.
-    Fire times come from APScheduler's CronTrigger, as the scheduler uses.
+    Fire times come from APScheduler's CronTrigger, built like the scheduler's.
     """
-    from apscheduler.triggers.cron import CronTrigger
-
     cron = (job.get('schedule_cron') or '').strip()
     if not job.get('schedule_enabled') or job.get('status') == 'running' or len(cron.split()) != 5:
         return None
     grace = BACKUP_OVERDUE_GRACE if grace is None else grace
     cutoff = (now or utc_now()) - timedelta(seconds=grace)
-    minute, hour, day, month, day_of_week = cron.split()
     try:
-        trigger = CronTrigger(minute=minute, hour=hour, day=day, month=month,
-                              day_of_week=day_of_week, timezone=tz_name)
+        trigger = cron_trigger(cron, tz_name)
     except Exception:
         return None
 
