@@ -15,6 +15,13 @@ class DatabaseBackend(ABC):
         """Get a database connection."""
         pass
 
+    def open_dedicated_connection(self):
+        """Open a connection outside any pool, owned and closed by the caller.
+
+        Used for session-scoped locks (see app/scheduler/locks.py).
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def close(self):
         """Close all connections and cleanup resources."""

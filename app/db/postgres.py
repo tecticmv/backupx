@@ -93,6 +93,31 @@ class PostgresBackend(DatabaseBackend):
         """Get a database connection from the pool."""
         return self._get_thread_connection()
 
+    def open_dedicated_connection(self):
+        """Open an autocommit connection outside the pool, for session-scoped advisory locks.
+
+        The caller owns it and must close it. TCP keepalives on both ends make
+        a dead peer show up within about a minute, so a lock held by a process
+        that vanished is released and one held over a broken link is noticed.
+        """
+        conn = psycopg2.connect(
+            host=self.host,
+            port=self.port,
+            database=self.database,
+            user=self.user,
+            password=self.password,
+            sslmode=self.ssl_mode,
+            connect_timeout=10,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=3,
+            options='-c tcp_keepalives_idle=30 -c tcp_keepalives_interval=10 -c tcp_keepalives_count=3',
+            application_name='backupx-lock',
+        )
+        conn.autocommit = True
+        return conn
+
     def close(self) -> None:
         """Release the connection back to the pool."""
         self._release_thread_connection()

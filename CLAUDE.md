@@ -51,7 +51,8 @@ pytest tests/test_security.py::TestAuthentication::test_login_success
   - `factory.py` - `create_database_backend()` factory
   - `migrate.py` - Schema migrations
 - `app/audit/` - Audit logging
-- `app/scheduler/distributed.py` - APScheduler with database-backed distributed coordination
+- `app/scheduler/locks.py` - Postgres advisory locks: scheduler leader election and per-job run lock
+- `app/scheduler/distributed.py` - Older leader-election scheduler, not wired up (its tests are stale)
 - `app/session.py` - Session management (filesystem or Redis)
 - `frontend/` - React + TypeScript + Vite + Radix UI + Tailwind
 - `tests/` - Pytest test suite
@@ -63,7 +64,8 @@ pytest tests/test_security.py::TestAuthentication::test_login_success
 - **Database**: Factory pattern — all DB operations go through `DatabaseBackend` interface
 - **SSH auth**: Three modes supported — key file path, pasted/uploaded key content, password (via `sshpass`). Sensitive values encrypted with Fernet
 - **Sessions**: Strategy pattern — filesystem (default) or Redis for horizontal scaling
-- **Scheduler**: Hybrid APScheduler + database for distributed deployments with leader election
+- **Scheduler**: Every gunicorn worker imports the app, but only the one holding a Postgres advisory lock starts APScheduler; it re-reads jobs/timezone from the DB every `SCHEDULER_LOCK_INTERVAL` (15s), and another worker takes over if it dies. Each backup run holds a per-job advisory lock, so a job never runs twice at once (a second trigger is skipped and logged, no notification)
+- **Restic init**: The backup script runs `restic init` only when `restic cat config` reports the repo doesn't exist (exit 10, or the old-restic message); any other open error fails that storage
 - **Restic provisioning**: Auto-install via SSH on server add/update. Falls back to `~/.local/bin` if `/usr/local/bin` isn't writable
 - **Snapshot caching**: In-memory TTL cache (60s for snapshot lists, 5m for repo stats) to avoid repeated S3 queries
 
@@ -92,3 +94,5 @@ Key variables:
 - `DATABASE_PASSWORD` — Shared between app and postgres container
 - `LISTEN_PORT` — Port gunicorn binds to (default 9090)
 - `SESSION_TYPE` — `filesystem` (default) or `redis`
+- `SCHEDULER_ENABLED` — `false` to keep an instance from ever running scheduled jobs (default `true`)
+- `SCHEDULER_LOCK_INTERVAL` — seconds between scheduler lock checks / schedule syncs (default 15)

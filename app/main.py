@@ -29,6 +29,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import yaml
 import humanize
 
+from .scheduler.locks import SchedulerLeader, job_run_lock, job_is_running
+
 # =============================================================================
 # Logging Configuration
 # =============================================================================
@@ -544,28 +546,132 @@ def validate_bucket_name(name: str) -> bool:
     bucket_pattern = re.compile(r'^[a-z0-9][a-z0-9\-\.]*[a-z0-9]$')
     return bool(bucket_pattern.match(name))
 
-# Scheduler - initialized with TZ env var, will be reconfigured with DB setting in init_app()
+# Scheduler - only the worker holding the scheduler lock starts it (see init_scheduler_leader).
+# Gunicorn runs several workers that each import this module; a scheduler per worker
+# would run every job once per worker.
 scheduler = BackgroundScheduler(timezone=os.environ.get('TZ', 'UTC'))
-scheduler.start()
+_scheduler_state_lock = threading.RLock()
+_scheduled_crons = {}  # job_id -> cron the running scheduler has for it
+_scheduler_leader = None
+SCHEDULER_LOCK_INTERVAL = int(os.environ.get('SCHEDULER_LOCK_INTERVAL', 15))
 
 
-def reinit_scheduler_with_db_timezone():
-    """Re-initialize scheduler with timezone from database (called after DB is ready)"""
+def _lock_connection():
+    """Dedicated database connection for an advisory lock"""
+    return get_db().open_dedicated_connection()
+
+
+def _is_scheduler_leader():
+    return _scheduler_leader is not None and _scheduler_leader.is_leader
+
+
+def sync_schedules():
+    """Make the running scheduler match the jobs and timezone stored in the database.
+
+    Jobs are edited through whichever worker serves the request, so the leader
+    re-reads them on every lock check rather than relying on in-process calls.
+    """
     global scheduler
-    try:
-        from .db import get_database
-        db = get_database()
-        result = db.fetchone('SELECT value FROM app_settings WHERE key = ?', ('timezone',))
-        db_tz = result['value'] if result else None
-        timezone = db_tz or os.environ.get('TZ', 'UTC')
+    timezone = get_scheduler_timezone()
+    desired = {}
+    for job_id, job in load_jobs().items():
+        cron = (job.get('schedule_cron') or '0 2 * * *').strip()
+        if job.get('schedule_enabled') and len(cron.split()) == 5:
+            desired[job_id] = cron
 
-        if timezone != scheduler.timezone.zone:
-            logger.info(f"Reinitializing scheduler with timezone: {timezone}")
-            scheduler.shutdown(wait=False)
+    with _scheduler_state_lock:
+        if str(scheduler.timezone) != timezone:
+            logger.info(f"Restarting scheduler with timezone: {timezone}")
+            if scheduler.running:
+                scheduler.shutdown(wait=False)
             scheduler = BackgroundScheduler(timezone=timezone)
+            _scheduled_crons.clear()
+        if not scheduler.running:
             scheduler.start()
+
+        for job_id in list(_scheduled_crons):
+            if job_id not in desired:
+                try:
+                    scheduler.remove_job(job_id)
+                except Exception:
+                    pass  # Job may already be gone
+                del _scheduled_crons[job_id]
+                logger.info(f"Unscheduled job: {job_id}")
+
+        for job_id, cron in desired.items():
+            if _scheduled_crons.get(job_id) == cron:
+                continue
+            minute, hour, day, month, day_of_week = cron.split()
+            try:
+                scheduler.add_job(
+                    run_backup,
+                    'cron',
+                    args=[job_id],
+                    id=job_id,
+                    replace_existing=True,
+                    minute=minute,
+                    hour=hour,
+                    day=day,
+                    month=month,
+                    day_of_week=day_of_week
+                )
+            except Exception as e:
+                logger.error(f"Invalid schedule for job {job_id} ({cron}): {e}")
+                continue
+            _scheduled_crons[job_id] = cron
+            logger.info(f"Scheduled job: {job_id} - cron: {cron}")
+
+
+def _leader_sync():
+    """sync_schedules from the lock thread, returning its DB connection to the pool after"""
+    try:
+        sync_schedules()
+    finally:
+        try:
+            get_db().close()
+        except Exception:
+            pass
+
+
+def _stop_scheduler():
+    """Stop running scheduled jobs in this worker (another worker took or will take over)"""
+    global scheduler
+    with _scheduler_state_lock:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        scheduler = BackgroundScheduler(timezone=scheduler.timezone)
+        _scheduled_crons.clear()
+
+
+def refresh_schedules():
+    """Apply schedule changes now if this worker runs the scheduler.
+
+    Other workers leave it to the leader, which picks changes up from the
+    database within SCHEDULER_LOCK_INTERVAL seconds.
+    """
+    if not _is_scheduler_leader():
+        return
+    try:
+        sync_schedules()
     except Exception as e:
-        logger.debug(f"Could not reinit scheduler timezone from DB: {e}")
+        logger.error(f"Failed to refresh schedules: {e}")
+
+
+def init_scheduler_leader():
+    """Start competing for the scheduler lock; the winner runs scheduled jobs"""
+    global _scheduler_leader
+    if os.environ.get('SCHEDULER_ENABLED', 'true').lower() in ('false', '0', 'no'):
+        logger.info("Scheduler disabled in this instance (SCHEDULER_ENABLED=false)")
+        return
+    if _scheduler_leader is None:
+        _scheduler_leader = SchedulerLeader(
+            _lock_connection,
+            on_acquire=_leader_sync,
+            on_lose=_stop_scheduler,
+            on_tick=_leader_sync,
+            interval=SCHEDULER_LOCK_INTERVAL,
+        )
+    _scheduler_leader.start()
 
 
 # =============================================================================
@@ -1415,9 +1521,16 @@ def send_notification(job_id, job_name, status, message, duration):
 
 
 def run_backup(job_id):
-    """Execute a backup job"""
+    """Execute a backup job, unless a run of the same job is already in progress"""
     try:
-        return _run_backup_inner(job_id)
+        with job_run_lock(_lock_connection, job_id) as acquired:
+            if not acquired:
+                # Another worker, the scheduler or a manual run got there first. Not a
+                # failure: leave the job status and history to the run in progress.
+                message = "Skipped: a backup of this job is already running"
+                logger.warning(f"Backup skipped, already running: {job_id}")
+                return False, message
+            return _run_backup_inner(job_id)
     finally:
         # Release this thread's DB connection back to the pool
         try:
@@ -1916,14 +2029,25 @@ export AWS_ACCESS_KEY_ID={shlex.quote(target['access_key'] or '')}
 export AWS_SECRET_ACCESS_KEY={shlex.quote(target['secret_key'] or '')}
 export RESTIC_REPOSITORY={shlex.quote(job_repo_url(job, target))}
 
-# Ensure repository exists (init if needed, ignore "already initialized" errors)
-if ! restic cat config {insecure_flag} >/dev/null 2>&1; then
-    echo "Initializing new restic repository..."
-    restic init {insecure_flag} 2>&1 || true
-fi
-
-{backup_cmd} {insecure_flag} 2>&1
+# Initialize the repository only if restic says it does not exist: exit code 10
+# on restic >= 0.17, only the message on older versions. Any other failure to
+# open it (wrong key, damaged config, auth, network) fails this storage as is.
+OPEN_ERR=$(restic cat config {insecure_flag} 2>&1 >/dev/null)
 RC=$?
+if [ $RC -ne 0 ]; then
+    if [ $RC -eq 10 ] || {{ printf '%s' "$OPEN_ERR" | grep -q 'Is there a repository at the following location' \\
+            && printf '%s' "$OPEN_ERR" | grep -qiE 'does not exist|no such file'; }}; then
+        echo "Initializing new restic repository..."
+        restic init {insecure_flag} 2>&1
+        RC=$?
+    else
+        printf '%s\\n' "$OPEN_ERR"
+    fi
+fi
+if [ $RC -eq 0 ]; then
+    {backup_cmd} {insecure_flag} 2>&1
+    RC=$?
+fi
 printf '{{"message_type":"backupx_target_done","index":{index},"exit_code":%d}}\\n' "$RC"
 [ $RC -eq 0 ] || BACKUPX_FAILED=1
 """)
@@ -2332,31 +2456,6 @@ def get_repo_stats(job, target):
         return None
 
 
-def schedule_job(job_id, job):
-    """Schedule a backup job"""
-    # Remove existing job if any
-    try:
-        scheduler.remove_job(job_id)
-    except Exception:
-        pass  # Job may not exist, which is fine
-
-    if job.get('schedule_enabled'):
-        cron = job.get('schedule_cron', '0 2 * * *')
-        parts = cron.split()
-        if len(parts) == 5:
-            scheduler.add_job(
-                run_backup,
-                'cron',
-                args=[job_id],
-                id=job_id,
-                minute=parts[0],
-                hour=parts[1],
-                day=parts[2],
-                month=parts[3],
-                day_of_week=parts[4]
-            )
-
-
 # Routes
 @app.route('/health')
 @limiter.exempt
@@ -2658,7 +2757,7 @@ def api_create_job():
     save_job(job_id, job)
 
     if job['schedule_enabled']:
-        schedule_job(job_id, job)
+        refresh_schedules()
 
     # Audit log
     try:
@@ -2752,7 +2851,7 @@ def api_update_job(job_id):
         job['restic_password'] = data['restic_password']
 
     save_job(job_id, job)
-    schedule_job(job_id, job)
+    refresh_schedules()
 
     # Audit log
     try:
@@ -2787,11 +2886,7 @@ def api_delete_job(job_id):
 
     job_name = job.get('name', job_id)
     delete_job_from_db(job_id)
-
-    try:
-        scheduler.remove_job(job_id)
-    except Exception:
-        pass  # Job may not be scheduled
+    refresh_schedules()
 
     # Audit log
     try:
@@ -2823,6 +2918,9 @@ def api_run_job(job_id):
     job = get_job(job_id)
     if not job:
         return jsonify({'success': False, 'error': 'Job not found'}), 404
+
+    if job_is_running(_lock_connection, job_id):
+        return jsonify({'success': False, 'error': 'A backup of this job is already running'}), 409
 
     # Audit log
     try:
@@ -2858,6 +2956,15 @@ def api_init_job_repo(job_id):
     if not targets:
         return jsonify({'success': False, 'error': 'No active S3 storage is configured for this job'}), 400
 
+    # Don't race a backup run, which may be initializing the same repository
+    with job_run_lock(_lock_connection, job_id) as acquired:
+        if not acquired:
+            return jsonify({'success': False, 'error': 'A backup of this job is running; try again when it finishes'}), 409
+        return _init_job_repos(job, targets)
+
+
+def _init_job_repos(job, targets):
+    """Run restic init on each storage; 'already initialized' counts as success"""
     messages, errors = [], []
     for target in targets:
         cmd = ['restic', 'init']
@@ -5217,16 +5324,10 @@ def api_set_timezone():
 
     success, error_msg = set_app_setting('timezone', timezone)
     if success:
-        # Update scheduler timezone
-        global scheduler
-        scheduler.shutdown(wait=False)
-        scheduler = BackgroundScheduler(timezone=timezone)
-        scheduler.start()
+        # The scheduler leader restarts its scheduler in the new timezone
+        refresh_schedules()
 
-        # Re-schedule all jobs with new timezone
-        init_schedules()
-
-        logger.info(f"Timezone updated to {timezone}, scheduler restarted")
+        logger.info(f"Timezone updated to {timezone}")
         return jsonify({'success': True, 'timezone': timezone})
     else:
         return jsonify({'error': error_msg or 'Failed to save timezone setting'}), 500
@@ -5261,19 +5362,6 @@ def serve_frontend(path):
     return redirect(url_for('login'))
 
 
-# Initialize scheduled jobs on startup
-def init_schedules():
-    logger.info("Initializing scheduled jobs...")
-    jobs = load_jobs()
-    scheduled_count = 0
-    for job_id, job in jobs.items():
-        if job.get('schedule_enabled'):
-            schedule_job(job_id, job)
-            scheduled_count += 1
-            logger.info(f"Scheduled job: {job['name']} ({job_id}) - cron: {job.get('schedule_cron', '0 2 * * *')}")
-    logger.info(f"Initialized {scheduled_count} scheduled jobs")
-
-
 # Initialize database and migrate data on startup
 def init_app():
     """Initialize the application"""
@@ -5283,9 +5371,6 @@ def init_app():
     init_db()
     migrate_json_to_db()
 
-    # Re-initialize scheduler with timezone from database
-    reinit_scheduler_with_db_timezone()
-
     # Initialize audit logging
     try:
         from .audit.logger import init_audit_logger
@@ -5294,26 +5379,31 @@ def init_app():
     except Exception as e:
         logger.warning(f"Audit logging not available: {e}")
 
-    # Initialize schedules
-    init_schedules()
-
-    # Reset any jobs stuck in 'running' state from a previous crash/restart
+    # Reset any jobs stuck in 'running' state from a previous crash/restart.
+    # A job whose run lock is held is really running in another worker.
     try:
         conn = get_db_connection()
         stuck_jobs = conn.fetchall(
             "SELECT id, name FROM jobs WHERE status = 'running'"
         )
+        reset_count = 0
         for row in stuck_jobs:
+            if job_is_running(_lock_connection, row['id']):
+                continue
             conn.execute(
                 "UPDATE jobs SET status='failed', progress=0, progress_message='Interrupted by server restart', updated_at=? WHERE id=?",
                 (utc_isoformat(), row['id'])
             )
+            reset_count += 1
             logger.warning(f"Reset stuck job: {row['id']} ({row['name']})")
-        if stuck_jobs:
+        if reset_count:
             conn.commit()
-    
+
     except Exception as e:
         logger.warning(f"Failed to reset stuck jobs: {e}")
+
+    # Compete for the scheduler lock; only the winning worker runs scheduled jobs
+    init_scheduler_leader()
 
     logger.info("BackupX application initialized successfully")
 
