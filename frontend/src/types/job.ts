@@ -38,6 +38,27 @@ export interface Job {
   // Scheduled job that hasn't started a run since its last expected fire time (+ grace)
   overdue?: boolean;
   overdue_since?: string | null;
+  // Latest retention forget/prune result per storage
+  retention_runs?: RetentionRun[];
+}
+
+export interface RetentionRun {
+  storage_id: string;
+  storage_name: string;
+  action: "forget" | "prune";
+  status: "success" | "failed" | "skipped";
+  dry_run: boolean;
+  snapshots_removed: number | null;
+  bytes_freed: number | null;
+  message: string;
+  timestamp: string;
+}
+
+export interface RetentionSettings {
+  enabled: boolean;
+  dry_run: boolean;
+  prune_cron: string;
+  prune_max_unused: string;
 }
 
 export interface Jobs {

@@ -269,6 +269,40 @@ sudo apt install mysql-client
 sudo yum install mysql
 ```
 
+## Snapshot Retention
+
+Each job's retention fields (hourly / daily / weekly / monthly) become restic
+`--keep-*` rules. Retention is **off by default** (`RETENTION_ENABLED=false`):
+deploying changes nothing until you turn it on.
+
+When on:
+
+- After every backup, old snapshots are forgotten on each storage that received
+  the new snapshot. Only snapshots BackupX wrote (tag `automated`) are
+  considered, grouped per host + tags (+ paths for file jobs), so manual
+  snapshots and other hosts' snapshots are kept by their own rules.
+- A job whose retention fields are all `0` keeps everything. A plan that would
+  remove every snapshot of a group is refused and reported.
+- Once a week (`RETENTION_PRUNE_CRON`, default `0 4 * * sun` in the scheduler
+  timezone) `restic prune --max-unused 10%` frees the space, one repository at
+  a time. Prune is skipped for a job whose backup is running.
+- Repositories shared by more than one job are skipped.
+- forget/prune run inside the BackupX container, not on the backed-up server.
+- The latest result per storage shows under "Last Run" in the Jobs list;
+  failures are sent to notification channels like backup failures.
+
+Restic counts only periods that have a snapshot: with one backup a day,
+"24 hourly" keeps the last 24 snapshots (24 days).
+
+Rollout:
+
+1. Set `RETENTION_ENABLED=true` and `RETENTION_DRY_RUN=true`, restart, and
+   check the next backups' "would remove" lines (Jobs list tooltip or
+   `docker compose logs backup-ui | grep Retention`). To try prune without
+   waiting for Sunday, temporarily set `RETENTION_PRUNE_CRON` to a time a few
+   minutes ahead.
+2. When the plans look right, set `RETENTION_DRY_RUN=false` and restart.
+
 ## Backup & Restore
 
 ### Backup BackupX Data

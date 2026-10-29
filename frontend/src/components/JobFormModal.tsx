@@ -22,7 +22,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
-import type { Job, JobFormData } from "@/types/job";
+import type { Job, JobFormData, RetentionSettings } from "@/types/job";
 import type { S3Config } from "@/types/s3";
 import type { Server } from "@/types/server";
 import type { DatabaseConfig } from "@/types/database";
@@ -88,12 +88,14 @@ export default function JobFormModal({
   const [browseOpen, setBrowseOpen] = useState(false);
   const [revealedPassword, setRevealedPassword] = useState<string | null>(null);
   const [isRevealing, setIsRevealing] = useState(false);
+  const [retentionSettings, setRetentionSettings] = useState<RetentionSettings | null>(null);
 
   useEffect(() => {
     if (open) {
       fetchS3Configs();
       fetchServers();
       fetchDbConfigs();
+      fetchRetentionSettings();
       setRevealedPassword(null);
       if (jobId) {
         fetchJob();
@@ -125,6 +127,17 @@ export default function JobFormModal({
       }
     } catch (error) {
       console.error("Failed to fetch servers:", error);
+    }
+  };
+
+  const fetchRetentionSettings = async () => {
+    try {
+      const response = await fetch("/api/retention/settings");
+      if (response.ok) {
+        setRetentionSettings(await response.json());
+      }
+    } catch (error) {
+      console.error("Failed to fetch retention settings:", error);
     }
   };
 
@@ -817,6 +830,18 @@ export default function JobFormModal({
                       />
                     </div>
                   </div>
+                  <p className="text-xs text-muted-foreground">
+                    How many hourly, daily, weekly and monthly snapshots to keep on each storage
+                    (restic counts only periods that have a snapshot). 0 turns a rule off; all 0 keeps
+                    every snapshot.{" "}
+                    {retentionSettings && !retentionSettings.enabled
+                      ? "Retention is turned off on this server (RETENTION_ENABLED), so nothing is removed yet."
+                      : retentionSettings?.dry_run
+                        ? "Retention runs in dry-run mode: it only logs what it would remove."
+                        : retentionSettings
+                          ? `Old snapshots are forgotten after each backup; unused data is pruned on schedule (${retentionSettings.prune_cron}).`
+                          : ""}
+                  </p>
                 </div>
 
                 <Separator />

@@ -500,6 +500,23 @@ class PostgresBackend(DatabaseBackend):
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- Retention runs (restic forget after backups, weekly prune)
+            CREATE TABLE IF NOT EXISTS retention_runs (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP NOT NULL,
+                job_id TEXT NOT NULL,
+                storage_id TEXT NOT NULL DEFAULT '',
+                storage_name TEXT,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                dry_run BOOLEAN DEFAULT FALSE,
+                snapshots_removed INTEGER,
+                bytes_freed BIGINT,
+                message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_retention_runs_latest
+                ON retention_runs(job_id, storage_id, action, timestamp DESC);
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_history_job_id ON history(job_id);
@@ -565,6 +582,23 @@ class PostgresBackend(DatabaseBackend):
                 value TEXT NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            -- Retention runs (restic forget after backups, weekly prune)
+            CREATE TABLE IF NOT EXISTS retention_runs (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP NOT NULL,
+                job_id TEXT NOT NULL,
+                storage_id TEXT NOT NULL DEFAULT '',
+                storage_name TEXT,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                dry_run BOOLEAN DEFAULT FALSE,
+                snapshots_removed INTEGER,
+                bytes_freed BIGINT,
+                message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_retention_runs_latest
+                ON retention_runs(job_id, storage_id, action, timestamp DESC);
         ''')
         self.commit()
 

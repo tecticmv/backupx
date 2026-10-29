@@ -26,7 +26,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { toast } from "sonner";
-import type { Jobs as JobsType } from "@/types/job";
+import type { Jobs as JobsType, RetentionRun } from "@/types/job";
 import JobFormModal from "@/components/JobFormModal";
 import {
   Plus,
@@ -235,6 +235,46 @@ export default function Jobs() {
     return new Date(timestamp).toLocaleString();
   };
 
+  // One line per job: when old snapshots were last forgotten / pruned, details per storage in the tooltip
+  const retentionSummary = (runs?: RetentionRun[]) => {
+    if (!runs || runs.length === 0) return null;
+    const latest = (action: RetentionRun["action"]) =>
+      runs
+        .filter((r) => r.action === action)
+        .sort((a, b) => b.timestamp.localeCompare(a.timestamp))[0];
+    const forget = latest("forget");
+    const prune = latest("prune");
+    const failed = runs.some((r) => r.status === "failed");
+    const parts = [
+      forget && `forget ${formatTime(forget.timestamp)}`,
+      prune && `prune ${formatTime(prune.timestamp)}`,
+    ].filter(Boolean);
+    return (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <p className={`text-xs mt-1 truncate ${failed ? "text-destructive" : "text-muted-foreground"}`}>
+            {failed && <AlertTriangle className="inline h-3 w-3 mr-1" />}
+            Retention: {parts.join(" · ")}
+          </p>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-md">
+          <div className="space-y-1">
+            {runs.map((r) => (
+              <p key={`${r.storage_id}-${r.action}`} className="text-xs">
+                <span className="font-medium">
+                  {r.action} · {r.storage_name || "storage"}
+                  {r.dry_run ? " (dry run)" : ""}:
+                </span>{" "}
+                {r.status === "success" ? "" : `${r.status} - `}
+                {r.message}
+              </p>
+            ))}
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    );
+  };
+
   const jobsList = Object.entries(jobs);
   const totalJobs = jobsList.length;
   const successJobs = jobsList.filter(([, j]) => j.status === "success").length;
@@ -415,6 +455,7 @@ export default function Jobs() {
                             <p className="text-xs text-muted-foreground mt-1">
                               {formatTime(job.last_run)}
                             </p>
+                            {retentionSummary(job.retention_runs)}
                           </>
                         )}
                       </div>

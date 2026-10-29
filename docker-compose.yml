@@ -33,6 +33,11 @@ services:
       - BACKUP_MAX_CONCURRENT=${BACKUP_MAX_CONCURRENT:-4}
       - BACKUP_MISFIRE_GRACE=${BACKUP_MISFIRE_GRACE:-21600}
       - BACKUP_OVERDUE_GRACE=${BACKUP_OVERDUE_GRACE:-21600}
+      # Snapshot retention (restic forget/prune); off until turned on, see DEPLOYMENT.md
+      - RETENTION_ENABLED=${RETENTION_ENABLED:-false}
+      - RETENTION_DRY_RUN=${RETENTION_DRY_RUN:-false}
+      - RETENTION_PRUNE_CRON=${RETENTION_PRUNE_CRON:-0 4 * * sun}
+      - RETENTION_PRUNE_MAX_UNUSED=${RETENTION_PRUNE_MAX_UNUSED:-10%}
     depends_on:
       postgres:
         condition: service_healthy

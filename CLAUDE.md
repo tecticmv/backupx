@@ -72,6 +72,7 @@ pytest tests/test_security.py::TestAuthentication::test_login_success
 - **Restic init**: The backup script runs `restic init` only when `restic cat config` reports the repo doesn't exist (exit 10, or the old-restic message); any other open error fails that storage
 - **Restic provisioning**: Auto-install via SSH on server add/update. Falls back to `~/.local/bin` if `/usr/local/bin` isn't writable
 - **Snapshot caching**: In-memory TTL cache (60s for snapshot lists, 5m for repo stats) to avoid repeated S3 queries
+- **Retention** (`app/retention.py` pure helpers, runners in `main.py`): off unless `RETENTION_ENABLED=true`. After a backup, on each storage that got the snapshot, restic runs *in the backupx container* (pinned static restic in the Dockerfile, not on the target host): `forget --dry-run --json --tag automated --group-by host,paths,tags` (DB jobs: `host,tags`, their dump paths are random) with the job's `--keep-hourly/daily/weekly/monthly`; the plan is refused if any group would lose all its snapshots, then exactly those snapshot IDs are forgotten. Jobs with all keep fields 0 are never forgotten. A weekly `prune --max-unused` (`RETENTION_PRUNE_CRON`, default Sunday 04:00 scheduler TZ) runs on its own one-thread `maintenance` executor, one repository at a time, under the job's run lock (skipped if a backup holds it). Repositories shared by several jobs (same endpoint/bucket/prefix) are skipped. `RETENTION_DRY_RUN=true` only logs. Results go to the `retention_runs` table (latest per job/storage shown in the Jobs list), not `history`; failures notify like backup failures
 
 ### Data Flow
 1. React UI calls Flask REST API (`/api/*`)
@@ -103,3 +104,6 @@ Key variables:
 - `BACKUP_MAX_CONCURRENT` — scheduled backups running at once (default 4)
 - `BACKUP_MISFIRE_GRACE` / `BACKUP_OVERDUE_GRACE` — seconds a queued run may start late / before a job is flagged overdue (default 21600 each)
 - `DATABASE_POOL_MAX` / `DATABASE_POOL_TIMEOUT` — pooled connections per worker (default 20) / seconds to wait for one (default 30)
+- `RETENTION_ENABLED` / `RETENTION_DRY_RUN` — run restic forget/prune at all (default `false`) / only log what would be removed (default `false`)
+- `RETENTION_PRUNE_CRON` / `RETENTION_PRUNE_MAX_UNUSED` — weekly prune schedule in the scheduler timezone (default `0 4 * * sun`; use day names, APScheduler numbers days from Monday) / restic `--max-unused` (default `10%`)
+- `RETENTION_LOCK_WAIT` / `RETENTION_FORGET_TIMEOUT` / `RETENTION_PRUNE_TIMEOUT` — restic `--retry-lock` (default `10m`) / seconds per forget (900) and prune (14400) run

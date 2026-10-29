@@ -34,6 +34,7 @@ import yaml
 import humanize
 
 from .scheduler.locks import SchedulerLeader, job_run_lock, job_is_running
+from . import retention
 
 # =============================================================================
 # Logging Configuration
@@ -574,6 +575,12 @@ def _on_scheduler_event(event):
         message = sanitize_error_message(
             f"Scheduled run crashed: {type(event.exception).__name__}: {event.exception}")
     logger.error(f"Scheduler: job {event.job_id}: {message}")
+    if event.job_id == retention.PRUNE_SCHEDULE_ID:
+        # Not a backup job: don't mark any job failed, just alert
+        threading.Thread(target=send_notification,
+                         args=(event.job_id, 'Retention prune', 'failed', message, 0),
+                         name='report-retention-prune', daemon=True).start()
+        return
     # Don't block the scheduler thread on database or network calls
     threading.Thread(target=_report_backup_failure, args=(event.job_id, message),
                      name=f'report-{event.job_id}', daemon=True).start()
@@ -583,7 +590,10 @@ def _new_scheduler(timezone):
     """BackgroundScheduler with a bounded worker pool that queues runs instead of dropping them"""
     new = BackgroundScheduler(
         timezone=timezone,
-        executors={'default': SchedulerThreadPool(BACKUP_MAX_CONCURRENT)},
+        # Retention prune gets its own single worker: it runs one repository at a
+        # time and never takes a backup slot.
+        executors={'default': SchedulerThreadPool(BACKUP_MAX_CONCURRENT),
+                   'maintenance': SchedulerThreadPool(1)},
         job_defaults={
             'coalesce': True,  # several missed fire times -> one run
             'max_instances': 1,
@@ -600,6 +610,7 @@ def _new_scheduler(timezone):
 scheduler = _new_scheduler(os.environ.get('TZ', 'UTC'))
 _scheduler_state_lock = threading.RLock()
 _scheduled_crons = {}  # job_id -> cron the running scheduler has for it
+_scheduled_prune = {'cron': None}  # cron of the retention prune entry, None if not scheduled
 _scheduler_leader = None
 SCHEDULER_LOCK_INTERVAL = int(os.environ.get('SCHEDULER_LOCK_INTERVAL', 15))
 
@@ -634,6 +645,7 @@ def sync_schedules():
                 scheduler.shutdown(wait=False)
             scheduler = _new_scheduler(timezone)
             _scheduled_crons.clear()
+            _scheduled_prune['cron'] = None
         if not scheduler.running:
             scheduler.start()
 
@@ -669,6 +681,42 @@ def sync_schedules():
             _scheduled_crons[job_id] = cron
             logger.info(f"Scheduled job: {job_id} - cron: {cron}")
 
+        _sync_prune_schedule()
+
+
+def _sync_prune_schedule():
+    """Schedule the weekly retention prune when retention is enabled (call with _scheduler_state_lock)."""
+    try:
+        cfg = retention.settings()
+    except ValueError as e:
+        logger.error(f"Invalid retention settings: {e}")
+        return
+    desired = cfg['prune_cron'] if cfg['enabled'] else None
+    if desired and len(desired.split()) != 5:
+        logger.error(f"Invalid RETENTION_PRUNE_CRON {desired!r}: retention prune not scheduled")
+        desired = None
+    if _scheduled_prune['cron'] == desired:
+        return
+    if _scheduled_prune['cron'] is not None:
+        try:
+            scheduler.remove_job(retention.PRUNE_SCHEDULE_ID)
+        except Exception:
+            pass
+        _scheduled_prune['cron'] = None
+    if desired:
+        minute, hour, day, month, day_of_week = desired.split()
+        try:
+            scheduler.add_job(
+                run_retention_maintenance, 'cron', id=retention.PRUNE_SCHEDULE_ID,
+                executor='maintenance', replace_existing=True,
+                minute=minute, hour=hour, day=day, month=month, day_of_week=day_of_week)
+        except Exception as e:
+            logger.error(f"Invalid RETENTION_PRUNE_CRON {desired!r}: {e}")
+            return
+        _scheduled_prune['cron'] = desired
+        logger.info(f"Scheduled retention prune - cron: {desired}"
+                    + (" (dry run)" if cfg['dry_run'] else ""))
+
 
 def _leader_sync():
     """sync_schedules from the lock thread, returning its DB connection to the pool after"""
@@ -689,6 +737,7 @@ def _stop_scheduler():
             scheduler.shutdown(wait=False)
         scheduler = _new_scheduler(scheduler.timezone)
         _scheduled_crons.clear()
+        _scheduled_prune['cron'] = None
 
 
 def refresh_schedules():
@@ -942,6 +991,7 @@ def delete_job_from_db(job_id):
     """Delete a job from database"""
     conn = get_db_connection()
     conn.execute('DELETE FROM jobs WHERE id = ?', (job_id,))
+    conn.execute('DELETE FROM retention_runs WHERE job_id = ?', (job_id,))
     conn.commit()
 
 
@@ -2372,6 +2422,7 @@ def _finish_backup(job_id, job, targets, start_time, returncode, stderr_text, pr
         add_history(job_id, job['name'], 'success', message, duration)
         send_notification(job_id, job['name'], 'success', message, duration)
         logger.info(f"{label} completed successfully: {job_id} (duration: {duration:.1f}s)")
+        apply_retention(job_id, job, targets)
         return True, message
 
     if not any(r['exit_code'] is not None for r in results):
@@ -2393,6 +2444,9 @@ def _finish_backup(job_id, job, targets, start_time, returncode, stderr_text, pr
     add_history(job_id, job['name'], 'failed', error_msg, duration)
     send_notification(job_id, job['name'], 'failed', error_msg, duration)
     logger.error(f"{label} failed: {job_id} - {error_msg[:200]}")
+    if succeeded:
+        # Forget only where this run stored a new snapshot
+        apply_retention(job_id, job, [t for t, r in zip(targets, results) if r['exit_code'] == 0])
     return False, error_msg
 
 
@@ -2746,6 +2800,285 @@ def get_repo_stats(job, target):
         return None
 
 
+# =============================================================================
+# Retention: restic forget after each backup, weekly prune
+# =============================================================================
+# Both run here in the backupx container (like snapshot listing), not on the
+# target server: forget/prune only touch the repository, so there is no reason
+# to load the target host. Secrets go through env= (job_restic_env), never argv.
+# Nothing runs unless RETENTION_ENABLED=true; RETENTION_DRY_RUN=true only logs.
+
+class RetentionError(Exception):
+    pass
+
+
+_local_restic_version_cache = []
+
+
+def _local_restic_version():
+    """Version of the restic in this container, as a tuple (None if unknown)."""
+    if not _local_restic_version_cache:
+        version = None
+        try:
+            out = subprocess.run(['restic', 'version'], capture_output=True, text=True, timeout=30)
+            version = retention.parse_restic_version(out.stdout)
+        except Exception as e:
+            logger.warning(f"Can't determine the local restic version: {e}")
+        _local_restic_version_cache.append(version)
+    return _local_restic_version_cache[0]
+
+
+def _restic_local(job, target, args, timeout, lock_wait=None):
+    """Run restic here against one of a job's storages; secrets only in the environment."""
+    cmd = ['restic', *args]
+    if lock_wait and retention.supports_retry_lock(_local_restic_version()):
+        cmd += ['--retry-lock', lock_wait]
+    if target.get('skip_ssl_verify'):
+        cmd.append('--insecure-tls')
+    return subprocess.run(cmd, capture_output=True, text=True, env=job_restic_env(job, target), timeout=timeout)
+
+
+def _restic_error(proc, what):
+    text = (proc.stderr or '').strip() or (proc.stdout or '').strip()
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('{'):
+            # With --json, restic reports errors as {"message_type":"exit_error","message":...}
+            try:
+                line = json.loads(line).get('message') or line
+            except (ValueError, AttributeError):
+                pass
+        if line:
+            lines.append(line)
+    return ' '.join(lines[-3:]) if lines else f'restic {what} exited with code {proc.returncode}'
+
+
+def record_retention_run(job_id, target, action, status, message,
+                         snapshots_removed=None, bytes_freed=None, dry_run=False):
+    """Store one forget/prune result (best effort, never raises)."""
+    try:
+        conn = get_db_connection()
+        conn.execute('''
+            INSERT INTO retention_runs (timestamp, job_id, storage_id, storage_name, action, status,
+                                        dry_run, snapshots_removed, bytes_freed, message)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (utc_isoformat(), job_id, target.get('id') or '', target.get('name') or '', action, status,
+              bool(dry_run), snapshots_removed, bytes_freed, message))
+        conn.execute('''
+            DELETE FROM retention_runs WHERE id NOT IN (
+                SELECT id FROM retention_runs ORDER BY timestamp DESC LIMIT 2000
+            )
+        ''')
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Can't record retention {action} for job {job_id}: {e}")
+
+
+def _jobs_sharing_repo(job_id, job, target):
+    """Names of other jobs that write to the same restic repository as this job/storage.
+
+    Forget is scoped by host and tags, which can't tell two jobs apart inside
+    one repository, so a shared repository is left alone.
+    """
+    url = job_repo_url(dict(job, id=job_id), target)
+    others = []
+    for other_id, other in load_jobs().items():
+        if other_id == job_id:
+            continue
+        other = dict(other, id=other_id)
+        if any(job_repo_url(other, t) == url for t in get_job_storage_targets(other, include_inactive=True)):
+            others.append(other.get('name') or other_id)
+    return others
+
+
+def _parse_json_output(text):
+    """restic --json output; tolerates stray non-JSON lines before it."""
+    text = (text or '').strip()
+    if not text:
+        return []
+    try:
+        return json.loads(text)
+    except ValueError:
+        start = min((i for i in (text.find('['), text.find('{')) if i >= 0), default=-1)
+        if start < 0:
+            raise
+        return json.loads(text[start:])
+
+
+def forget_on_target(job, target, cfg):
+    """Apply the job's policy on one storage. Returns (snapshots_removed, message). Raises RetentionError."""
+    plan_args = retention.forget_plan_args(job)
+    if plan_args is None:
+        raise RetentionError('job has no retention policy')  # callers check first; never forget everything
+    proc = _restic_local(job, target, plan_args, cfg['forget_timeout'], cfg['lock_wait'])
+    if proc.returncode != 0:
+        raise RetentionError(_restic_error(proc, 'forget'))
+    try:
+        groups = _parse_json_output(proc.stdout)
+    except ValueError:
+        raise RetentionError('could not read the forget plan from restic')
+    if not isinstance(groups, list):
+        raise RetentionError('unexpected forget plan from restic')
+    remove, keep_count, problems = retention.check_forget_plan(groups)
+    if problems:
+        raise RetentionError('refused, nothing removed: ' + '; '.join(problems))
+    policy = retention.describe_policy(job)
+    if not remove:
+        return 0, f'nothing to remove ({keep_count} kept; policy {policy})'
+    ids = retention.summarize_removed(remove)
+    if cfg['dry_run']:
+        return len(remove), f'dry run: would remove {len(remove)} snapshot(s), keep {keep_count} ({policy}): {ids}'
+    proc = _restic_local(job, target, retention.forget_ids_args([s['id'] for s in remove]),
+                         cfg['forget_timeout'], cfg['lock_wait'])
+    if proc.returncode != 0:
+        raise RetentionError(_restic_error(proc, 'forget'))
+    return len(remove), f'removed {len(remove)} snapshot(s), kept {keep_count} ({policy}): {ids}'
+
+
+def apply_retention(job_id, job, targets):
+    """Forget old snapshots on each storage after a backup. Never raises.
+
+    Called while the job's run lock is held. Does nothing unless retention is
+    enabled and the job has at least one keep rule.
+    """
+    try:
+        cfg = retention.settings()
+        if not cfg['enabled'] or not targets:
+            return
+        if not retention.retention_policy(job):
+            logger.info(f"Retention: job {job.get('name')} has no keep rules; keeping every snapshot")
+            return
+    except Exception as e:
+        logger.error(f"Retention skipped for job {job_id}: {e}")
+        return
+
+    for target in targets:
+        name = target.get('name') or '?'
+        try:
+            shared = _jobs_sharing_repo(job_id, job, target)
+            if shared:
+                message = f"skipped: repository shared with {', '.join(shared)}"
+                logger.warning(f"Retention: job {job.get('name')} on {name}: {message}")
+                record_retention_run(job_id, target, 'forget', 'skipped', message, dry_run=cfg['dry_run'])
+                continue
+            removed, message = forget_on_target(job, target, cfg)
+            logger.info(f"Retention: job {job.get('name')} on {name}: {message}")
+            record_retention_run(job_id, target, 'forget', 'success', message,
+                                 snapshots_removed=removed, dry_run=cfg['dry_run'])
+            if removed and not cfg['dry_run']:
+                invalidate_snapshot_cache(job_id)
+        except Exception as e:
+            if isinstance(e, subprocess.TimeoutExpired):
+                e = RetentionError(f'timed out after {cfg["forget_timeout"]}s')
+            message = sanitize_error_message(f'Retention (forget) failed on {name}: {e}')
+            logger.error(f"Job {job.get('name')}: {message}")
+            record_retention_run(job_id, target, 'forget', 'failed', message, dry_run=cfg['dry_run'])
+            try:
+                send_notification(job_id, job.get('name') or job_id, 'failed', message, 0)
+            except Exception as ne:
+                logger.error(f"Can't send retention failure notification: {ne}")
+
+
+def prune_target(job_id, job, target, cfg):
+    """Prune one storage of a job under the job's run lock. Never raises."""
+    import time
+    name = target.get('name') or '?'
+    job_name = job.get('name') or job_id
+    start = time.monotonic()
+    try:
+        shared = _jobs_sharing_repo(job_id, job, target)
+        if shared:
+            message = f"skipped: repository shared with {', '.join(shared)}"
+            logger.warning(f"Retention prune: job {job_name} on {name}: {message}")
+            record_retention_run(job_id, target, 'prune', 'skipped', message, dry_run=cfg['dry_run'])
+            return
+        with job_run_lock(_lock_connection, job_id) as acquired:
+            if not acquired:
+                message = 'skipped: a backup of this job is running'
+                logger.warning(f"Retention prune: job {job_name} on {name}: {message}")
+                record_retention_run(job_id, target, 'prune', 'skipped', message, dry_run=cfg['dry_run'])
+                return
+            logger.info(f"Retention prune: job {job_name} on {name} starting"
+                        + (" (dry run)" if cfg['dry_run'] else ""))
+            proc = _restic_local(job, target, retention.prune_args(cfg['dry_run'], cfg['prune_max_unused']),
+                                 cfg['prune_timeout'], cfg['lock_wait'])
+        if proc.returncode != 0:
+            raise RetentionError(_restic_error(proc, 'prune'))
+        parsed = retention.parse_prune_output(proc.stdout)
+        took = time.monotonic() - start
+        freed = parsed['bytes_freed']
+        prefix = 'dry run: would free' if cfg['dry_run'] else 'freed'
+        message = f"{prefix} {_format_bytes(freed) if freed is not None else 'unknown'} in {format_duration(took)}"
+        if parsed['summary']:
+            message += f" ({parsed['summary']})"
+        logger.info(f"Retention prune: job {job_name} on {name}: {message}")
+        record_retention_run(job_id, target, 'prune', 'success', message,
+                             bytes_freed=freed, dry_run=cfg['dry_run'])
+        if not cfg['dry_run']:
+            invalidate_snapshot_cache(job_id)
+    except Exception as e:
+        if isinstance(e, subprocess.TimeoutExpired):
+            e = RetentionError(f'timed out after {cfg["prune_timeout"]}s')
+        message = sanitize_error_message(f'Retention (prune) failed on {name}: {e}')
+        logger.error(f"Job {job_name}: {message}")
+        record_retention_run(job_id, target, 'prune', 'failed', message, dry_run=cfg['dry_run'])
+        try:
+            send_notification(job_id, job_name, 'failed', message, time.monotonic() - start)
+        except Exception as ne:
+            logger.error(f"Can't send prune failure notification: {ne}")
+
+
+def run_retention_maintenance():
+    """Weekly: prune every active storage of every job that has keep rules, one at a time. Never raises."""
+    with _short_lived_db():
+        try:
+            cfg = retention.settings()
+            if not cfg['enabled']:
+                return
+            logger.info("Retention prune: starting" + (" (dry run)" if cfg['dry_run'] else ""))
+            for job_id, job in load_jobs().items():
+                job = dict(job, id=job_id)
+                if not retention.retention_policy(job):
+                    continue
+                for target in get_job_storage_targets(job):
+                    prune_target(job_id, job, target, cfg)
+            logger.info("Retention prune: finished")
+        except Exception as e:
+            logger.exception(f"Retention prune run failed: {e}")
+        finally:
+            try:
+                get_db().close()
+            except Exception:
+                pass
+
+
+def _iso_utc(value):
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    return value
+
+
+def latest_retention_runs():
+    """Latest forget and prune result per job and storage: {job_id: [run, ...]}"""
+    conn = get_db_connection()
+    rows = conn.fetchall('''
+        SELECT DISTINCT ON (job_id, storage_id, action)
+               job_id, storage_id, storage_name, action, status, dry_run,
+               snapshots_removed, bytes_freed, message, timestamp
+        FROM retention_runs
+        ORDER BY job_id, storage_id, action, timestamp DESC
+    ''')
+    runs = {}
+    for row in rows:
+        run = dict(row)
+        run['timestamp'] = _iso_utc(run['timestamp'])
+        runs.setdefault(run.pop('job_id'), []).append(run)
+    return runs
+
+
 # Routes
 @app.route('/health')
 @limiter.exempt
@@ -2969,7 +3302,30 @@ def _annotate_overdue(jobs):
 @limiter.exempt
 def api_jobs():
     jobs = _annotate_overdue(load_jobs())
+    try:
+        runs = latest_retention_runs()
+    except Exception as e:
+        logger.debug(f"Loading retention runs failed: {e}")
+        runs = {}
+    for job_id, job in jobs.items():
+        job['retention_runs'] = runs.get(job_id, [])
     return jsonify(jobs)
+
+
+@app.route('/api/retention/settings')
+@login_required
+def api_retention_settings():
+    """Whether retention runs, and how (set via environment variables)"""
+    try:
+        cfg = retention.settings()
+    except ValueError as e:
+        return jsonify({'error': f'Invalid retention settings: {e}'}), 500
+    return jsonify({
+        'enabled': cfg['enabled'],
+        'dry_run': cfg['dry_run'],
+        'prune_cron': cfg['prune_cron'],
+        'prune_max_unused': cfg['prune_max_unused'],
+    })
 
 
 @app.route('/api/jobs/<job_id>/reveal-password', methods=['POST'])
