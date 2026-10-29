@@ -27,6 +27,12 @@ services:
       - DATABASE_NAME=backupx
       - DATABASE_USER=backupx
       - DATABASE_PASSWORD=${DATABASE_PASSWORD:-backupx-secure-password}
+      - DATABASE_POOL_MAX=${DATABASE_POOL_MAX:-20}
+      - DATABASE_POOL_TIMEOUT=${DATABASE_POOL_TIMEOUT:-30}
+      # Scheduled backups
+      - BACKUP_MAX_CONCURRENT=${BACKUP_MAX_CONCURRENT:-4}
+      - BACKUP_MISFIRE_GRACE=${BACKUP_MISFIRE_GRACE:-21600}
+      - BACKUP_OVERDUE_GRACE=${BACKUP_OVERDUE_GRACE:-21600}
     depends_on:
       postgres:
         condition: service_healthy

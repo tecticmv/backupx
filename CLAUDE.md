@@ -65,6 +65,8 @@ pytest tests/test_security.py::TestAuthentication::test_login_success
 - **SSH auth**: Three modes supported — key file path, pasted/uploaded key content, password (via `sshpass`). Sensitive values encrypted with Fernet
 - **Sessions**: Strategy pattern — filesystem (default) or Redis for horizontal scaling
 - **Scheduler**: Every gunicorn worker imports the app, but only the one holding a Postgres advisory lock starts APScheduler; it re-reads jobs/timezone from the DB every `SCHEDULER_LOCK_INTERVAL` (15s), and another worker takes over if it dies. Each backup run holds a per-job advisory lock, so a job never runs twice at once (a second trigger is skipped and logged, no notification)
+- **Backup runs and the DB pool**: At most `BACKUP_MAX_CONCURRENT` scheduled runs at once; the rest queue (misfire grace `BACKUP_MISFIRE_GRACE`, so queued runs aren't dropped). Advisory locks use dedicated non-pooled connections; a run borrows a pooled connection per query (`short_lived_connections()` mode) instead of holding one for hours. The pool waits up to `DATABASE_POOL_TIMEOUT` for a free connection instead of raising at once. `run_backup` never raises: any error marks the job failed, writes history and notifies; an APScheduler error/missed listener is the last resort
+- **Overdue jobs**: `/api/jobs` and `/api/dashboard/stats` flag scheduled jobs that haven't started a run since the last expected fire time (`BACKUP_OVERDUE_GRACE` ago), computed with APScheduler's CronTrigger in the scheduler timezone
 - **Restic init**: The backup script runs `restic init` only when `restic cat config` reports the repo doesn't exist (exit 10, or the old-restic message); any other open error fails that storage
 - **Restic provisioning**: Auto-install via SSH on server add/update. Falls back to `~/.local/bin` if `/usr/local/bin` isn't writable
 - **Snapshot caching**: In-memory TTL cache (60s for snapshot lists, 5m for repo stats) to avoid repeated S3 queries
@@ -96,3 +98,6 @@ Key variables:
 - `SESSION_TYPE` — `filesystem` (default) or `redis`
 - `SCHEDULER_ENABLED` — `false` to keep an instance from ever running scheduled jobs (default `true`)
 - `SCHEDULER_LOCK_INTERVAL` — seconds between scheduler lock checks / schedule syncs (default 15)
+- `BACKUP_MAX_CONCURRENT` — scheduled backups running at once (default 4)
+- `BACKUP_MISFIRE_GRACE` / `BACKUP_OVERDUE_GRACE` — seconds a queued run may start late / before a job is flagged overdue (default 21600 each)
+- `DATABASE_POOL_MAX` / `DATABASE_POOL_TIMEOUT` — pooled connections per worker (default 20) / seconds to wait for one (default 30)

@@ -26,7 +26,8 @@ def create_database_backend() -> DatabaseBackend:
         DATABASE_USER: Username (required)
         DATABASE_PASSWORD: Password (required)
         DATABASE_POOL_MIN: Min pool size (default: 2)
-        DATABASE_POOL_MAX: Max pool size (default: 10)
+        DATABASE_POOL_MAX: Max pool size per process (default: 20)
+        DATABASE_POOL_TIMEOUT: Seconds to wait for a free pooled connection (default: 30)
         DATABASE_SSL_MODE: SSL mode (default: prefer)
 
     Returns:
@@ -40,7 +41,8 @@ def create_database_backend() -> DatabaseBackend:
     user = os.environ.get('DATABASE_USER')
     password = os.environ.get('DATABASE_PASSWORD', '')
     pool_min = int(os.environ.get('DATABASE_POOL_MIN', 2))
-    pool_max = int(os.environ.get('DATABASE_POOL_MAX', 10))
+    pool_max = int(os.environ.get('DATABASE_POOL_MAX', 20))
+    pool_timeout = float(os.environ.get('DATABASE_POOL_TIMEOUT', 30))
     ssl_mode = os.environ.get('DATABASE_SSL_MODE', 'prefer')
 
     if not user:
@@ -55,7 +57,8 @@ def create_database_backend() -> DatabaseBackend:
         password=password,
         pool_min=pool_min,
         pool_max=pool_max,
-        ssl_mode=ssl_mode
+        ssl_mode=ssl_mode,
+        pool_timeout=pool_timeout
     )
 
 

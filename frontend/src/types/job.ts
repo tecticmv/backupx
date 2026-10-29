@@ -35,6 +35,9 @@ export interface Job {
   updated_at?: string;
   last_run?: string;
   last_success?: string;
+  // Scheduled job that hasn't started a run since its last expected fire time (+ grace)
+  overdue?: boolean;
+  overdue_since?: string | null;
 }
 
 export interface Jobs {

@@ -18,7 +18,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, request, redirect, url_for, jsonify, send_from_directory, g
@@ -26,6 +27,8 @@ from flask_login import LoginManager, UserMixin, login_user, logout_user, login_
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import generate_password_hash, check_password_hash
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor as SchedulerThreadPool
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 import yaml
 import humanize
 
@@ -546,10 +549,54 @@ def validate_bucket_name(name: str) -> bool:
     bucket_pattern = re.compile(r'^[a-z0-9][a-z0-9\-\.]*[a-z0-9]$')
     return bool(bucket_pattern.match(name))
 
+# How many scheduled backups run at once in the scheduler worker; the rest wait
+# for a free slot (many jobs share the same cron time, e.g. 02:00).
+BACKUP_MAX_CONCURRENT = max(1, int(os.environ.get('BACKUP_MAX_CONCURRENT', 4)))
+# How late a queued run may still start. APScheduler drops a run as "missed" if it
+# starts later than this after its fire time, which includes time spent waiting
+# for a free slot, so it must cover the queue at the busiest cron time.
+BACKUP_MISFIRE_GRACE = int(os.environ.get('BACKUP_MISFIRE_GRACE', 6 * 3600))
+# A scheduled job is flagged overdue when it hasn't started a run since the fire
+# time that is at least this many seconds in the past.
+BACKUP_OVERDUE_GRACE = int(os.environ.get('BACKUP_OVERDUE_GRACE', 6 * 3600))
+
+
+def _on_scheduler_event(event):
+    """Last-resort report for a scheduled run that crashed or never started.
+
+    run_backup reports its own failures, so this fires when that reporting
+    itself failed, or when APScheduler dropped a run (missed its grace time).
+    """
+    if event.code == EVENT_JOB_MISSED:
+        message = f"Scheduled run did not start (was due {event.scheduled_run_time})"
+    else:
+        message = sanitize_error_message(
+            f"Scheduled run crashed: {type(event.exception).__name__}: {event.exception}")
+    logger.error(f"Scheduler: job {event.job_id}: {message}")
+    # Don't block the scheduler thread on database or network calls
+    threading.Thread(target=_report_backup_failure, args=(event.job_id, message),
+                     name=f'report-{event.job_id}', daemon=True).start()
+
+
+def _new_scheduler(timezone):
+    """BackgroundScheduler with a bounded worker pool that queues runs instead of dropping them"""
+    new = BackgroundScheduler(
+        timezone=timezone,
+        executors={'default': SchedulerThreadPool(BACKUP_MAX_CONCURRENT)},
+        job_defaults={
+            'coalesce': True,  # several missed fire times -> one run
+            'max_instances': 1,
+            'misfire_grace_time': BACKUP_MISFIRE_GRACE,
+        },
+    )
+    new.add_listener(_on_scheduler_event, EVENT_JOB_ERROR | EVENT_JOB_MISSED)
+    return new
+
+
 # Scheduler - only the worker holding the scheduler lock starts it (see init_scheduler_leader).
 # Gunicorn runs several workers that each import this module; a scheduler per worker
 # would run every job once per worker.
-scheduler = BackgroundScheduler(timezone=os.environ.get('TZ', 'UTC'))
+scheduler = _new_scheduler(os.environ.get('TZ', 'UTC'))
 _scheduler_state_lock = threading.RLock()
 _scheduled_crons = {}  # job_id -> cron the running scheduler has for it
 _scheduler_leader = None
@@ -584,7 +631,7 @@ def sync_schedules():
             logger.info(f"Restarting scheduler with timezone: {timezone}")
             if scheduler.running:
                 scheduler.shutdown(wait=False)
-            scheduler = BackgroundScheduler(timezone=timezone)
+            scheduler = _new_scheduler(timezone)
             _scheduled_crons.clear()
         if not scheduler.running:
             scheduler.start()
@@ -639,7 +686,7 @@ def _stop_scheduler():
     with _scheduler_state_lock:
         if scheduler.running:
             scheduler.shutdown(wait=False)
-        scheduler = BackgroundScheduler(timezone=scheduler.timezone)
+        scheduler = _new_scheduler(scheduler.timezone)
         _scheduled_crons.clear()
 
 
@@ -687,6 +734,24 @@ def get_db():
 def get_db_connection():
     """Get the PostgreSQL database backend (alias for get_db for compatibility)"""
     return get_db()
+
+
+@contextmanager
+def _short_lived_db():
+    """Return the thread's pooled DB connection after every operation in this block.
+
+    For long-running work (backup runs): holding one pooled connection for a
+    whole run starves the pool when many jobs run at once.
+    """
+    try:
+        scope = get_db().short_lived_connections()
+    except Exception:
+        scope = None  # No database, or a backend without the mode: run as is
+    if scope is None:
+        yield
+        return
+    with scope:
+        yield
 
 
 @app.teardown_appcontext
@@ -1491,9 +1556,25 @@ def send_webhook_notification(channel, job_name, status, message, duration):
         raise
 
 
+_notification_channels_cache = None
+
+
 def send_notification(job_id, job_name, status, message, duration):
-    """Send notifications to all enabled channels"""
-    channels = load_notification_channels()
+    """Send notifications to all enabled channels. Never raises.
+
+    If the channels can't be loaded (database down), the last list loaded is
+    used, so a failure caused by the database can still be reported.
+    """
+    global _notification_channels_cache
+    try:
+        channels = load_notification_channels()
+        _notification_channels_cache = channels
+    except Exception as e:
+        if _notification_channels_cache is None:
+            logger.error(f"Can't send notifications for job {job_name}: loading channels failed: {e}")
+            return
+        logger.warning(f"Loading notification channels failed ({e}); using the last loaded list")
+        channels = _notification_channels_cache
 
     for channel in channels:
         if not channel['enabled']:
@@ -1521,22 +1602,72 @@ def send_notification(job_id, job_name, status, message, duration):
 
 
 def run_backup(job_id):
-    """Execute a backup job, unless a run of the same job is already in progress"""
-    try:
-        with job_run_lock(_lock_connection, job_id) as acquired:
-            if not acquired:
-                # Another worker, the scheduler or a manual run got there first. Not a
-                # failure: leave the job status and history to the run in progress.
-                message = "Skipped: a backup of this job is already running"
-                logger.warning(f"Backup skipped, already running: {job_id}")
-                return False, message
-            return _run_backup_inner(job_id)
-    finally:
-        # Release this thread's DB connection back to the pool
+    """Execute a backup job, unless a run of the same job is already in progress.
+
+    Never raises: any error is logged and reported (job status, history row,
+    notification), so a run can't fail without a trace.
+    """
+    # The run lock lives on its own dedicated connection; pooled connections are
+    # only borrowed per query, so a long run doesn't tie one up.
+    with _short_lived_db():
         try:
-            get_db().close()
-        except Exception:
-            pass
+            with job_run_lock(_lock_connection, job_id) as acquired:
+                if not acquired:
+                    # Another worker, the scheduler or a manual run got there first. Not a
+                    # failure: leave the job status and history to the run in progress.
+                    message = "Skipped: a backup of this job is already running"
+                    logger.warning(f"Backup skipped, already running: {job_id}")
+                    return False, message
+                return _run_backup_inner(job_id)
+        except Exception as e:
+            logger.exception(f"Backup run for job {job_id} failed with an unexpected error")
+            message = sanitize_error_message(f"Backup failed: {type(e).__name__}: {e}")
+            _report_backup_failure(job_id, message)
+            return False, message
+        finally:
+            # Release this thread's DB connection back to the pool
+            try:
+                get_db().close()
+            except Exception:
+                pass
+
+
+def _report_backup_failure(job_id, message, job_name=None):
+    """Best-effort: mark the job failed, add a history row and notify. Never raises.
+
+    Each step is tried on its own, so a database outage still gets a log line
+    and (with cached channels) a notification.
+    """
+    with _short_lived_db():
+        try:
+            if job_name is None:
+                try:
+                    job = get_job(job_id)
+                    job_name = job['name'] if job else job_id
+                except Exception as e:
+                    logger.error(f"Failure report for job {job_id}: can't load the job: {e}")
+                    job_name = job_id
+            logger.error(f"Backup failed: job {job_name} ({job_id}): {message}")
+            try:
+                update_job_status(job_id, 'failed')
+                update_job_progress(job_id, 0, message)
+            except Exception as e:
+                logger.error(f"Failure report for job {job_name}: can't update the job status: {e}")
+            try:
+                add_history(job_id, job_name, 'failed', message, 0)
+            except Exception as e:
+                logger.error(f"Failure report for job {job_name}: can't write history: {e}")
+            try:
+                send_notification(job_id, job_name, 'failed', message, 0)
+            except Exception as e:
+                logger.error(f"Failure report for job {job_name}: can't send notification: {e}")
+        except Exception as e:
+            logger.error(f"Failure report for job {job_id} failed: {e}")
+        finally:
+            try:
+                get_db().close()
+            except Exception:
+                pass
 
 
 def _run_backup_inner(job_id):
@@ -2595,12 +2726,90 @@ def api_change_password():
     return jsonify({'success': True, 'message': 'Password changed successfully'})
 
 
+def _as_utc(value):
+    """Datetime (naive = UTC) or ISO string -> aware UTC datetime; None if missing/unparseable"""
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def job_overdue_since(job, tz_name='UTC', now=None, grace=None):
+    """The fire time a scheduled job should have started a run by, if it hasn't.
+
+    Takes the latest fire time at least `grace` seconds in the past (so queued
+    and slow runs aren't flagged) and returns it if the job's last run started
+    before it. Returns None when the job is on time, unscheduled or running.
+    Fire times come from APScheduler's CronTrigger, as the scheduler uses.
+    """
+    from apscheduler.triggers.cron import CronTrigger
+
+    cron = (job.get('schedule_cron') or '').strip()
+    if not job.get('schedule_enabled') or job.get('status') == 'running' or len(cron.split()) != 5:
+        return None
+    grace = BACKUP_OVERDUE_GRACE if grace is None else grace
+    cutoff = (now or utc_now()) - timedelta(seconds=grace)
+    minute, hour, day, month, day_of_week = cron.split()
+    try:
+        trigger = CronTrigger(minute=minute, hour=hour, day=day, month=month,
+                              day_of_week=day_of_week, timezone=tz_name)
+    except Exception:
+        return None
+
+    # Latest fire time <= cutoff: walk forward from a window before the cutoff,
+    # widening it for crons that fire rarely (monthly, yearly).
+    due = None
+    for lookback_days in (2, 40, 400):
+        fire = trigger.get_next_fire_time(None, cutoff - timedelta(days=lookback_days))
+        while fire is not None and fire <= cutoff:
+            due = fire
+            fire = trigger.get_next_fire_time(None, fire + timedelta(seconds=1))
+        if due is not None:
+            break
+    if due is None:
+        return None
+    due = due.astimezone(timezone.utc)
+
+    created = _as_utc(job.get('created_at'))
+    if created and created > due:
+        return None  # Job didn't exist yet at that fire time
+    last_run = _as_utc(job.get('last_run'))
+    if last_run and last_run >= due:
+        return None
+    return due
+
+
+def _annotate_overdue(jobs):
+    """Add overdue / overdue_since to each job dict (in place)"""
+    try:
+        tz_name = get_scheduler_timezone()
+    except Exception:
+        tz_name = os.environ.get('TZ', 'UTC')
+    for job in jobs.values():
+        try:
+            since = job_overdue_since(job, tz_name)
+        except Exception as e:
+            logger.debug(f"Overdue check failed for job {job.get('name')}: {e}")
+            since = None
+        job['overdue'] = since is not None
+        job['overdue_since'] = since.isoformat() if since else None
+    return jobs
+
+
 # API Routes
 @app.route('/api/jobs')
 @login_required
 @limiter.exempt
 def api_jobs():
-    jobs = load_jobs()
+    jobs = _annotate_overdue(load_jobs())
     return jsonify(jobs)
 
 
@@ -3624,7 +3833,7 @@ def api_dashboard_stats():
     """Get dashboard statistics"""
     from datetime import datetime, timedelta
 
-    jobs = load_jobs()
+    jobs = _annotate_overdue(load_jobs())
     history = load_history()
 
     # Basic job stats
@@ -3634,6 +3843,7 @@ def api_dashboard_stats():
     failed_jobs = sum(1 for j in jobs_list if j.get('status') == 'failed')
     running_jobs = sum(1 for j in jobs_list if j.get('status') == 'running')
     scheduled_jobs = sum(1 for j in jobs_list if j.get('schedule_enabled'))
+    overdue = sorted((j for j in jobs_list if j.get('overdue')), key=lambda j: j['overdue_since'])
 
     # Parse entry timestamp — handles both datetime objects (PostgreSQL) and strings
     def parse_entry_time(entry):
@@ -3742,6 +3952,8 @@ def api_dashboard_stats():
         'failed_jobs': failed_jobs,
         'running_jobs': running_jobs,
         'scheduled_jobs': scheduled_jobs,
+        'overdue_jobs': len(overdue),
+        'overdue_job_names': [j.get('name') for j in overdue],
         'success_rate': success_rate,
         'success_rate_period': '7 days',
         'last_24h': {
@@ -5401,6 +5613,12 @@ def init_app():
 
     except Exception as e:
         logger.warning(f"Failed to reset stuck jobs: {e}")
+    finally:
+        # Don't keep a pooled connection checked out by the worker's main thread
+        try:
+            get_db().close()
+        except Exception:
+            pass
 
     # Compete for the scheduler lock; only the winning worker runs scheduled jobs
     init_scheduler_leader()

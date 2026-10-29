@@ -45,6 +45,7 @@ import {
   TrendingDown,
   Database,
   FolderPlus,
+  AlertTriangle,
 } from "lucide-react";
 import {
   Tooltip,
@@ -395,7 +396,22 @@ export default function Jobs() {
                           </div>
                         ) : (
                           <>
-                            {getStatusBadge(job.status)}
+                            <div className="flex items-center gap-1">
+                              {getStatusBadge(job.status)}
+                              {job.overdue && (
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Badge variant="outline" className="gap-1 border-amber-500/50 text-amber-500">
+                                      <AlertTriangle className="h-3 w-3" />
+                                      Overdue
+                                    </Badge>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    No run since the scheduled time {formatTime(job.overdue_since ?? undefined)}
+                                  </TooltipContent>
+                                </Tooltip>
+                              )}
+                            </div>
                             <p className="text-xs text-muted-foreground mt-1">
                               {formatTime(job.last_run)}
                             </p>

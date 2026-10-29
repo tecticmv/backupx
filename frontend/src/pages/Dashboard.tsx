@@ -9,6 +9,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Progress } from "@/components/ui/progress";
 import { ContributionGraph } from "@/components/ContributionGraph";
 import { toast } from "sonner";
@@ -32,6 +33,7 @@ import {
   RefreshCw,
   Database,
   Server,
+  AlertTriangle,
 } from "lucide-react";
 
 interface ContributionDay {
@@ -47,6 +49,8 @@ interface DashboardStats {
   failed_jobs: number;
   running_jobs: number;
   scheduled_jobs: number;
+  overdue_jobs?: number;
+  overdue_job_names?: string[];
   success_rate: number;
   success_rate_period: string;
   last_24h: {
@@ -224,6 +228,17 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
+      {!!stats?.overdue_jobs && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>
+            {stats.overdue_jobs} scheduled {stats.overdue_jobs === 1 ? "job hasn't" : "jobs haven't"} run on schedule
+          </AlertTitle>
+          <AlertDescription>
+            {(stats.overdue_job_names ?? []).join(", ")}
+          </AlertDescription>
+        </Alert>
+      )}
       {/* Hero Stats Section */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Card className="bg-gradient-to-br from-emerald-500/10 to-emerald-500/5 border-emerald-500/20">

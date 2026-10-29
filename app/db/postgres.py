@@ -4,6 +4,8 @@ PostgreSQL database backend implementation with connection pooling.
 
 import logging
 import re
+import threading
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import DatabaseBackend
@@ -21,6 +23,35 @@ except ImportError:
     logger.warning("psycopg2 not installed. PostgreSQL support unavailable.")
 
 
+if PSYCOPG2_AVAILABLE:
+    class BlockingThreadedConnectionPool(pool.ThreadedConnectionPool):
+        """ThreadedConnectionPool that waits for a free connection instead of failing.
+
+        psycopg2's pool raises PoolError the moment all maxconn connections are
+        checked out. Here a caller waits up to `timeout` seconds for one to be
+        returned, and only then gets PoolError.
+        """
+
+        def __init__(self, minconn, maxconn, *args, timeout: float = 30, **kwargs):
+            self._slots = threading.BoundedSemaphore(maxconn)
+            self._timeout = timeout
+            super().__init__(minconn, maxconn, *args, **kwargs)
+
+        def getconn(self, key=None):
+            if not self._slots.acquire(timeout=self._timeout):
+                raise pool.PoolError(
+                    f"connection pool exhausted: no connection free after {self._timeout:g}s")
+            try:
+                return super().getconn(key)
+            except Exception:
+                self._slots.release()
+                raise
+
+        def putconn(self, conn=None, key=None, close=False):
+            super().putconn(conn, key, close)
+            self._slots.release()
+
+
 class PostgresBackend(DatabaseBackend):
     """PostgreSQL database backend with connection pooling."""
 
@@ -33,7 +64,8 @@ class PostgresBackend(DatabaseBackend):
         password: str = '',
         pool_min: int = 2,
         pool_max: int = 30,
-        ssl_mode: str = 'prefer'
+        ssl_mode: str = 'prefer',
+        pool_timeout: float = 30
     ):
         """
         Initialize PostgreSQL backend with connection pool.
@@ -47,6 +79,7 @@ class PostgresBackend(DatabaseBackend):
             pool_min: Minimum pool connections
             pool_max: Maximum pool connections
             ssl_mode: SSL mode (disable, prefer, require)
+            pool_timeout: Seconds to wait for a free pooled connection before PoolError
         """
         if not PSYCOPG2_AVAILABLE:
             raise ImportError("psycopg2 is required for PostgreSQL support. Install with: pip install psycopg2-binary")
@@ -59,9 +92,10 @@ class PostgresBackend(DatabaseBackend):
         self.ssl_mode = ssl_mode
 
         # Create connection pool
-        self._pool = pool.ThreadedConnectionPool(
+        self._pool = BlockingThreadedConnectionPool(
             minconn=pool_min,
             maxconn=pool_max,
+            timeout=pool_timeout,
             host=host,
             port=port,
             database=database,
@@ -72,26 +106,77 @@ class PostgresBackend(DatabaseBackend):
         )
 
         # Thread-local storage for connections
-        import threading
         self._local = threading.local()
 
         logger.info(f"PostgreSQL backend initialized: {user}@{host}:{port}/{database} (pool: {pool_min}-{pool_max})")
 
     def _get_thread_connection(self):
         """Get or create connection for current thread from pool."""
-        if not hasattr(self._local, 'connection') or self._local.connection is None or self._local.connection.closed:
+        conn = getattr(self._local, 'connection', None)
+        if conn is not None and conn.closed:
+            # Dropped (e.g. Postgres restarted): give its slot back before taking another
+            self._local.connection = None
+            try:
+                self._pool.putconn(conn, close=True)
+            except Exception:
+                pass
+            conn = None
+        if conn is None:
             self._local.connection = self._pool.getconn()
         return self._local.connection
 
     def _release_thread_connection(self):
         """Release connection back to pool for current thread."""
-        if hasattr(self._local, 'connection') and self._local.connection is not None:
-            self._pool.putconn(self._local.connection)
+        conn = getattr(self._local, 'connection', None)
+        if conn is not None:
             self._local.connection = None
+            self._pool.putconn(conn)
 
     def get_connection(self):
         """Get a database connection from the pool."""
         return self._get_thread_connection()
+
+    @contextmanager
+    def short_lived_connections(self):
+        """Within this block, give the thread's connection back to the pool after each operation.
+
+        Normally a thread keeps its pooled connection until close() (end of the
+        request). Long-running work such as a backup run would then hold a
+        connection for hours, so concurrent runs exhaust the pool. In this mode
+        the connection goes back as soon as nothing is pending on it: after
+        commit/rollback, and after a read that started its own transaction.
+        """
+        previous = getattr(self._local, 'short_lived', False)
+        self._local.short_lived = True
+        try:
+            yield
+        finally:
+            self._local.short_lived = previous
+            if not previous:
+                self._release_thread_connection()
+
+    def _idle_before(self, conn) -> bool:
+        return conn.info.transaction_status == psycopg2.extensions.TRANSACTION_STATUS_IDLE
+
+    def _maybe_release(self, read_only_txn: bool = False):
+        """Release the thread's connection in short-lived mode if nothing is pending on it.
+
+        read_only_txn: the transaction was opened by the read just done, so
+        rolling it back loses nothing.
+        """
+        if not getattr(self._local, 'short_lived', False):
+            return
+        conn = getattr(self._local, 'connection', None)
+        if conn is None:
+            return
+        if conn.closed:
+            self._local.connection = None
+            self._pool.putconn(conn, close=True)
+            return
+        if self._idle_before(conn) or read_only_txn:
+            if not self._idle_before(conn):
+                conn.rollback()
+            self._release_thread_connection()
 
     def open_dedicated_connection(self):
         """Open an autocommit connection outside the pool, for session-scoped advisory locks.
@@ -146,6 +231,7 @@ class PostgresBackend(DatabaseBackend):
             return cursor
         except Exception:
             conn.rollback()
+            self._maybe_release()
             raise
 
     def executemany(self, query: str, params_list: List[Tuple]):
@@ -174,6 +260,7 @@ class PostgresBackend(DatabaseBackend):
     def fetchone(self, query: str, params: Optional[Tuple] = None) -> Optional[Dict[str, Any]]:
         """Execute a query and fetch one result as a dictionary."""
         conn = self.get_connection()
+        fresh_txn = self._idle_before(conn)
         cursor = conn.cursor()
         converted_query = self.convert_query(query)
         try:
@@ -182,14 +269,18 @@ class PostgresBackend(DatabaseBackend):
             else:
                 cursor.execute(converted_query)
             row = cursor.fetchone()
-            return dict(row) if row else None
+            result = dict(row) if row else None
         except Exception:
             conn.rollback()
+            self._maybe_release()
             raise
+        self._maybe_release(read_only_txn=fresh_txn)
+        return result
 
     def fetchall(self, query: str, params: Optional[Tuple] = None) -> List[Dict[str, Any]]:
         """Execute a query and fetch all results as dictionaries."""
         conn = self.get_connection()
+        fresh_txn = self._idle_before(conn)
         cursor = conn.cursor()
         converted_query = self.convert_query(query)
         try:
@@ -198,20 +289,25 @@ class PostgresBackend(DatabaseBackend):
             else:
                 cursor.execute(converted_query)
             rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+            result = [dict(row) for row in rows]
         except Exception:
             conn.rollback()
+            self._maybe_release()
             raise
+        self._maybe_release(read_only_txn=fresh_txn)
+        return result
 
     def commit(self) -> None:
         """Commit the current transaction."""
         conn = self.get_connection()
         conn.commit()
+        self._maybe_release()
 
     def rollback(self) -> None:
         """Rollback the current transaction."""
         conn = self.get_connection()
         conn.rollback()
+        self._maybe_release()
 
     def get_table_columns(self, table_name: str) -> List[str]:
         """Get list of column names for a table using information_schema."""
