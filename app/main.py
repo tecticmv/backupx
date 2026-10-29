@@ -14,6 +14,7 @@ import smtplib
 import ssl
 import shlex
 import re
+import html
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from urllib.request import Request, urlopen
@@ -1358,7 +1359,8 @@ def send_email_notification(channel, job_name, status, message, duration):
 
     # Create email
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"[BackupX] {job_name} - {status.upper()}"
+    # No CR/LF in headers: a job name must not be able to add headers (e.g. Bcc)
+    msg['Subject'] = _one_line(f"[BackupX] {job_name} - {status.upper()}")
     msg['From'] = from_address
     msg['To'] = ', '.join(to_addresses)
 
@@ -1392,6 +1394,20 @@ Time: {utc_now().strftime('%Y-%m-%d %H:%M:%S')} UTC
         raise
 
 
+def _one_line(text):
+    return re.sub(r'[\r\n]+', ' ', str(text))
+
+
+def _slack_escape(text):
+    """Escape the three characters Slack treats as markup (<!channel>, <url|label>, ...)"""
+    return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def _code_block_safe(text):
+    """Keep text from closing the ``` code block it is shown in"""
+    return str(text).replace('```', '`​`​`')
+
+
 def send_slack_notification(channel, job_name, status, message, duration):
     """Send notification to Slack via webhook"""
     config = channel['config']
@@ -1412,14 +1428,14 @@ def send_slack_notification(channel, job_name, status, message, duration):
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"{emoji} *Backup Job: {job_name}*\n*Status:* {status.upper()}\n*Duration:* {format_duration(duration)}"
+                        "text": f"{emoji} *Backup Job: {_slack_escape(job_name)}*\n*Status:* {status.upper()}\n*Duration:* {format_duration(duration)}"
                     }
                 },
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"```{message[:500]}```" if message else "_No additional details_"
+                        "text": f"```{_code_block_safe(_slack_escape(message[:500]))}```" if message else "_No additional details_"
                     }
                 }
             ]
@@ -1454,15 +1470,17 @@ def send_discord_notification(channel, job_name, status, message, duration):
 
     payload = {
         "embeds": [{
-            "title": f"{emoji} Backup Job: {job_name}",
+            "title": f"{emoji} Backup Job: {job_name}"[:256],
             "color": color,
             "fields": [
                 {"name": "Status", "value": status.upper(), "inline": True},
                 {"name": "Duration", "value": format_duration(duration), "inline": True}
             ],
-            "description": f"```{message[:1000]}```" if message else "_No additional details_",
+            "description": f"```{_code_block_safe(message[:1000])}```" if message else "_No additional details_",
             "timestamp": utc_isoformat()
-        }]
+        }],
+        # Never ping anyone because of text inside a message
+        "allowed_mentions": {"parse": []}
     }
 
     data = json.dumps(payload).encode('utf-8')
@@ -1479,8 +1497,73 @@ def send_discord_notification(channel, job_name, status, message, duration):
         raise
 
 
+TELEGRAM_MAX_LENGTH = 4096
+
+
+def _telegram_length(text):
+    """Length as Telegram counts it (UTF-16 code units)."""
+    return len(text.encode('utf-16-le')) // 2
+
+
+def _truncate_for_telegram(text, limit, escape=False, suffix='…'):
+    """Cut text so it fits in `limit` Telegram characters, adding `suffix` if cut.
+
+    With escape=True each character is HTML-escaped as it is added, so the cut
+    never lands inside an entity such as &lt;.
+    """
+    rendered = html.escape(text, quote=False) if escape else text
+    if _telegram_length(rendered) <= limit:
+        return rendered
+    budget = limit - _telegram_length(suffix)
+    out, used = [], 0
+    for ch in text:
+        piece = html.escape(ch, quote=False) if escape else ch
+        size = _telegram_length(piece)
+        if used + size > budget:
+            break
+        out.append(piece)
+        used += size
+    return ''.join(out) + suffix
+
+
+def _telegram_texts(job_name, status, message, duration):
+    """(html_text, plain_text) for a Telegram notification, each within the size limit.
+
+    Every interpolated value is HTML-escaped; only our own <b> tag is markup.
+    A failure message can hold anything (e.g. "<data/38b4ddc444>"), and one
+    stray "<" makes Telegram reject the whole message with HTTP 400.
+    """
+    emoji = get_status_emoji(status)
+    head_plain = f"{emoji} {job_name} — {status.upper()}\nDuration: {format_duration(duration)}\n"
+    head_html = (f"{emoji} <b>{html.escape(str(job_name), quote=False)}</b> — "
+                 f"{html.escape(status.upper(), quote=False)}\n"
+                 f"Duration: {html.escape(format_duration(duration), quote=False)}\n")
+    message = message or ''
+    # A job name long enough to leave no room is cut too, keeping the <b> tag closed
+    if _telegram_length(head_html) > TELEGRAM_MAX_LENGTH // 2:
+        name = _truncate_for_telegram(str(job_name), 200, escape=True)
+        head_html = (f"{emoji} <b>{name}</b> — {html.escape(status.upper(), quote=False)}\n"
+                     f"Duration: {html.escape(format_duration(duration), quote=False)}\n")
+    html_text = head_html + _truncate_for_telegram(
+        message, TELEGRAM_MAX_LENGTH - _telegram_length(head_html), escape=True)
+    plain_text = _truncate_for_telegram(head_plain + message, TELEGRAM_MAX_LENGTH)
+    return html_text.rstrip('\n'), plain_text.rstrip('\n')
+
+
+def _telegram_send(api_url, payload):
+    req = Request(api_url, data=json.dumps(payload).encode('utf-8'),
+                  headers={'Content-Type': 'application/json'})
+    with urlopen(req, timeout=30) as response:
+        return json.loads(response.read().decode('utf-8'))
+
+
 def send_telegram_notification(channel, job_name, status, message, duration):
-    """Send notification to Telegram via Bot API"""
+    """Send notification to Telegram via Bot API.
+
+    Sent as HTML with every value escaped. If Telegram still rejects it with
+    HTTP 400 (e.g. it can't parse the entities), it is sent once more as plain
+    text with no parse_mode, so the alert is never lost.
+    """
     config = channel['config']
     bot_token = config.get('bot_token', '')
     chat_id = config.get('chat_id', '')
@@ -1489,31 +1572,32 @@ def send_telegram_notification(channel, job_name, status, message, duration):
         logger.warning("Telegram bot_token or chat_id not configured")
         return
 
-    emoji = get_status_emoji(status)
-
-    # Format message for Telegram (using HTML parse mode)
-    text = f"""{emoji} <b>{job_name}</b> — {status.upper()}
-Duration: {format_duration(duration)}
-{message[:3000] if message else ''}"""
-
+    html_text, plain_text = _telegram_texts(job_name, status, message, duration)
     api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
-        "text": text,
+        "text": html_text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
 
-    data = json.dumps(payload).encode('utf-8')
-    req = Request(api_url, data=data, headers={'Content-Type': 'application/json'})
-
     try:
-        with urlopen(req, timeout=30) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            if result.get('ok'):
-                logger.info(f"Telegram notification sent for job {job_name}")
-            else:
-                logger.warning(f"Telegram API error: {result.get('description', 'Unknown error')}")
+        try:
+            result = _telegram_send(api_url, payload)
+        except HTTPError as e:
+            if e.code != 400:
+                raise
+            body = e.read().decode('utf-8', errors='replace')
+            logger.warning(f"Telegram rejected the HTML message ({body}); resending as plain text")
+            result = _telegram_send(api_url, {
+                "chat_id": chat_id,
+                "text": plain_text,
+                "disable_web_page_preview": True
+            })
+        if result.get('ok'):
+            logger.info(f"Telegram notification sent for job {job_name}")
+        else:
+            logger.warning(f"Telegram API error: {result.get('description', 'Unknown error')}")
     except HTTPError as e:
         body = e.read().decode('utf-8', errors='replace')
         logger.error(f"Failed to send Telegram notification: {e} — {body}")
@@ -1753,8 +1837,97 @@ def _get_ssh_key_path(server):
     return server.get('ssh_key') or '/home/backupx/.ssh/id_rsa'
 
 
+class SshCommand(list):
+    """An ssh argv prefix plus the environment it needs.
+
+    The SSH password (password auth) travels to sshpass in the SSHPASS
+    environment variable (`sshpass -e`), never in argv, where every local user
+    could read it from `ps` / /proc/PID/cmdline.
+    """
+
+    def __init__(self, args, password=None):
+        super().__init__(args)
+        self.password = password
+
+    def env(self):
+        env = os.environ.copy()
+        if self.password is not None:
+            env['SSHPASS'] = self.password
+        return env
+
+
+# What ssh asks the remote login shell to run. The real script follows on
+# stdin, so nothing secret ends up in the argv of ssh here or of the shell on
+# the target host.
+REMOTE_SHELL = 'if command -v bash >/dev/null 2>&1; then exec bash -s; else exec sh -s; fi'
+
+
+def _remote_script(script):
+    """Wrap a script for delivery over stdin.
+
+    The shell parses a { ...; } group completely before running it, and the
+    group's stdin is /dev/null, so no command inside it can swallow the rest
+    of the script from stdin (and nothing waits on a terminal).
+    """
+    return '{\n' + script.rstrip('\n') + '\n} </dev/null\n'
+
+
+def _mysql_option_file(path_expr, password):
+    """Shell that writes a 0600 MySQL option file holding the password.
+
+    Used with --defaults-extra-file so the password never appears in the argv
+    of mysql/mysqldump (MySQL clients only blank -p<password> after start-up,
+    and a ps in that window sees it). printf is a shell builtin, so writing the
+    file doesn't put the password in any argv either. path_expr is a shell
+    word such as "$MYCNF"; the caller removes the file.
+    """
+    value = (password or '').replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+    line = 'password="' + value + '"'
+    return f"( umask 077; printf '%s\\n' '[client]' {shlex.quote(line)} > {path_expr} )"
+
+
+def _ssh_run(ssh_cmd, script, timeout):
+    """Run a script on the remote host, sent over stdin. Returns CompletedProcess."""
+    return subprocess.run(
+        list(ssh_cmd) + [REMOTE_SHELL],
+        input=_remote_script(script),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=ssh_cmd.env() if isinstance(ssh_cmd, SshCommand) else None,
+    )
+
+
+def _ssh_popen(ssh_cmd, script):
+    """Start a script on the remote host, sent over stdin; stdout/stderr are pipes."""
+    proc = subprocess.Popen(
+        list(ssh_cmd) + [REMOTE_SHELL],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=ssh_cmd.env() if isinstance(ssh_cmd, SshCommand) else None,
+    )
+    payload = _remote_script(script)
+
+    def feed():
+        # A thread, so a large script can't deadlock against unread output
+        try:
+            proc.stdin.write(payload)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+    threading.Thread(target=feed, daemon=True).start()
+    return proc
+
+
 def _build_ssh_cmd(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_rsa', timeout=30, ssh_auth_type='key_path', ssh_password=None):
-    """Build a standard SSH command prefix"""
+    """Build a standard SSH command prefix (an SshCommand)"""
     base_opts = [
         '-p', str(ssh_port),
         '-o', 'StrictHostKeyChecking=accept-new',
@@ -1766,23 +1939,23 @@ def _build_ssh_cmd(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_r
     if ssh_auth_type == 'password':
         if not ssh_password:
             raise ValueError("Password authentication selected but no password provided")
-        # Use sshpass for password authentication
-        return [
-            'sshpass', '-p', ssh_password,
+        # sshpass -e reads the password from $SSHPASS (see SshCommand.env)
+        return SshCommand([
+            'sshpass', '-e',
             'ssh',
             *base_opts,
             '-o', 'PubkeyAuthentication=no',
             '-o', 'PreferredAuthentications=password',
             f'{ssh_user}@{host}'
-        ]
+        ], password=ssh_password)
     else:
         # Key-based authentication (key_path or key_content)
-        return [
+        return SshCommand([
             'ssh', '-i', ssh_key,
             *base_opts,
             '-o', 'BatchMode=yes',
             f'{ssh_user}@{host}'
-        ]
+        ])
 
 
 def _build_ssh_cmd_for_server(server, timeout=30):
@@ -1978,12 +2151,7 @@ def ensure_db_client_installed(server, client_type):
     script = DB_CLIENT_INSTALL_SCRIPT % client_type
 
     try:
-        result = subprocess.run(
-            ssh_cmd + [script],
-            capture_output=True,
-            text=True,
-            timeout=180
-        )
+        result = _ssh_run(ssh_cmd, script, timeout=180)
 
         output = result.stdout.strip()
 
@@ -2018,12 +2186,7 @@ def ensure_restic_installed(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/
     ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key, ssh_auth_type=ssh_auth_type, ssh_password=ssh_password)
 
     try:
-        result = subprocess.run(
-            ssh_cmd + [RESTIC_INSTALL_SCRIPT],
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
+        result = _ssh_run(ssh_cmd, RESTIC_INSTALL_SCRIPT, timeout=120)
 
         output = result.stdout.strip()
 
@@ -2280,12 +2443,7 @@ exit $BACKUPX_FAILED
         update_job_progress(job_id, 20, 'Connecting to remote server...')
         update_job_progress(job_id, 30, 'Starting backup on remote server...')
         backup_timeout = job.get('timeout', 28800)  # 8 hour default timeout
-        proc = subprocess.Popen(
-            ssh_cmd + [remote_cmd],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        proc = _ssh_popen(ssh_cmd, remote_cmd)
 
         returncode, stderr_text, preamble, results = _stream_restic_progress(
             proc, job_id, backup_timeout, [t['name'] for t in targets])
@@ -2462,7 +2620,13 @@ fi
             backup_tag = 'postgres-backup'
             dump_error_msg = 'pg_dump failed'
         else:
-            dump_cmd = f'mysqldump -h {db_host} -P {db_port} -u {db_user} -p{db_pass} {db_flag} --single-transaction --routines --triggers'
+            # Password via a 0600 option file inside the 0700 $BACKUP_DIR, removed as soon as the dump ends
+            dump_cmd = f'''
+MYCNF="$BACKUP_DIR/.backupx-my.cnf"
+trap 'rm -f "$MYCNF"' EXIT
+{_mysql_option_file('"$MYCNF"', db_config['password'])} || exit 1
+mysqldump --defaults-extra-file="$MYCNF" -h {db_host} -P {db_port} -u {db_user} {db_flag} --single-transaction --routines --triggers
+'''
             backup_tag = 'mysql-backup'
             dump_error_msg = 'mysqldump failed'
 
@@ -2510,12 +2674,7 @@ exit $BACKUPX_FAILED
         update_job_progress(job_id, 20, 'Connecting to remote server...')
         update_job_progress(job_id, 30, 'Dumping database...')
         backup_timeout = job.get('timeout', 28800)  # 8 hour default timeout
-        proc = subprocess.Popen(
-            ssh_cmd + [remote_cmd],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        proc = _ssh_popen(ssh_cmd, remote_cmd)
 
         returncode, stderr_text, preamble, results = _stream_restic_progress(
             proc, job_id, backup_timeout, [t['name'] for t in targets])
@@ -3517,12 +3676,7 @@ mkdir -p {safe_target}
 
         ssh_cmd = _build_ssh_cmd_for_server(server, timeout=30)
 
-        result = subprocess.run(
-            ssh_cmd + [full_cmd],
-            capture_output=True,
-            text=True,
-            timeout=1800
-        )
+        result = _ssh_run(ssh_cmd, full_cmd, timeout=1800)
 
         if result.returncode != 0:
             return jsonify({'error': result.stderr or 'Restore failed'}), 400
@@ -3613,6 +3767,7 @@ def api_snapshot_restore_db(job_id, snapshot_id):
         use_docker = bool(container.strip())
         safe_container = shlex.quote(container) if use_docker else ''
 
+        mysql_option_file = ''
         if use_docker:
             # For docker-exec: leave import_cmd empty; detection + execution happens in the remote script body
             import_cmd = None
@@ -3622,10 +3777,10 @@ def api_snapshot_restore_db(job_id, snapshot_id):
             else:
                 import_cmd = f'PGPASSWORD={safe_db_pass} psql -h {safe_db_host} -p {db_port} -U {safe_db_user} -d postgres'
         else:
-            if target_database:
-                import_cmd = f'mysql -h {safe_db_host} -P {db_port} -u {safe_db_user} -p{safe_db_pass} {shlex.quote(target_database)}'
-            else:
-                import_cmd = f'mysql -h {safe_db_host} -P {db_port} -u {safe_db_user} -p{safe_db_pass}'
+            # Password via a 0600 option file inside $RESTORE_DIR (removed by the script's EXIT trap)
+            db_arg = f' {shlex.quote(target_database)}' if target_database else ''
+            import_cmd = f'mysql --defaults-extra-file="$RESTORE_DIR/.backupx-my.cnf" -h {safe_db_host} -P {db_port} -u {safe_db_user}{db_arg}'
+            mysql_option_file = _mysql_option_file('"$RESTORE_DIR/.backupx-my.cnf"', target_db['password'])
 
         if use_docker:
             target_db_name_arg = shlex.quote(target_database) if target_database else '""'
@@ -3656,6 +3811,7 @@ IMPORT_EXIT=$?
         else:
             import_block = f"""
 echo "Importing into database..."
+{mysql_option_file}
 zcat "$DUMP_FILE" | {import_cmd}
 IMPORT_EXIT=$?
 """
@@ -3698,12 +3854,7 @@ echo "Database restore completed successfully"
 
         ssh_cmd = _build_ssh_cmd_for_server(server, timeout=30)
 
-        result = subprocess.run(
-            ssh_cmd + [remote_cmd],
-            capture_output=True,
-            text=True,
-            timeout=3600  # 1 hour for DB restore
-        )
+        result = _ssh_run(ssh_cmd, remote_cmd, timeout=3600)  # 1 hour for DB restore
 
         if result.returncode != 0:
             error = sanitize_error_message(result.stderr or result.stdout or 'Database restore failed')
@@ -4578,12 +4729,7 @@ def api_test_server_connection():
         ssh_cmd = _build_ssh_cmd(host, ssh_user, ssh_port, ssh_key, timeout=10,
                                   ssh_auth_type=ssh_auth_type, ssh_password=ssh_password)
 
-        result = subprocess.run(
-            ssh_cmd + ['export PATH="$HOME/.local/bin:$PATH"; echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")'],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        result = _ssh_run(ssh_cmd, 'export PATH="$HOME/.local/bin:$PATH"; echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")', timeout=30)
 
         if result.returncode == 0:
             output = result.stdout.strip()
@@ -4659,12 +4805,7 @@ def api_test_server_connection_by_id(server_id):
     try:
         ssh_cmd = _build_ssh_cmd_for_server(server, timeout=10)
 
-        result = subprocess.run(
-            ssh_cmd + ['export PATH="$HOME/.local/bin:$PATH"; echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")'],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        result = _ssh_run(ssh_cmd, 'export PATH="$HOME/.local/bin:$PATH"; echo "Connection successful" && (restic version 2>/dev/null || echo "RESTIC_NOT_FOUND")', timeout=30)
 
         if result.returncode == 0:
             output = result.stdout.strip()
@@ -4806,12 +4947,7 @@ for container in $($DOCKER_CMD ps --format '{{.Names}}'); do
 done
 '''
 
-        result = subprocess.run(
-            ssh_cmd + [remote_cmd],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
+        result = _ssh_run(ssh_cmd, remote_cmd, timeout=60)
 
         output = (result.stdout or '').strip()
         stderr = (result.stderr or '').strip()
@@ -4874,12 +5010,7 @@ def api_browse_server_directories(server_id):
         # List both directories and files, tagged with 'd' or 'f'
         remote_cmd = f"find {safe_path} -maxdepth 1 -mindepth 1 -printf '%y\\t%p\\n' 2>/dev/null | sort -t$'\\t' -k1,1 -k2,2 | head -1000"
 
-        result = subprocess.run(
-            ssh_cmd + [remote_cmd],
-            capture_output=True,
-            text=True,
-            timeout=15
-        )
+        result = _ssh_run(ssh_cmd, remote_cmd, timeout=15)
 
         if result.returncode != 0 and not result.stdout:
             return jsonify({'error': 'Failed to list directories'}), 500
@@ -5088,16 +5219,14 @@ def api_test_db_connection():
         elif is_postgres:
             test_cmd = f"PGPASSWORD={escaped_pass} psql -h {escaped_host} -p {db_port} -U {escaped_user} -d postgres -c 'SELECT 1' 2>&1"
         else:
-            test_cmd = f"mysql -h {escaped_host} -P {db_port} -u {escaped_user} -p{escaped_pass} -e 'SELECT 1' 2>&1"
+            # Password via a 0600 option file, removed on exit
+            option_file = _mysql_option_file('"$MYCNF"', db_pass)
+            test_cmd = f"""MYCNF=$(mktemp) || exit 1
+trap 'rm -f "$MYCNF"' EXIT
+{option_file} || exit 1
+mysql --defaults-extra-file="$MYCNF" -h {escaped_host} -P {db_port} -u {escaped_user} -e 'SELECT 1' 2>&1"""
 
-        ssh_cmd.append(test_cmd)
-
-        result = subprocess.run(
-            ssh_cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        result = _ssh_run(ssh_cmd, test_cmd, timeout=30)
 
         if result.returncode == 0:
             return jsonify({'success': True, 'message': 'Database connection successful'})
