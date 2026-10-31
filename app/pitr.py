@@ -369,8 +369,14 @@ def _append_host_checks(checks, facts, mode, client_image, server_version=''):
                              (f', or set the client image to {suggestion}' if suggestion else '') + '.'))
     elif server_version:
         server_flav = server_flavor(server_version)
-        client_flav = 'mariadb' if 'mariadb' in client_version.lower() else 'mysql'
-        sv, cv = _version_tuple(server_version), _version_tuple(_client_server_version(client_version))
+        dump_version = facts.get('dump_client_version', '')
+        client_flav = _client_flavor(f'{client} {client_version}', dump_version)
+        # Older MariaDB binlog clients don't print the server release; the
+        # mysqldump from the same install (host or client image) does.
+        client_release = _client_server_version(client_version)
+        if client_release is None and _client_flavor(dump_version) == client_flav:
+            client_release = _client_server_version(dump_version)
+        sv, cv = _version_tuple(server_version), _version_tuple(client_release)
         suggestion = suggested_client_image(server_version)
         if server_flav != client_flav:
             checks.append(_check('mysqlbinlog matches the server', 'fail', f'{client} ({client_version.strip()})',
@@ -406,7 +412,7 @@ def _dump_client_check(facts, server_version):
         return _check(name, 'fail', 'not found', 'mysqldump / mariadb-dump',
                       f'Install the matching client or set the client image to {suggestion}.')
     server_flav = server_flavor(server_version)
-    client_flav = 'mariadb' if 'mariadb' in version_text.lower() else 'mysql'
+    client_flav = _client_flavor(f'{client} {version_text}')
     sv = _version_tuple(server_version)
     cv = _version_tuple(_client_server_version(version_text))
     current = version_text.strip() or client
@@ -423,11 +429,39 @@ def _dump_client_check(facts, server_version):
 
 
 def _client_server_version(text):
-    """'mysqlbinlog  Ver 8.4.8 for Linux' / 'mariadb-binlog Ver 3.5 Distrib 11.4.2-MariaDB' -> server version part."""
-    distrib = re.search(r'Distrib\s+([\d.]+)', text or '')
-    if distrib:
-        return distrib.group(1)
-    return text
+    """Server release a mysql/mariadb client was built from, or None if it doesn't say.
+
+    Client tools carry their own version next to the server's, and only the
+    server's is comparable with the database:
+      'mysqldump  Ver 10.19 Distrib 10.6.22-MariaDB, for debian-linux-gnu (x86_64)' -> 10.6.22
+      'mariadb-binlog from 11.4.13-MariaDB, client 3.5 for debian-linux-gnu (x86_64)' -> 11.4.13
+      'mysqlbinlog  Ver 8.4.13 for Linux on x86_64 (MySQL Community Server - GPL)' -> 8.4.13
+      'mariadb-binlog Ver 3.5 for debian-linux-gnu at x86_64' -> None (3.5 is the tool's version)
+    """
+    text = text or ''
+    for pattern in (r'\bDistrib\s+(\d+\.\d+(?:\.\d+)?)', r'\bfrom\s+(\d+\.\d+(?:\.\d+)?)'):
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    # MySQL 8.0+ prints the server release as the program version. Tool
+    # versions (mysqlbinlog 3.x, mysqldump 10.x) are never MySQL majors 5-9.
+    match = re.search(r'\bVer\s+(\d+)\.(\d+)(?:\.(\d+))?', text)
+    if match and 5 <= int(match.group(1)) <= 9:
+        return '.'.join(g for g in match.groups() if g is not None)
+    return None
+
+
+def _client_flavor(text, fallback_text=''):
+    """'mariadb' or 'mysql' for a client --version line (plus its path).
+
+    Older MariaDB mysqlbinlog ('mysqlbinlog Ver 3.5 for debian-linux-gnu at
+    x86_64') names neither; then the other client from the same install decides.
+    """
+    if 'mariadb' in (text or '').lower():
+        return 'mariadb'
+    if _client_server_version(text) is None and 'mariadb' in (fallback_text or '').lower():
+        return 'mariadb'
+    return 'mysql'
 
 
 def prereqs_ok(checks):

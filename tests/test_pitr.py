@@ -124,6 +124,83 @@ def test_prereqs_short_server_retention_warns():
     assert row['status'] == 'warn'
 
 
+# Real `--version` first lines (docker images mariadb:10.6/10.11/11.4, the Koha
+# host's Ubuntu 22.04 packages, mysql/percona 8.0 and 8.4).
+CLIENT_VERSION_LINES = [
+    # (binlog line, dump line, server release the client comes from)
+    ('mysqlbinlog Ver 3.5 for debian-linux-gnu at x86_64',
+     'mysqldump  Ver 10.19 Distrib 10.6.28-MariaDB, for debian-linux-gnu (x86_64)', '10.6.28'),
+    ('/usr/bin/mariadb-binlog Ver 3.5 for debian-linux-gnu at x86_64',
+     'mysqldump  Ver 10.19 Distrib 10.6.22-MariaDB, for debian-linux-gnu (x86_64)', '10.6.22'),
+    ('mariadb-binlog Ver 3.5 for debian-linux-gnu at x86_64',
+     'mariadb-dump  Ver 10.19 Distrib 10.11.19-MariaDB, for debian-linux-gnu (x86_64)', '10.11.19'),
+    ('mariadb-binlog from 11.4.13-MariaDB, client 3.5 for debian-linux-gnu (x86_64)',
+     'mariadb-dump from 11.4.13-MariaDB, client 10.19 for debian-linux-gnu (x86_64)', '11.4.13'),
+    ('mysqlbinlog  Ver 8.0.40 for Linux on x86_64 (MySQL Community Server - GPL)',
+     'mysqldump  Ver 8.0.40 for Linux on x86_64 (MySQL Community Server - GPL)', '8.0.40'),
+    ("mysqlbinlog  Ver 8.0.36-28 for Linux on x86_64 (Percona Server (GPL), Release '28', Revision '47601f19')",
+     "mysqldump  Ver 8.0.36-28 for Linux on x86_64 (Percona Server (GPL), Release '28', Revision '47601f19')",
+     '8.0.36'),
+    ('/usr/bin/mysqlbinlog  Ver 8.4.13 for Linux on x86_64 (MySQL Community Server - GPL)',
+     'mysqldump  Ver 8.4.13 for Linux on x86_64 (MySQL Community Server - GPL)', '8.4.13'),
+]
+
+
+@pytest.mark.parametrize('binlog_line,dump_line,release', CLIENT_VERSION_LINES)
+def test_client_server_version_reads_the_server_release(binlog_line, dump_line, release):
+    assert pitr._client_server_version(dump_line) == release
+    binlog_release = pitr._client_server_version(binlog_line)
+    if 'Ver 3.' in binlog_line:
+        assert binlog_release is None  # 3.5 is mysqlbinlog's own version, not the server's
+    else:
+        assert binlog_release == release
+
+
+@pytest.mark.parametrize('binlog_line,dump_line,release', CLIENT_VERSION_LINES)
+def test_matching_clients_get_no_binlog_warning(binlog_line, dump_line, release):
+    mariadb = 'MariaDB' in dump_line
+    server = f'{release}-MariaDB-0ubuntu0.22.04.1-log' if mariadb else release
+    binlog_client = binlog_line.split()[0].rsplit('/', 1)[-1]
+    facts = dict(GOOD_MYSQL, version=server, binlog_client=binlog_client, binlog_client_version=binlog_line,
+                 dump_client='mysqldump', dump_client_version=dump_line)
+    checks = by_name(pitr.evaluate_mysql_prereqs(facts))
+    row = checks['mysqlbinlog matches the server']
+    assert row['status'] == 'ok', row
+    assert checks['mysqldump can record the binlog position']['status'] == 'ok'
+
+
+def test_koha_mariadb_106_binlog_client_no_false_warning():
+    # The Koha DB host on 2026-10-31: warned "10.6 or newer" because it read mysqlbinlog's 3.5
+    facts = dict(GOOD_MYSQL, version='10.6.22-MariaDB-0ubuntu0.22.04.1-log', binlog_client='mariadb-binlog',
+                 binlog_client_version='/usr/bin/mariadb-binlog Ver 3.5 for debian-linux-gnu at x86_64',
+                 dump_client='mysqldump',
+                 dump_client_version='mysqldump  Ver 10.19 Distrib 10.6.22-MariaDB, for debian-linux-gnu (x86_64)')
+    assert by_name(pitr.evaluate_mysql_prereqs(facts))['mysqlbinlog matches the server']['status'] == 'ok'
+
+
+def test_older_mariadb_client_than_server_still_warns():
+    facts = dict(GOOD_MYSQL, version='11.4.13-MariaDB', binlog_client='mariadb-binlog',
+                 binlog_client_version='mariadb-binlog Ver 3.5 for debian-linux-gnu at x86_64',
+                 dump_client='mariadb-dump',
+                 dump_client_version='mariadb-dump  Ver 10.19 Distrib 10.6.28-MariaDB, for debian-linux-gnu (x86_64)')
+    row = by_name(pitr.evaluate_mysql_prereqs(facts))['mysqlbinlog matches the server']
+    assert row['status'] == 'warn' and 'mariadb:11.4' in row['fix']
+
+
+def test_older_mysql_client_than_server_still_warns():
+    facts = dict(GOOD_MYSQL, binlog_client_version='mysqlbinlog  Ver 8.0.40 for Linux on x86_64 (MySQL Community Server - GPL)')
+    row = by_name(pitr.evaluate_mysql_prereqs(facts))['mysqlbinlog matches the server']
+    assert row['status'] == 'warn' and 'percona/percona-server:8.4' in row['fix']
+
+
+def test_unversioned_mariadb_binlog_against_mysql_server_still_fails():
+    facts = dict(GOOD_MYSQL, binlog_client='mysqlbinlog',
+                 binlog_client_version='mysqlbinlog Ver 3.5 for debian-linux-gnu at x86_64',
+                 dump_client_version='mysqldump  Ver 10.19 Distrib 10.6.28-MariaDB, for debian-linux-gnu (x86_64)')
+    row = by_name(pitr.evaluate_mysql_prereqs(facts))['mysqlbinlog matches the server']
+    assert row['status'] == 'fail'
+
+
 def test_pg_prereqs_archive_mode_needs_restart():
     facts = {'server_version_num': '100023', 'server_version': '10.23', 'wal_level': 'replica',
              'archive_mode': 'off', 'archive_command': '(disabled)', 'archive_timeout': '0',
