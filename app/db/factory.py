@@ -5,6 +5,7 @@ Creates PostgreSQL database backend.
 
 import os
 import logging
+from contextlib import nullcontext
 from typing import Optional
 
 from .base import DatabaseBackend
@@ -84,11 +85,14 @@ def init_database() -> DatabaseBackend:
         DatabaseBackend instance
     """
     db = get_database()
-    db.init_schema()
+    # One worker at a time: concurrent CREATE TABLE IF NOT EXISTS can collide
+    lock = db.schema_lock() if hasattr(db, 'schema_lock') else nullcontext()
+    with lock:
+        db.init_schema()
 
-    # Run migrations if the backend supports it
-    if hasattr(db, 'migrate_schema'):
-        db.migrate_schema()
+        # Run migrations if the backend supports it
+        if hasattr(db, 'migrate_schema'):
+            db.migrate_schema()
 
     return db
 

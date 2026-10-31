@@ -12,6 +12,10 @@ from .base import DatabaseBackend
 
 logger = logging.getLogger(__name__)
 
+# Two-key advisory lock namespace for schema init/migrations (next to the
+# scheduler/job namespaces in app/scheduler/locks.py)
+SCHEMA_LOCK_NAMESPACE = 0x42585303
+
 # Import psycopg2 conditionally
 try:
     import psycopg2
@@ -202,6 +206,26 @@ class PostgresBackend(DatabaseBackend):
         )
         conn.autocommit = True
         return conn
+
+    @contextmanager
+    def schema_lock(self):
+        """Serialize schema creation and migrations across workers and containers.
+
+        Every gunicorn worker runs init_schema/migrate_schema at import. Run
+        concurrently, two CREATE TABLE IF NOT EXISTS for the same table can both
+        miss it and one fails on the table's row type ("already exists"),
+        killing the worker and the gunicorn master. Holding a session advisory
+        lock on a dedicated connection makes one worker migrate while the
+        others wait, then find nothing to do. Closing the connection releases it
+        (also if this process dies mid-migration).
+        """
+        conn = self.open_dedicated_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT pg_advisory_lock(%s, %s)', (SCHEMA_LOCK_NAMESPACE, 0))
+            yield
+        finally:
+            conn.close()
 
     def close(self) -> None:
         """Release the connection back to the pool."""

@@ -62,7 +62,7 @@ pytest tests/test_security.py::TestAuthentication::test_login_success
 - `docker-compose.host.yml` - Override for Linux host networking
 
 ### Key Patterns
-- **Database**: Factory pattern — all DB operations go through `DatabaseBackend` interface
+- **Database**: Factory pattern — all DB operations go through `DatabaseBackend` interface. `init_database()` (every gunicorn worker, at import) runs `init_schema` + `migrate_schema` under a Postgres advisory lock (`schema_lock()`, dedicated connection), so one worker migrates and the rest wait and no-op; unlocked, concurrent `CREATE TABLE IF NOT EXISTS` collides on the table's row type and kills gunicorn
 - **SSH auth**: Three modes supported — key file path, pasted/uploaded key content, password (via `sshpass -e`, password in `$SSHPASS`). Sensitive values encrypted with Fernet
 - **No secrets in argv**: argv is world-readable (`ps`, `/proc/PID/cmdline`). Remote scripts go over stdin via `_ssh_run` / `_ssh_popen` (ssh runs only the fixed `REMOTE_SHELL`, `bash -s`); never `ssh_cmd + [script]`. Inside scripts, secrets are `export`ed env vars (restic, AWS_*, PGPASSWORD) or a 0600 MySQL option file (`_mysql_option_file` + `--defaults-extra-file`), never `-p<password>` or `docker exec -e VAR=value`. Local restic/rclone calls pass secrets via `env=`
 - **Notifications**: Telegram text is HTML-escaped (only our `<b>` is markup), cut to 4096 without splitting entities, and resent as plain text on HTTP 400; Slack text escapes `& < >`; code blocks can't be closed by message text
