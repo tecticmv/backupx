@@ -13,7 +13,9 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Progress } from "@/components/ui/progress";
 import { ContributionGraph } from "@/components/ContributionGraph";
 import { toast } from "sonner";
-import type { Jobs, HistoryEntry } from "@/types/job";
+import type { Jobs, HistoryEntry, PitrSummary } from "@/types/job";
+import PitrBadge from "@/components/PitrBadge";
+import { formatWindow } from "@/lib/pitr";
 import JobFormModal from "@/components/JobFormModal";
 import {
   Play,
@@ -51,6 +53,7 @@ interface DashboardStats {
   scheduled_jobs: number;
   overdue_jobs?: number;
   overdue_job_names?: string[];
+  pitr?: (PitrSummary & { job_id: string; name: string })[];
   success_rate: number;
   success_rate_period: string;
   last_24h: {
@@ -238,6 +241,28 @@ export default function Dashboard() {
             {(stats.overdue_job_names ?? []).join(", ")}
           </AlertDescription>
         </Alert>
+      )}
+      {!!stats?.pitr?.length && (
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-medium">Point-in-time recovery</CardTitle>
+            <CardDescription>Restorable to any second inside each window</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {stats.pitr.map((p) => (
+              <div key={p.job_id} className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                <div className="flex items-center gap-2">
+                  <PitrBadge pitr={p} />
+                  <span className="font-medium">{p.name}</span>
+                </div>
+                <span className="text-xs text-muted-foreground">
+                  {formatWindow(p.window_start, p.window_end)}
+                  {p.lag_minutes !== null && ` · lag ${Math.round(p.lag_minutes)} min`}
+                </span>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
       )}
       {/* Hero Stats Section */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">

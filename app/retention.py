@@ -9,7 +9,8 @@ How snapshots are matched: backupx tags every snapshot it writes with
 "automated" (database dumps also with "postgres-backup" / "mysql-backup"), and
 restic records the target server's hostname. Forget only looks at "automated"
 snapshots, so anything added to a repository by hand is never touched, and the
-policy is applied per host + tags (+ paths for file jobs). Database dumps are
+policy is applied per host + tags + paths for file jobs, per host for database
+jobs (see group_by). Database dumps are
 written to a fresh mktemp directory each run, so their paths differ every time
 and must not be part of the group, or every dump would be its own group and
 nothing would ever be removed.
@@ -83,9 +84,16 @@ def describe_policy(job):
 
 
 def group_by(job):
-    """restic --group-by for a job's snapshots (see the module docstring)."""
+    """restic --group-by for a job's snapshots (see the module docstring).
+
+    Database jobs group by host only: their dump paths are random, and with
+    point-in-time recovery each dump carries its own binlog position tag
+    (binlog:<file>:<pos>), so grouping by tags would make every dump its own
+    group. Every snapshot in a database job's repository is that job's dump, so
+    host alone is the right group (forget still only looks at "automated").
+    """
     if job.get('backup_type') == 'database':
-        return 'host,tags'
+        return 'host'
     return 'host,paths,tags'
 
 

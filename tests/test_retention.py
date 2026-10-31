@@ -83,10 +83,10 @@ def test_missing_fields_mean_no_forget():
 
 def test_group_by_leaves_out_paths_for_database_dumps():
     # Dumps go to a fresh mktemp dir each run: grouping by paths would keep everything
-    assert retention.group_by(_job(backup_type='database')) == 'host,tags'
+    assert retention.group_by(_job(backup_type='database')) == 'host'
     assert retention.group_by(_job(backup_type='filesystem')) == 'host,paths,tags'
     args = retention.forget_plan_args(_job(backup_type='database'))
-    assert args[args.index('--group-by') + 1] == 'host,tags'
+    assert args[args.index('--group-by') + 1] == 'host'
 
 
 def test_prune_args():

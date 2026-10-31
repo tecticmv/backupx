@@ -43,6 +43,7 @@ import {
   Star,
 } from "lucide-react";
 import DirectoryBrowser from "@/components/DirectoryBrowser";
+import PitrSettings from "@/components/PitrSettings";
 
 const defaultFormData: JobFormData = {
   job_id: "",
@@ -62,6 +63,10 @@ const defaultFormData: JobFormData = {
   retention_weekly: 4,
   retention_monthly: 12,
   timeout: 28800,
+  pitr_enabled: false,
+  pitr_interval: 5,
+  pitr_retention_days: 7,
+  pitr_client_image: "",
 };
 
 interface JobFormModalProps {
@@ -183,6 +188,10 @@ export default function JobFormModal({
             retention_weekly: job.retention_weekly,
             retention_monthly: job.retention_monthly,
             timeout: job.timeout,
+            pitr_enabled: !!job.pitr_enabled,
+            pitr_interval: job.pitr_interval || 5,
+            pitr_retention_days: job.pitr_retention_days || 7,
+            pitr_client_image: job.pitr_client_image || "",
           });
         }
       }
@@ -574,6 +583,13 @@ export default function JobFormModal({
                       )}
                     </div>
                   </div>
+                )}
+
+                {formData.backup_type === "database" && (
+                  <>
+                    <Separator />
+                    <PitrSettings jobId={jobId} formData={formData} setFormData={setFormData} />
+                  </>
                 )}
 
                 {(formData.backup_type === "filesystem" || formData.backup_type === "database") && <Separator />}

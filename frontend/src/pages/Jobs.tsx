@@ -28,6 +28,8 @@ import {
 import { toast } from "sonner";
 import type { Jobs as JobsType, RetentionRun } from "@/types/job";
 import JobFormModal from "@/components/JobFormModal";
+import PitrBadge from "@/components/PitrBadge";
+import PitrRestoreDialog from "@/components/PitrRestoreDialog";
 import {
   Plus,
   Play,
@@ -46,6 +48,7 @@ import {
   Database,
   FolderPlus,
   AlertTriangle,
+  History,
 } from "lucide-react";
 import {
   Tooltip,
@@ -62,6 +65,7 @@ export default function Jobs() {
   const [initializingJobs, setInitializingJobs] = useState<Set<string>>(new Set());
   const [jobModalOpen, setJobModalOpen] = useState(false);
   const [editingJobId, setEditingJobId] = useState<string | undefined>(undefined);
+  const [pitrJobId, setPitrJobId] = useState<string | null>(null);
   // Maps database config id -> engine, so a job's badge can name the real engine
   // instead of assuming MySQL
   const [dbEngines, setDbEngines] = useState<Record<string, string>>({});
@@ -456,6 +460,11 @@ export default function Jobs() {
                               {formatTime(job.last_run)}
                             </p>
                             {retentionSummary(job.retention_runs)}
+                            {job.pitr?.enabled && (
+                              <div className="mt-1">
+                                <PitrBadge pitr={job.pitr} />
+                              </div>
+                            )}
                           </>
                         )}
                       </div>
@@ -496,6 +505,16 @@ export default function Jobs() {
                           </TooltipTrigger>
                           <TooltipContent>Run backup</TooltipContent>
                         </Tooltip>
+                        {job.backup_type === "database" && job.pitr_enabled && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button size="icon" variant="ghost" onClick={() => setPitrJobId(jobId)}>
+                                <History className="h-4 w-4" />
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>Point-in-time restore</TooltipContent>
+                          </Tooltip>
+                        )}
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <Link to={`/jobs/${jobId}/snapshots`}>
@@ -561,6 +580,12 @@ export default function Jobs() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <PitrRestoreDialog
+        jobId={pitrJobId}
+        jobName={pitrJobId ? jobs[pitrJobId]?.name : undefined}
+        onOpenChange={(open) => !open && setPitrJobId(null)}
+      />
 
       <JobFormModal
         open={jobModalOpen}

@@ -40,12 +40,60 @@ export interface Job {
   overdue_since?: string | null;
   // Latest retention forget/prune result per storage
   retention_runs?: RetentionRun[];
+  // Point-in-time recovery (database jobs)
+  pitr_enabled?: boolean;
+  pitr_interval?: number;
+  pitr_retention_days?: number;
+  pitr_client_image?: string | null;
+  pitr?: PitrSummary | null;
+}
+
+export type PitrState = "disabled" | "pending" | "ok" | "lagging" | "broken" | "unanchored";
+
+export interface PitrSummary {
+  enabled: boolean;
+  state: PitrState;
+  window_start: string | null;
+  window_end: string | null;
+  lag_minutes: number | null;
+  last_error: string | null;
+}
+
+export interface PitrCheck {
+  check: string;
+  status: "ok" | "warn" | "fail";
+  current: string;
+  required: string;
+  fix: string;
+  needs_restart: boolean;
+}
+
+export interface PitrCheckResult {
+  kind: "mysql" | "postgres";
+  checks: PitrCheck[];
+  ok: boolean;
+  needs_restart: boolean;
+  suggested_client_image?: string | null;
+  postgresql_conf?: string[];
+}
+
+export interface PitrDetails extends PitrSummary {
+  state_since: string | null;
+  last_tick_at: string | null;
+  last_ship_at: string | null;
+  streamer_active: string | null;
+  server_version: string | null;
+  kind: "mysql" | "postgres" | null;
+  chains: { chain_id: number; start_seq: number | null; reason: string; started_at: string | null }[];
+  windows: { chain_id: number; from: string | null; to: string | null; anchored: boolean; reason: string }[];
+  anchors: { id: number; time: string; binlog_file: string; binlog_pos: number; storages: string[]; forgotten: boolean }[];
+  segments: { id: number; chain_id: number; first_file: string; last_file: string; end_time: string; size: number; forgotten: boolean }[];
 }
 
 export interface RetentionRun {
   storage_id: string;
   storage_name: string;
-  action: "forget" | "prune";
+  action: "forget" | "prune" | "pitr-forget" | "pitr-prune";
   status: "success" | "failed" | "skipped";
   dry_run: boolean;
   snapshots_removed: number | null;
@@ -131,4 +179,8 @@ export interface JobFormData {
   retention_weekly: number;
   retention_monthly: number;
   timeout: number;
+  pitr_enabled: boolean;
+  pitr_interval: number;
+  pitr_retention_days: number;
+  pitr_client_image: string;
 }

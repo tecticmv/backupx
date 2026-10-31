@@ -433,7 +433,11 @@ class PostgresBackend(DatabaseBackend):
                 created_at TIMESTAMP NOT NULL,
                 updated_at TIMESTAMP,
                 last_run TIMESTAMP,
-                last_success TIMESTAMP
+                last_success TIMESTAMP,
+                pitr_enabled BOOLEAN DEFAULT FALSE,
+                pitr_interval INTEGER DEFAULT 5,
+                pitr_retention_days INTEGER DEFAULT 7,
+                pitr_client_image TEXT
             );
 
             -- History table
@@ -517,6 +521,74 @@ class PostgresBackend(DatabaseBackend):
             CREATE INDEX IF NOT EXISTS idx_retention_runs_latest
                 ON retention_runs(job_id, storage_id, action, timestamp DESC);
 
+            -- Point-in-time recovery (app/pitr*.py)
+            CREATE TABLE IF NOT EXISTS pitr_state (
+                job_id TEXT PRIMARY KEY,
+                kind TEXT,
+                state TEXT,
+                state_since TIMESTAMP,
+                alerted_state TEXT,
+                chain_id INTEGER DEFAULT 0,
+                server_uuid TEXT,
+                binlog_base TEXT,
+                last_seq BIGINT,
+                partial_file TEXT,
+                partial_size BIGINT,
+                partial_mtime BIGINT,
+                partial_until TIMESTAMP,
+                window_start TIMESTAMP,
+                window_end TIMESTAMP,
+                lag_minutes DOUBLE PRECISION,
+                streamer_active TEXT,
+                heartbeat TIMESTAMP,
+                server_version TEXT,
+                last_tick_at TIMESTAMP,
+                last_ship_at TIMESTAMP,
+                last_error TEXT,
+                consecutive_failures INTEGER DEFAULT 0,
+                info TEXT,
+                updated_at TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS pitr_chains (
+                job_id TEXT NOT NULL,
+                chain_id INTEGER NOT NULL,
+                start_seq BIGINT,
+                server_uuid TEXT,
+                base TEXT,
+                reason TEXT,
+                started_at TIMESTAMP,
+                PRIMARY KEY (job_id, chain_id)
+            );
+            CREATE TABLE IF NOT EXISTS pitr_segments (
+                id SERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                chain_id INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'closed',
+                first_file TEXT,
+                last_file TEXT,
+                first_seq BIGINT,
+                last_seq BIGINT,
+                end_time TIMESTAMP,
+                size BIGINT,
+                snapshots TEXT,
+                forgotten BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_pitr_segments_job ON pitr_segments(job_id, kind, chain_id);
+            CREATE TABLE IF NOT EXISTS pitr_anchors (
+                id SERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                time TIMESTAMP NOT NULL,
+                binlog_file TEXT NOT NULL,
+                binlog_pos BIGINT NOT NULL,
+                gtid_set TEXT,
+                server_uuid TEXT DEFAULT '',
+                snapshots TEXT,
+                forgotten BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_pitr_anchors_job ON pitr_anchors(job_id, time);
+
             -- Indexes
             CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_history_job_id ON history(job_id);
@@ -574,6 +646,15 @@ class PostgresBackend(DatabaseBackend):
         if 's3_config_ids' not in job_columns:
             # JSON list of storage IDs, primary first; s3_config_id keeps the primary
             self.add_column('jobs', 's3_config_ids', 'TEXT')
+        # Point-in-time recovery settings
+        if 'pitr_enabled' not in job_columns:
+            self.add_column('jobs', 'pitr_enabled', 'BOOLEAN', 'FALSE')
+        if 'pitr_interval' not in job_columns:
+            self.add_column('jobs', 'pitr_interval', 'INTEGER', '5')
+        if 'pitr_retention_days' not in job_columns:
+            self.add_column('jobs', 'pitr_retention_days', 'INTEGER', '7')
+        if 'pitr_client_image' not in job_columns:
+            self.add_column('jobs', 'pitr_client_image', 'TEXT')
 
         # Create app_settings table if it doesn't exist
         self.executescript('''
@@ -599,6 +680,74 @@ class PostgresBackend(DatabaseBackend):
             );
             CREATE INDEX IF NOT EXISTS idx_retention_runs_latest
                 ON retention_runs(job_id, storage_id, action, timestamp DESC);
+
+            -- Point-in-time recovery (app/pitr*.py)
+            CREATE TABLE IF NOT EXISTS pitr_state (
+                job_id TEXT PRIMARY KEY,
+                kind TEXT,
+                state TEXT,
+                state_since TIMESTAMP,
+                alerted_state TEXT,
+                chain_id INTEGER DEFAULT 0,
+                server_uuid TEXT,
+                binlog_base TEXT,
+                last_seq BIGINT,
+                partial_file TEXT,
+                partial_size BIGINT,
+                partial_mtime BIGINT,
+                partial_until TIMESTAMP,
+                window_start TIMESTAMP,
+                window_end TIMESTAMP,
+                lag_minutes DOUBLE PRECISION,
+                streamer_active TEXT,
+                heartbeat TIMESTAMP,
+                server_version TEXT,
+                last_tick_at TIMESTAMP,
+                last_ship_at TIMESTAMP,
+                last_error TEXT,
+                consecutive_failures INTEGER DEFAULT 0,
+                info TEXT,
+                updated_at TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS pitr_chains (
+                job_id TEXT NOT NULL,
+                chain_id INTEGER NOT NULL,
+                start_seq BIGINT,
+                server_uuid TEXT,
+                base TEXT,
+                reason TEXT,
+                started_at TIMESTAMP,
+                PRIMARY KEY (job_id, chain_id)
+            );
+            CREATE TABLE IF NOT EXISTS pitr_segments (
+                id SERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                chain_id INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'closed',
+                first_file TEXT,
+                last_file TEXT,
+                first_seq BIGINT,
+                last_seq BIGINT,
+                end_time TIMESTAMP,
+                size BIGINT,
+                snapshots TEXT,
+                forgotten BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_pitr_segments_job ON pitr_segments(job_id, kind, chain_id);
+            CREATE TABLE IF NOT EXISTS pitr_anchors (
+                id SERIAL PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                time TIMESTAMP NOT NULL,
+                binlog_file TEXT NOT NULL,
+                binlog_pos BIGINT NOT NULL,
+                gtid_set TEXT,
+                server_uuid TEXT DEFAULT '',
+                snapshots TEXT,
+                forgotten BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_pitr_anchors_job ON pitr_anchors(job_id, time);
         ''')
         self.commit()
 

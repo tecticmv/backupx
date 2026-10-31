@@ -35,6 +35,8 @@ import humanize
 
 from .scheduler.locks import SchedulerLeader, job_run_lock, job_is_running
 from . import retention
+from . import pitr
+from . import pitr_service
 from .cron import cron_fields, cron_trigger
 
 # =============================================================================
@@ -576,6 +578,9 @@ def _on_scheduler_event(event):
         message = sanitize_error_message(
             f"Scheduled run crashed: {type(event.exception).__name__}: {event.exception}")
     logger.error(f"Scheduler: job {event.job_id}: {message}")
+    if event.job_id.endswith((pitr.PITR_SCHEDULE_SUFFIX, pitr.WALG_BASE_SCHEDULE_SUFFIX)):
+        # PITR ticks report through their own state/alerts; a missed tick is just late
+        return
     if event.job_id == retention.PRUNE_SCHEDULE_ID:
         # Not a backup job: don't mark any job failed, just alert
         threading.Thread(target=send_notification,
@@ -593,8 +598,11 @@ def _new_scheduler(timezone):
         timezone=timezone,
         # Retention prune gets its own single worker: it runs one repository at a
         # time and never takes a backup slot.
+        # PITR shipping (binlog streams, WAL-G checks) has its own pool so a busy
+        # backup window can't starve it.
         executors={'default': SchedulerThreadPool(BACKUP_MAX_CONCURRENT),
-                   'maintenance': SchedulerThreadPool(1)},
+                   'maintenance': SchedulerThreadPool(1),
+                   'pitr': SchedulerThreadPool(pitr.settings()['max_concurrent'])},
         job_defaults={
             'coalesce': True,  # several missed fire times -> one run
             'max_instances': 1,
@@ -612,6 +620,7 @@ scheduler = _new_scheduler(os.environ.get('TZ', 'UTC'))
 _scheduler_state_lock = threading.RLock()
 _scheduled_crons = {}  # job_id -> cron the running scheduler has for it
 _scheduled_prune = {'cron': None}  # cron of the retention prune entry, None if not scheduled
+_scheduled_pitr = {}  # APScheduler id (<job>__pitr / <job>__walg_base) -> (kind, value) it was added with
 _scheduler_leader = None
 SCHEDULER_LOCK_INTERVAL = int(os.environ.get('SCHEDULER_LOCK_INTERVAL', 15))
 
@@ -634,7 +643,8 @@ def sync_schedules():
     global scheduler
     timezone = get_scheduler_timezone()
     desired = {}
-    for job_id, job in load_jobs().items():
+    jobs = load_jobs()
+    for job_id, job in jobs.items():
         cron = (job.get('schedule_cron') or '0 2 * * *').strip()
         if job.get('schedule_enabled') and len(cron.split()) == 5:
             desired[job_id] = cron
@@ -647,6 +657,7 @@ def sync_schedules():
             scheduler = _new_scheduler(timezone)
             _scheduled_crons.clear()
             _scheduled_prune['cron'] = None
+            _scheduled_pitr.clear()
         if not scheduler.running:
             scheduler.start()
 
@@ -678,6 +689,59 @@ def sync_schedules():
             logger.info(f"Scheduled job: {job_id} - cron: {cron}")
 
         _sync_prune_schedule()
+        _sync_pitr_schedules(jobs)
+
+
+def _desired_pitr_schedules(jobs):
+    """{scheduler id: (func, trigger kind, value, job_id)} for PITR-enabled database jobs."""
+    desired = {}
+    db_kinds = {}
+    for job_id, job in jobs.items():
+        if not job.get('pitr_enabled') or job.get('backup_type') != 'database':
+            continue
+        config_id = job.get('database_config_id')
+        if config_id not in db_kinds:
+            try:
+                db_kinds[config_id] = pitr.job_kind(get_db_config(config_id)) if config_id else None
+            except Exception:
+                db_kinds[config_id] = None
+        kind = db_kinds[config_id]
+        if kind is None:
+            continue
+        minutes = max(1, int(job.get('pitr_interval') or pitr.DEFAULT_INTERVAL_MINUTES))
+        desired[job_id + pitr.PITR_SCHEDULE_SUFFIX] = (pitr_service.run_tick, 'interval', minutes, job_id)
+        cron = (job.get('schedule_cron') or '0 2 * * *').strip()
+        if kind == 'postgres' and job.get('schedule_enabled') and len(cron.split()) == 5:
+            desired[job_id + pitr.WALG_BASE_SCHEDULE_SUFFIX] = (pitr_service.run_pg_base_backup, 'cron', cron, job_id)
+    return desired
+
+
+def _sync_pitr_schedules(jobs):
+    """Interval entries for PITR shipping on the 'pitr' executor (call with _scheduler_state_lock)."""
+    desired = _desired_pitr_schedules(jobs)
+    for sched_id in list(_scheduled_pitr):
+        if sched_id not in desired or _scheduled_pitr[sched_id] != desired[sched_id][1:3]:
+            try:
+                scheduler.remove_job(sched_id)
+            except Exception:
+                pass
+            del _scheduled_pitr[sched_id]
+    for sched_id, (func, kind, value, job_id) in desired.items():
+        if sched_id in _scheduled_pitr:
+            continue
+        try:
+            if kind == 'interval':
+                scheduler.add_job(func, 'interval', minutes=value, args=[job_id], id=sched_id,
+                                  executor='pitr', replace_existing=True, misfire_grace_time=value * 60,
+                                  next_run_time=datetime.now(timezone.utc) + timedelta(seconds=20))
+            else:
+                scheduler.add_job(func, 'cron', args=[job_id], id=sched_id, executor='pitr',
+                                  replace_existing=True, **cron_fields(value))
+        except Exception as e:
+            logger.error(f"Invalid PITR schedule {sched_id}: {e}")
+            continue
+        _scheduled_pitr[sched_id] = (kind, value)
+        logger.info(f"Scheduled PITR entry {sched_id}: {kind} {value}")
 
 
 def _sync_prune_schedule():
@@ -732,6 +796,7 @@ def _stop_scheduler():
         scheduler = _new_scheduler(scheduler.timezone)
         _scheduled_crons.clear()
         _scheduled_prune['cron'] = None
+        _scheduled_pitr.clear()
 
 
 def refresh_schedules():
@@ -902,6 +967,7 @@ def load_jobs():
         job['s3_config_ids'] = _parse_s3_config_ids(job)
         # Convert integer to boolean
         job['schedule_enabled'] = bool(job['schedule_enabled'])
+        job['pitr_enabled'] = bool(job.get('pitr_enabled'))
         # Remove the 'id' from the job dict since it's the key
         job_id = job.pop('id')
         jobs[job_id] = job
@@ -920,6 +986,7 @@ def get_job(job_id):
         job['excludes'] = json.loads(job['excludes'] or '[]')
         job['s3_config_ids'] = _parse_s3_config_ids(job)
         job['schedule_enabled'] = bool(job['schedule_enabled'])
+        job['pitr_enabled'] = bool(job.get('pitr_enabled'))
         return job
     return None
 
@@ -976,6 +1043,11 @@ def save_job(job_id, job):
 
     s3_config_ids = job.get('s3_config_ids') or ([s3_config_id] if s3_config_id else [])
     conn.execute('UPDATE jobs SET s3_config_ids=? WHERE id=?', (json.dumps(s3_config_ids), job_id))
+    conn.execute('UPDATE jobs SET pitr_enabled=?, pitr_interval=?, pitr_retention_days=?, pitr_client_image=? '
+                 'WHERE id=?',
+                 (bool(job.get('pitr_enabled')), int(job.get('pitr_interval') or pitr.DEFAULT_INTERVAL_MINUTES),
+                  int(job.get('pitr_retention_days') or pitr.DEFAULT_RETENTION_DAYS),
+                  job.get('pitr_client_image') or None, job_id))
 
     conn.commit()
 
@@ -986,6 +1058,8 @@ def delete_job_from_db(job_id):
     conn = get_db_connection()
     conn.execute('DELETE FROM jobs WHERE id = ?', (job_id,))
     conn.execute('DELETE FROM retention_runs WHERE job_id = ?', (job_id,))
+    for table in ('pitr_state', 'pitr_chains', 'pitr_segments', 'pitr_anchors'):
+        conn.execute(f'DELETE FROM {table} WHERE job_id = ?', (job_id,))
     conn.commit()
 
 
@@ -1378,7 +1452,8 @@ def get_status_emoji(status):
         'success': '\u2705',  # Green checkmark
         'failed': '\u274C',   # Red X
         'timeout': '\u23F0',  # Alarm clock
-        'error': '\u26A0\uFE0F'    # Warning sign
+        'error': '\u26A0\uFE0F',   # Warning sign
+        'recovered': '\u2705',  # back to OK after an alert (PITR)
     }
     return emojis.get(status, '\u2753')  # Question mark for unknown
 
@@ -2328,6 +2403,8 @@ def _stream_restic_progress(proc, job_id, timeout, target_names):
             update_job_progress(job_id, progress, label(status_msg))
 
         elif msg_type == 'summary':
+            if current is not None and current < len(results) and msg.get('snapshot_id'):
+                results[current]['snapshot_id'] = msg['snapshot_id']
             total = msg.get('total_bytes_processed', 0)
             added = msg.get('data_added', 0)
             files_new = msg.get('files_new', 0)
@@ -2573,6 +2650,10 @@ def run_database_backup(job_id, job, targets):
         # for direct connection we use the explicit type from the config
         db_type = db_config.get('type', 'mysql')
         is_postgres = db_type in ('postgres', 'postgresql')
+        # PITR anchor: the dump records its binlog position (--source-data=2, or
+        # --master-data=2 on MariaDB / MySQL < 8.0.26). PITR_OFF=1 (set by the
+        # fallback below) dumps without it.
+        pitr_mysql = bool(job.get('pitr_enabled')) and not is_postgres
 
         # Generate backup filename with timestamp
         timestamp = utc_now().strftime('%Y%m%d_%H%M%S')
@@ -2624,9 +2705,18 @@ def run_database_backup(job_id, job, targets):
                 backup_tag = 'postgres-backup'
                 dump_error_msg = 'pg_dumpall failed'
             else:
-                dump_body = (f'$DOCKER exec {safe_container} mysqldump --all-databases '
+                # MariaDB 11 images ship only mariadb-dump (no mysqldump name)
+                dump_body = (f'$DOCKER exec {safe_container} "$MYSQLDUMP" --all-databases '
                              f'--single-transaction --routines --triggers')
-                resolve_lines = ''
+                resolve_lines = (f'MYSQLDUMP=$($DOCKER exec {safe_container} sh -c '
+                                 f"'command -v mysqldump || command -v mariadb-dump' 2>/dev/null | tail -n1); "
+                                 f'[ -n "$MYSQLDUMP" ] || MYSQLDUMP=mysqldump')
+                if pitr_mysql:
+                    resolve_lines += (
+                        f'\nPITR_FLAG=""; [ -n "${{PITR_OFF:-}}" ] || PITR_FLAG=$($DOCKER exec {safe_container} '
+                        f"\"$MYSQLDUMP\" --help 2>/dev/null | grep -q -- '--source-data' "
+                        f'&& echo --source-data=2 || echo --master-data=2)')
+                    dump_body += ' $PITR_FLAG'
                 backup_tag = 'mysql-backup'
                 dump_error_msg = 'mysqldump failed'
 
@@ -2668,18 +2758,63 @@ fi
             backup_tag = 'postgres-backup'
             dump_error_msg = 'pg_dump failed'
         else:
+            # PITR jobs with a client image dump with that image's mysqldump: the dump
+            # must speak the server's dialect to record its binlog position (MySQL 8.4
+            # removed SHOW MASTER STATUS, which 8.0 / MariaDB clients send). The option
+            # file goes in on stdin, so the password stays out of every argv.
+            client_image = (job.get('pitr_client_image') or '').strip() if pitr_mysql else ''
+            if client_image:
+                image = shlex.quote(client_image)
+                dump_prefix = ('if docker info >/dev/null 2>&1; then DOCKER="docker"; '
+                               'else DOCKER="sudo -n docker"; fi\n')
+                dump_prog = (f'$DOCKER run --rm -i --network host --entrypoint sh {image} -c '
+                             '\'cat > /tmp/my.cnf && exec mysqldump --defaults-extra-file=/tmp/my.cnf "$@"\' sh')
+                dump_stdin = ' < "$MYCNF"'
+                help_cmd = f'$DOCKER run --rm --entrypoint mysqldump {image} --help'
+            else:
+                dump_prefix, dump_prog, dump_stdin = '', 'mysqldump --defaults-extra-file="$MYCNF"', ''
+                help_cmd = 'mysqldump --help'
+            pitr_flag_line = (f'PITR_FLAG=""; [ -n "${{PITR_OFF:-}}" ] || PITR_FLAG=$({help_cmd} 2>/dev/null '
+                              "| grep -q -- '--source-data' && echo --source-data=2 || echo --master-data=2)\n"
+                              if pitr_mysql else '')
             # Password via a 0600 option file inside the 0700 $BACKUP_DIR, removed as soon as the dump ends
             dump_cmd = f'''
 MYCNF="$BACKUP_DIR/.backupx-my.cnf"
 trap 'rm -f "$MYCNF"' EXIT
 {_mysql_option_file('"$MYCNF"', db_config['password'])} || exit 1
-mysqldump --defaults-extra-file="$MYCNF" -h {db_host} -P {db_port} -u {db_user} {db_flag} --single-transaction --routines --triggers
+{dump_prefix}{pitr_flag_line}{dump_prog} -h {db_host} -P {db_port} -u {db_user} {db_flag} --single-transaction --routines --triggers{' $PITR_FLAG' if pitr_mysql else ''}{dump_stdin}
 '''
             backup_tag = 'mysql-backup'
             dump_error_msg = 'mysqldump failed'
 
         # Build remote command with proper escaping
-        backup_cmd = f'restic backup --json --compression auto --tag automated --tag {backup_tag} "$BACKUP_FILE"'
+        backup_cmd = f'restic backup --json --compression auto --tag automated --tag {backup_tag} $ANCHOR_TAGS "$BACKUP_FILE"'
+        if pitr_mysql:
+            dump_step = f'''
+PITR_T0=$(date +%s)
+( {dump_cmd} ) 2>"$BACKUP_DIR/dump.err" | gzip > "$BACKUP_FILE"
+DUMP_RC=$?
+cat "$BACKUP_DIR/dump.err" >&2
+if [ $DUMP_RC -ne 0 ]; then
+    echo "backupx-anchor-failed: dump with the binlog position failed ($(grep -v 'Using a password' "$BACKUP_DIR/dump.err" | tail -n 2 | tr '\\n' ' ')); dumped again without it"
+    export PITR_OFF=1
+    ( {dump_cmd} ) | gzip > "$BACKUP_FILE"
+    DUMP_RC=$?
+else
+    echo "backupx-anchor-time: $PITR_T0"
+    ANCHOR_LINE=$(gzip -dc "$BACKUP_FILE" 2>/dev/null | head -n 400 | grep -m1 -E "CHANGE (MASTER|REPLICATION SOURCE) TO .*LOG_FILE")
+    printf '%s\\n' "$ANCHOR_LINE" | sed 's/^/backupx-anchor: /'
+    gzip -dc "$BACKUP_FILE" 2>/dev/null | head -n 400 | sed -n '/GTID_PURGED/,/;/p' | head -n 100 | sed 's/^/backupx-anchor: /'
+    AFILE=$(printf '%s' "$ANCHOR_LINE" | sed -n "s/.*LOG_FILE='\\([A-Za-z0-9._-]*\\)'.*/\\1/p")
+    APOS=$(printf '%s' "$ANCHOR_LINE" | sed -n "s/.*LOG_POS=\\([0-9]*\\).*/\\1/p")
+    if [ -n "$AFILE" ] && [ -n "$APOS" ]; then ANCHOR_TAGS="--tag pitr-anchor --tag binlog:$AFILE:$APOS"; fi
+fi
+'''
+        else:
+            dump_step = f'''
+( {dump_cmd} ) | gzip > "$BACKUP_FILE"
+DUMP_RC=$?
+'''
         remote_cmd = f"""
 export PATH="$HOME/.local/bin:$PATH"
 export RESTIC_PASSWORD={restic_password}
@@ -2693,9 +2828,8 @@ BACKUP_FILE="$BACKUP_DIR/{backup_filename}"
 # failed dump into a valid 20-byte empty archive that then gets stored as a "successful"
 # backup. Not every /bin/sh supports it, so the emptiness guard below is the real net.
 set -o pipefail 2>/dev/null || true
-( {dump_cmd} ) | gzip > "$BACKUP_FILE"
-DUMP_RC=$?
-
+ANCHOR_TAGS=""
+{dump_step}
 if [ $DUMP_RC -ne 0 ]; then
     echo "{dump_error_msg}"
     rm -rf "$BACKUP_DIR"
@@ -2726,8 +2860,14 @@ exit $BACKUPX_FAILED
 
         returncode, stderr_text, preamble, results = _stream_restic_progress(
             proc, job_id, backup_timeout, [t['name'] for t in targets])
-        return _finish_backup(job_id, job, targets, start_time, returncode, stderr_text,
-                              preamble, results, 'Database backup')
+        anchor = anchor_error = None
+        if pitr_mysql:
+            anchor, anchor_error, preamble = pitr.extract_anchor_lines(preamble)
+        outcome = _finish_backup(job_id, job, targets, start_time, returncode, stderr_text,
+                                 preamble, results, 'Database backup')
+        if pitr_mysql:
+            pitr_service.record_anchor(job_id, dict(job, id=job_id), anchor, anchor_error, targets, results)
+        return outcome
 
     except subprocess.TimeoutExpired:
         update_job_status(job_id, 'timeout')
@@ -3033,6 +3173,8 @@ def run_retention_maintenance():
             logger.info("Retention prune: starting" + (" (dry run)" if cfg['dry_run'] else ""))
             for job_id, job in load_jobs().items():
                 job = dict(job, id=job_id)
+                if job.get('pitr_enabled'):
+                    _pitr_retention_locked(job_id, job, cfg)
                 if not retention.retention_policy(job):
                     continue
                 for target in get_job_storage_targets(job):
@@ -3045,6 +3187,18 @@ def run_retention_maintenance():
                 get_db().close()
             except Exception:
                 pass
+
+
+def _pitr_retention_locked(job_id, job, cfg):
+    """PITR retention under the job's PITR lock, so no shipment runs during forget/prune."""
+    import time
+    for _ in range(20):
+        with job_run_lock(_lock_connection, pitr_service.lock_key(job_id)) as acquired:
+            if acquired:
+                pitr_service.apply_retention(job_id, job, cfg)
+                return
+        time.sleep(15)
+    logger.warning(f"PITR retention skipped for {job.get('name')}: shipping kept the lock")
 
 
 def _iso_utc(value):
@@ -3297,9 +3451,97 @@ def api_jobs():
     except Exception as e:
         logger.debug(f"Loading retention runs failed: {e}")
         runs = {}
+    try:
+        pitr_states = pitr_service.summaries(jobs)
+    except Exception as e:
+        logger.debug(f"Loading PITR states failed: {e}")
+        pitr_states = {}
     for job_id, job in jobs.items():
         job['retention_runs'] = runs.get(job_id, [])
+        job['pitr'] = pitr_states.get(job_id)
     return jsonify(jobs)
+
+
+# --- Point-in-time recovery -------------------------------------------------
+
+@app.route('/api/jobs/<job_id>/pitr')
+@login_required
+def api_job_pitr(job_id):
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(pitr_service.details(job_id, dict(job, id=job_id)))
+
+
+@app.route('/api/jobs/<job_id>/pitr/check', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_job_pitr_check(job_id):
+    """Prerequisite table for PITR on this job (runs read-only queries over SSH)."""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    overrides, error = pitr.pitr_settings_from_request(request.get_json(silent=True) or {}, job)
+    if error:
+        return jsonify({'error': error}), 400
+    try:
+        return jsonify(pitr_service.check_prereqs(job_id, job, overrides))
+    except pitr_service.PitrError as e:
+        return jsonify({'error': str(e)}), 400
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'The prerequisite check timed out'}), 504
+    except Exception as e:
+        logger.exception(f"PITR prerequisite check failed for {job_id}")
+        return jsonify({'error': sanitize_error_message(str(e))}), 500
+
+
+@app.route('/api/jobs/<job_id>/pitr/ship', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_job_pitr_ship(job_id):
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    if not job.get('pitr_enabled'):
+        return jsonify({'error': 'Point-in-time recovery is off for this job'}), 400
+    pitr_service.kick(job_id)
+    return jsonify({'success': True, 'message': 'PITR check/ship started'})
+
+
+@app.route('/api/jobs/<job_id>/pitr/restore-script', methods=['POST'])
+@login_required
+@csrf.exempt
+def api_job_pitr_restore_script(job_id):
+    """Download a script that restores this job to a point in time in a scratch container."""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    data = request.get_json(silent=True) or {}
+    try:
+        target = datetime.fromisoformat(str(data.get('time') or '').replace('Z', '+00:00'))
+    except ValueError:
+        return jsonify({'error': 'time must be an ISO 8601 date-time'}), 400
+    if target.tzinfo is None:
+        return jsonify({'error': 'time must include a UTC offset (e.g. 2026-10-31T10:15:00Z)'}), 400
+    try:
+        filename, text = pitr_service.restore_script(job_id, target, data.get('storage_id') or None)
+    except (pitr_service.PitrError, pitr.RestorePlanError) as e:
+        return jsonify({'error': str(e)}), 400
+    try:
+        from .audit.logger import get_audit_logger
+        audit_logger = get_audit_logger()
+        if audit_logger:
+            audit_logger.log(action='pitr_restore_script', resource_type='job', resource_id=job_id,
+                             resource_name=job.get('name'),
+                             user_id=current_user.id if hasattr(current_user, 'id') else 'unknown',
+                             user_name=current_user.id if hasattr(current_user, 'id') else 'unknown',
+                             status='success', new_value={'time': target.isoformat()},
+                             ip_address=request.remote_addr, user_agent=request.headers.get('User-Agent', ''))
+    except Exception as e:
+        logger.debug(f"Audit logging failed: {e}")
+    response = app.response_class(text, mimetype='text/x-shellscript')
+    response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
 
 
 @app.route('/api/retention/settings')
@@ -3434,6 +3676,12 @@ def api_create_job():
     # Get backup type
     backup_type = data.get('backup_type', 'filesystem')
 
+    pitr_fields, error = pitr.pitr_settings_from_request(data)
+    if error:
+        return jsonify({'error': error}), 400
+    if pitr_fields['pitr_enabled'] and backup_type != 'database':
+        return jsonify({'error': 'Point-in-time recovery is only for database jobs'}), 400
+
     job = {
         'name': data.get('name', job_id),
         'backup_type': backup_type,
@@ -3465,13 +3713,16 @@ def api_create_job():
         'retention_monthly': int(data.get('retention_monthly', 12)),
         'timeout': int(data.get('timeout', 7200)),
         'status': 'pending',
-        'created_at': utc_isoformat()
+        'created_at': utc_isoformat(),
+        **pitr_fields,
     }
 
     save_job(job_id, job)
 
-    if job['schedule_enabled']:
+    if job['schedule_enabled'] or job['pitr_enabled']:
         refresh_schedules()
+    if job['pitr_enabled']:
+        pitr_service.kick(job_id)
 
     # Audit log
     try:
@@ -3525,6 +3776,14 @@ def api_update_job(job_id):
         return jsonify({'error': error}), 400
     s3_config_id = s3_config_ids[0] if s3_config_ids else None
 
+    pitr_fields, error = pitr.pitr_settings_from_request(data, job)
+    if error:
+        return jsonify({'error': error}), 400
+    if pitr_fields['pitr_enabled'] and data.get('backup_type', job.get('backup_type')) != 'database':
+        return jsonify({'error': 'Point-in-time recovery is only for database jobs'}), 400
+    pitr_was_enabled = bool(job.get('pitr_enabled'))
+    previous_job = dict(job)
+
     job.update({
         'name': data.get('name', job['name']),
         'backup_type': data.get('backup_type', job.get('backup_type', 'filesystem')),
@@ -3553,7 +3812,8 @@ def api_update_job(job_id):
         'retention_weekly': int(data.get('retention_weekly', job.get('retention_weekly', 4))),
         'retention_monthly': int(data.get('retention_monthly', job.get('retention_monthly', 12))),
         'timeout': int(data.get('timeout', job.get('timeout', 7200))),
-        'updated_at': utc_isoformat()
+        'updated_at': utc_isoformat(),
+        **pitr_fields,
     })
 
     # Only update secrets if provided
@@ -3566,6 +3826,10 @@ def api_update_job(job_id):
 
     save_job(job_id, job)
     refresh_schedules()
+    if pitr_was_enabled and not job['pitr_enabled']:
+        pitr_service.teardown(job_id, previous_job)
+    elif job['pitr_enabled']:
+        pitr_service.kick(job_id)  # (re)installs the streamer with the new settings
 
     # Audit log
     try:
@@ -3599,6 +3863,8 @@ def api_delete_job(job_id):
         return jsonify({'error': 'Job not found'}), 404
 
     job_name = job.get('name', job_id)
+    if job.get('pitr_enabled'):
+        pitr_service.teardown(job_id, dict(job), keep_state=False)
     delete_job_from_db(job_id)
     refresh_schedules()
 
@@ -4443,7 +4709,16 @@ def api_dashboard_stats():
             'total': day_success + day_failed
         })
 
+    pitr_jobs = []
+    try:
+        for job_id, p in pitr_service.summaries(jobs).items():
+            if p.get('enabled'):
+                pitr_jobs.append(dict(p, job_id=job_id, name=jobs[job_id].get('name', job_id)))
+    except Exception as e:
+        logger.debug(f"Loading PITR states failed: {e}")
+
     return jsonify({
+        'pitr': sorted(pitr_jobs, key=lambda p: p['name']),
         'total_jobs': total_jobs,
         'success_jobs': success_jobs,
         'failed_jobs': failed_jobs,
