@@ -13,7 +13,7 @@ from datetime import timezone
 
 from . import pitr
 
-STREAMER_VERSION = '1'
+STREAMER_VERSION = '2'
 STREAMER_PATH = '/usr/local/lib/backupx-pitr/binlog-streamer.sh'
 UNIT_NAME = 'backupx-pitr-binlog@.service'
 UNIT_PATH = '/etc/systemd/system/' + UNIT_NAME
@@ -168,7 +168,10 @@ else
     log "first start: streaming from the current binlog $START"
 fi
 
-if pitr_client "$BINLOG" --help 2>/dev/null | grep -q -- '--connection-server-id'; then
+# mysqlbinlog reads only our option file (--defaults-file, must come first): the host's
+# [client] section may hold options it rejects (MariaDB 10.3: default-character-set).
+# --no-defaults can't be combined with --defaults-extra-file (it is rejected as unknown).
+if pitr_client "$BINLOG" --defaults-file="$CNF" --help 2>/dev/null | grep -q -- '--connection-server-id'; then
     SID_OPT="--connection-server-id=$PITR_SERVER_ID"
 else
     SID_OPT="--stop-never-slave-server-id=$PITR_SERVER_ID"
@@ -176,7 +179,7 @@ fi
 
 [ -n "$PITR_RUN_IMAGE" ] && $DOCKER rm -f "$CONTAINER_NAME" >/dev/null 2>&1
 log "streaming from $START (server $UUID)"
-pitr_client --name "$CONTAINER_NAME" "$BINLOG" --defaults-extra-file="$CNF" \
+pitr_client --name "$CONTAINER_NAME" "$BINLOG" --defaults-file="$CNF" \
     --read-from-remote-server --raw --stop-never "$SID_OPT" \
     --result-file="$OUT_DIR/" "$START" &
 PID=$!
@@ -262,6 +265,14 @@ def mysql_env(job_id, db_config, client_image=''):
 
 
 _SUDO = 'SUDO=""; if [ "$(id -u)" != 0 ]; then SUDO="sudo -n"; fi'
+# Prerequisite facts: who we are, and whether sudo really works without a
+# password and gives root (`sudo -n id -u` prints 0), not just whether it exists.
+ROOT_FACTS = r'''fact uid "$(id -u 2>/dev/null)"
+fact user_name "$(id -un 2>/dev/null)"
+if [ "$(id -u 2>/dev/null)" != 0 ]; then
+    SUDO_OUT=$(sudo -n id -u 2>&1 </dev/null) && fact sudo_uid "$(printf '%s\n' "$SUDO_OUT" | tail -n1)" \
+        || fact sudo_error "$(printf '%s' "$SUDO_OUT" | head -c 200 | tr '\n' ' ')"
+fi'''
 # Run a shell command line as the postgres OS user (root: su; others: sudo -n -u postgres)
 _AS_PG = '''as_pg() {
     if [ "$(id -u)" = 0 ]; then su -s /bin/sh postgres -c "$1"; else sudo -n -u postgres sh -c "$1"; fi
@@ -441,8 +452,7 @@ SPOOL=""
 PITR_CONTAINER={q(container)}
 PITR_IMAGE={q('' if container else client_image)}
 {CLIENT_RUNNER}
-[ "$(id -u)" = 0 ] && fact is_root 1 || fact is_root 0
-sudo -n true >/dev/null 2>&1 && fact sudo 1 || fact sudo 0
+{ROOT_FACTS}
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then fact systemd 1; else fact systemd 0; fi
 if docker info >/dev/null 2>&1 || sudo -n docker info >/dev/null 2>&1; then fact docker 1; else fact docker 0; fi
 fact free_mb "$(df -Pm /var/lib 2>/dev/null | awk 'NR==2 {{print $4}}')"
@@ -452,7 +462,16 @@ if ! pitr_setup_client 2>"$CONF_DIR/err"; then
 fi
 pitr_find_programs
 fact binlog_client "${{BINLOG##*/}}"
-[ -n "$BINLOG" ] && fact binlog_client_version "$(pitr_client "$BINLOG" --version 2>/dev/null | head -n1)"
+if [ -n "$BINLOG" ]; then
+    # As the streamer runs it: only our option file (--defaults-file), so a [client]
+    # option this mysqlbinlog doesn't know (MariaDB 10.3: default-character-set) can't stop it
+    V=$(pitr_client "$BINLOG" --defaults-file="$CNF" --version 2>"$CONF_DIR/binerr" | head -n1)
+    fact binlog_client_version "$V"
+    [ -z "$V" ] && fact binlog_client_error "$(grep -v '^$' "$CONF_DIR/binerr" | head -c 300 | tr '\\n' ' ')"
+    # ... and as a person would, with the host's option files
+    pitr_client "$BINLOG" --version >/dev/null 2>"$CONF_DIR/binerr" \\
+        || fact binlog_host_defaults_error "$(grep -v '^$' "$CONF_DIR/binerr" | head -c 300 | tr '\\n' ' ')"
+fi
 DUMP=$(pitr_client sh -c 'command -v mysqldump || command -v mariadb-dump' 2>/dev/null | tail -n1)
 fact dump_client "${{DUMP##*/}}"
 [ -n "$DUMP" ] && fact dump_client_version "$(pitr_client "$DUMP" --version 2>/dev/null | head -n1)"
@@ -738,8 +757,7 @@ def pg_prereq_script():
 set -u
 {_AS_PG}
 fact() {{ printf 'PITR\\t%s\\t%s\\n' "$1" "$2"; }}
-[ "$(id -u)" = 0 ] && fact is_root 1 || fact is_root 0
-sudo -n true >/dev/null 2>&1 && fact sudo 1 || fact sudo 0
+{ROOT_FACTS}
 fact glibc "$(ldd --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\\.[0-9]+$')"
 fact walg_version "$(/usr/local/bin/wal-g --version 2>/dev/null | head -n1)"
 SQL="
@@ -759,6 +777,18 @@ UNION ALL SELECT 'archiver_last_failed_time', coalesce(last_failed_time::text, '
 "
 OUT=$(printf '%s' "$SQL" | as_pg 'psql -XtA -F "	"' 2>&1) || {{ fact connect_error "$(printf '%s' "$OUT" | head -c 300 | tr '\\n' ' ')"; exit 0; }}
 printf '%s\\n' "$OUT" | while IFS="$(printf '\\t')" read -r k v; do [ -n "$k" ] && fact "$k" "$v"; done
+# Where WAL is written now, to tell an idle server (nothing new to archive) from a stuck
+# archiver. Separate query, ignored if it fails (e.g. on a standby).
+POS_SQL="
+SELECT 'current_wal_file', pg_walfile_name(pg_current_wal_lsn()) WHERE NOT pg_is_in_recovery()
+UNION ALL SELECT 'current_wal_lsn', pg_current_wal_lsn()::text WHERE NOT pg_is_in_recovery()
+UNION ALL SELECT 'wal_segment_size', (setting::bigint * CASE unit WHEN '8kB' THEN 8192 WHEN 'kB' THEN 1024
+    WHEN 'MB' THEN 1048576 ELSE 1 END)::text FROM pg_settings WHERE name = 'wal_segment_size'
+UNION ALL SELECT 'archiver_last_failed_epoch', coalesce(extract(epoch from last_failed_time)::bigint::text, '')
+    FROM pg_stat_archiver;
+"
+POS=$(printf '%s' "$POS_SQL" | as_pg 'psql -XtA -F "	"' 2>/dev/null) && \\
+    printf '%s\\n' "$POS" | while IFS="$(printf '\\t')" read -r k v; do [ -n "$k" ] && fact "$k" "$v"; done
 exit 0
 '''
 

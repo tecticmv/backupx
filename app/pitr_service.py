@@ -773,8 +773,10 @@ def _pg_windows(state):
     to = pitr._utc(int(end))
     frm = pitr._utc(start) if start else None
     anchored = bool(frm and frm <= to and reason == 'start')
+    # idle_at: the last tick that found nothing written since the last archived WAL;
+    # the window is current up to then even though the archive time is old.
     return [{'chain_id': 1, 'reason': reason, 'from': frm if anchored else None, 'to': to,
-             'anchored': anchored, 'anchor_ids': []}]
+             'anchored': anchored, 'anchor_ids': [], 'complete_at': info.get('idle_at')}]
 
 
 def _pg_tick(job_id, job, server, db_config, targets):
@@ -798,12 +800,20 @@ def _pg_tick(job_id, job, server, db_config, targets):
         raise PitrError('psql: ' + facts['connect_error'])
     archiving = facts.get('archive_mode') in ('on', 'always') and \
         pitr.WALG_ARCHIVE_COMMAND.split()[0] in facts.get('archive_command', '')
+    health = pitr.walg_archiver_health(facts)
+    now = _now()
     info.update(archive_mode=facts.get('archive_mode'), archiving=archiving,
                 last_archived_wal=facts.get('archiver_last_archived_wal'),
                 last_archived_time=facts.get('archiver_last_archived_time') or None,
-                archiver_failed_count=facts.get('archiver_failed_count'))
+                archiver_failed_count=facts.get('archiver_failed_count'),
+                current_wal_file=facts.get('current_wal_file') or None,
+                archiver=health['detail'],
+                idle_at=now.isoformat() if archiving and health['idle'] else None)
     message = None if archiving else ('postgresql.conf changes pending (archive_mode/archive_command); '
                                       'see Check prerequisites')
+    if archiving and health['failing']:
+        message = health['detail']
+    ship_ok = archiving and not health['failing']
     if archiving:
         res = _run(server, scripts.walg_run_script('wal-g backup-list --json --detail'), timeout=120)
         try:
@@ -830,11 +840,23 @@ def _pg_tick(job_id, job, server, db_config, targets):
             if not last_mirror or _now() - pitr._utc(last_mirror) >= timedelta(minutes=15):
                 info['mirror'] = _mirror_wal(prefix, primary, targets[1:])
                 info['mirror_at'] = _now().isoformat()
-    save_state(job_id, kind='postgres', info=json.dumps(info), last_tick_at=_ts(_now()),
-               last_error=message, consecutive_failures=0, streamer_active='active' if archiving else 'inactive',
-               server_version=facts.get('server_version'))
-    refresh_state(job_id, job, live=archiving)
-    return True, message or 'ok'
+                failed = [f"{r['storage']}: {r['error'] or 'failed'}" for r in info['mirror'] if not r['ok']]
+                if failed:
+                    ship_ok = False
+                    message = message or ('WAL mirror failed - ' + '; '.join(failed))[:500]
+            else:
+                ship_ok = False  # nothing shipped to the other storages this tick
+    fields = {}
+    if ship_ok:
+        # A "ship": WAL on the primary is current (archiver healthy) and every storage
+        # has it - even when an idle server produced no new files.
+        fields['last_ship_at'] = _ts(now)
+    save_state(job_id, kind='postgres', info=json.dumps(info), last_tick_at=_ts(now),
+               last_error=message, consecutive_failures=0,
+               streamer_active=('failing' if health['failing'] else 'active') if archiving else 'inactive',
+               server_version=facts.get('server_version'), **fields)
+    refresh_state(job_id, job, live=archiving and not health['failing'])
+    return True, message or ('ok (' + health['detail'] + ')' if archiving else 'ok')
 
 
 def _hash(*parts):

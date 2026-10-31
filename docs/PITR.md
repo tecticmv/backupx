@@ -32,6 +32,10 @@ configuration changes and restarts are always left to you.
      `heartbeat`, which lets backupx count the open file as complete up to now.
    - Credentials: `/etc/backupx-pitr/<job>/my.cnf` (root, 0600). When the
      client runs in docker the file goes into the container on stdin.
+     `mysqlbinlog` gets it as `--defaults-file` (only that file): MariaDB
+     10.3's `/etc/mysql/mariadb.conf.d/50-client.cnf` puts
+     `default-character-set` in `[client]`, which mysqlbinlog rejects
+     (`--no-defaults` can't be combined with `--defaults-extra-file`).
 2. **Shipping** (every *interval* minutes, own scheduler pool `pitr`, advisory
    lock `<job>:pitr`): backupx ships the closed files (all but the newest) with
    restic to the sibling repository `<prefix>-binlog` on **each** of the job's
@@ -63,6 +67,16 @@ configuration changes and restarts are always left to you.
 Alerts go to the normal notification channels only on state **changes**: one
 "failed" when a job enters lagging/broken (or unanchored after it was ok, or
 for more than 26 h after enabling), one "recovered" when it's ok again.
+
+### Check prerequisites
+
+- *Root or passwordless sudo* passes only when `id -u` is 0 or
+  `sudo -n id -u` prints 0 on the server; otherwise it fails with sudo's error.
+- GRANT fixes name the account as `'user'@'host'` from `CURRENT_USER()`.
+- A binlog client that dies before printing its version is reported as
+  *mysqlbinlog starts* with its error (not as a version mismatch); one that
+  only fails with the host's option files is a warning (*mysqlbinlog reads the
+  host option files*), since the streamer doesn't read them.
 
 ### Client versions (important)
 
@@ -151,6 +165,17 @@ Spool: up to a few files per job (E-Petition ~10 MB/day total).
 - **Monitoring** every interval: `pg_stat_archiver`; `wal-g wal-verify
   integrity timeline` at most hourly. Window = oldest base backup → last
   archived WAL time; integrity FAILURE → broken.
+- **Idle servers are not lagging**: PostgreSQL only switches WAL (and
+  `archive_timeout` only fires) when something was written, so on a quiet
+  database the last archive time can be hours old with nothing missing. Each
+  tick compares `pg_walfile_name(pg_current_wal_lsn())` with
+  `last_archived_wal`: equal = everything written is archived, the window is
+  current up to that tick (lag 0). Otherwise lag is measured from the last
+  archive time as before (25 min default). `last_failed_time` newer than
+  `last_archived_time` = `archive_command` failing → lagging, with the failed
+  WAL in the alert.
+- **Last ship** (Jobs list): set when the archiver is healthy and the R2
+  mirror (below) succeeded on that tick, even if there were no new files.
 - **Second storage** (e.g. R2): `rclone copy` (never sync) of `<prefix>-wal`
   from the primary every 15 minutes, run in the backupx container. Because it
   never deletes, add a bucket lifecycle rule on that prefix (e.g. expire after

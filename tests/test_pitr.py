@@ -7,8 +7,11 @@ Everything here is pure (app.pitr / app.pitr_scripts) or uses the faked
 transport from test_secrets_argv; the end-to-end run against real MySQL 8.4 /
 MariaDB 11 containers is described in docs/PITR.md.
 """
+import json
+import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -52,7 +55,7 @@ GOOD_MYSQL = {
     'version': '8.4.8', 'user': 'doadmin@%', 'log_bin': '1', 'binlog_format': 'ROW', 'binlog_row_image': 'FULL',
     'server_id': '1', 'gtid_mode': 'ON', 'binlog_expire_seconds': '0',
     'grants': "GRANT SELECT, RELOAD, PROCESS, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO `doadmin`@`%`|",
-    'is_root': '1', 'sudo': '0', 'systemd': '1', 'docker': '1', 'free_mb': '50000',
+    'uid': '0', 'user_name': 'root', 'systemd': '1', 'docker': '1', 'free_mb': '50000',
     'binlog_client': 'mysqlbinlog', 'binlog_client_version': 'mysqlbinlog  Ver 8.4.11-11 for Linux on x86_64',
     'dump_client': 'mysqldump', 'dump_client_version': 'mysqldump  Ver 8.4.11-11 for Linux on x86_64',
 }
@@ -110,8 +113,8 @@ def test_prereqs_old_mysqldump_cannot_anchor_on_84():
 
 
 def test_prereqs_connection_error_still_reports_host_checks():
-    checks = pitr.evaluate_mysql_prereqs({'connect_error': "Access denied for user 'x'", 'is_root': '0',
-                                          'sudo': '0', 'systemd': '1'})
+    checks = pitr.evaluate_mysql_prereqs({'connect_error': "Access denied for user 'x'", 'uid': '1000', 'user_name': 'bk',
+                                          'sudo_error': 'sudo: a password is required', 'systemd': '1'})
     names = by_name(checks)
     assert names['Database connection']['status'] == 'fail'
     assert names['Root or passwordless sudo']['status'] == 'fail'
@@ -204,7 +207,7 @@ def test_unversioned_mariadb_binlog_against_mysql_server_still_fails():
 def test_pg_prereqs_archive_mode_needs_restart():
     facts = {'server_version_num': '100023', 'server_version': '10.23', 'wal_level': 'replica',
              'archive_mode': 'off', 'archive_command': '(disabled)', 'archive_timeout': '0',
-             'is_root': '1', 'glibc': '2.27'}
+             'uid': '0', 'glibc': '2.27'}
     checks = by_name(pitr.evaluate_pg_prereqs(facts))
     assert checks['archive_mode']['status'] == 'fail' and checks['archive_mode']['needs_restart']
     assert not checks['archive_command']['needs_restart']
@@ -863,3 +866,272 @@ def test_pitr_only_for_database_jobs(session_client):
     res = authenticated_client.post('/api/jobs', json={'job_id': 'db-pitr', 'name': 'x', 'backup_type': 'database',
                                                        'pitr_enabled': True, 'pitr_interval': 99})
     assert res.status_code == 400 and 'interval' in res.get_json()['error']
+
+
+# ---------------------------------------------------------------------------
+# Prerequisite fixes: GRANT account, binlog client start errors, root/sudo
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('current_user, account', [
+    ('azureuser@localhost', "'azureuser'@'localhost'"),
+    ('doadmin@%', "'doadmin'@'%'"),
+    ('bk@10.0.%', "'bk'@'10.0.%'"),
+    ('bk@192.168.1.0/255.255.255.0', "'bk'@'192.168.1.0/255.255.255.0'"),
+    ('bk@db.example.com', "'bk'@'db.example.com'"),
+    ('we@ird@host', "'we@ird'@'host'"),               # user names may contain '@', hosts never
+    ("o'neil@%", "'o''neil'@'%'"),
+    ("'bk'@'%'", "'bk'@'%'"),
+    ('`bk`@`localhost`', "'bk'@'localhost'"),
+    ('bk', "'bk'@'%'"),
+    ('', "'user'@'%'"),
+])
+def test_mysql_account(current_user, account):
+    assert pitr.mysql_account(current_user) == account
+
+
+def test_prereqs_grant_fix_names_the_real_account():
+    facts = dict(GOOD_MYSQL, user='azureuser@localhost', grants='GRANT SELECT ON *.* TO `azureuser`@`localhost`|')
+    checks = by_name(pitr.evaluate_mysql_prereqs(facts))
+    fix = checks['Privilege REPLICATION SLAVE']['fix']
+    assert fix == "GRANT REPLICATION SLAVE ON *.* TO 'azureuser'@'localhost';"
+    assert "TO 'azureuser'@'localhost';" in checks['Privilege RELOAD']['fix']
+    assert "@localhost'@" not in fix
+
+
+MARIADB_103 = dict(GOOD_MYSQL, version='10.3.39-MariaDB-0ubuntu0.20.04.2', gtid_mode='',
+                   grants='GRANT RELOAD, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO `bk`@`localhost`|',
+                   binlog_client='mysqlbinlog',
+                   binlog_client_version='mysqlbinlog Ver 3.4 for debian-linux-gnu at x86_64',
+                   dump_client='mysqldump',
+                   dump_client_version='mysqldump  Ver 10.19 Distrib 10.3.39-MariaDB, for debian-linux-gnu (x86_64)')
+CHARSET_ERROR = "mysqlbinlog: unknown variable 'default-character-set=utf8mb4'"
+
+
+def test_prereqs_binlog_client_that_cannot_start_is_not_a_version_mismatch():
+    facts = dict(MARIADB_103, binlog_client_version='', binlog_client_error=CHARSET_ERROR,
+                 binlog_host_defaults_error=CHARSET_ERROR)
+    checks = by_name(pitr.evaluate_mysql_prereqs(facts))
+    assert 'mysqlbinlog matches the server' not in checks
+    row = checks['mysqlbinlog starts']
+    assert row['status'] == 'fail' and CHARSET_ERROR in row['current']
+    assert '[client]' in row['fix'] and '[mysql]' in row['fix'] and '50-client.cnf' in row['fix']
+    assert 'mariadb:10.3' in row['fix']
+
+
+def test_prereqs_host_option_file_error_only_warns_when_streamer_can_start():
+    # snipe-it / old-website: plain `mysqlbinlog` dies on [client] default-character-set,
+    # `mysqlbinlog --defaults-file=<ours>` (what the streamer runs) is fine
+    facts = dict(MARIADB_103, binlog_host_defaults_error=CHARSET_ERROR)
+    checks = pitr.evaluate_mysql_prereqs(facts)
+    rows = by_name(checks)
+    assert rows['mysqlbinlog reads the host option files']['status'] == 'warn'
+    assert 'default-character-set' in rows['mysqlbinlog reads the host option files']['fix']
+    assert rows['mysqlbinlog matches the server']['status'] == 'ok'
+    assert pitr.prereqs_ok(checks)
+
+
+def test_binlog_start_hint_generic():
+    assert "'ssl-mode'" in pitr.binlog_start_hint("mysqlbinlog: unknown variable 'ssl-mode=REQUIRED'",
+                                                  '10.3.39-MariaDB')
+    assert 'fix the error above' in pitr.binlog_start_hint('Segmentation fault', '')
+
+
+@pytest.mark.parametrize('facts, status, text', [
+    ({'uid': '0', 'user_name': 'root'}, 'ok', 'root'),
+    ({'uid': '1000', 'user_name': 'azureuser', 'sudo_uid': '0'}, 'ok', 'sudo -n works'),
+    ({'uid': '1000', 'user_name': 'bk', 'sudo_error': 'sudo: a password is required'}, 'fail',
+     'password is required'),
+    ({'uid': '1000', 'user_name': 'bk', 'sudo_uid': '1001'}, 'fail', 'no passwordless sudo'),  # not to root
+    ({'uid': '1000', 'user_name': 'bk'}, 'fail', 'no passwordless sudo'),
+    ({}, 'fail', 'not checked'),
+    ({'is_root': '1', 'sudo': '1'}, 'fail', 'not checked'),  # unverified flags count for nothing
+])
+def test_root_check_needs_evidence(facts, status, text):
+    pg_base = {'server_version_num': '100023', 'server_version': '10.23', 'wal_level': 'replica', 'glibc': '2.27'}
+    for evaluate, base in ((pitr.evaluate_mysql_prereqs, GOOD_MYSQL), (pitr.evaluate_pg_prereqs, pg_base)):
+        merged = {k: v for k, v in base.items() if k not in ('uid', 'user_name')}
+        row = by_name(evaluate(dict(merged, **facts)))['Root or passwordless sudo']
+        assert row['status'] == status and text in row['current'], (evaluate.__name__, row)
+
+
+def _stub(directory, name, body):
+    path = directory / name
+    path.write_text('#!/bin/sh\n' + body)
+    path.chmod(0o755)
+
+
+@pytest.mark.skipif(BASH is None or sys.platform == 'win32', reason='needs bash on a POSIX host')
+@pytest.mark.parametrize('sudo_ok', [False, True])
+def test_mysql_prereq_script_measures_sudo_and_binlog_start(tmp_path, sudo_ok):
+    """Run the real prerequisite script against stub programs: a MariaDB 10.3 host whose
+    [client] section breaks plain mysqlbinlog, reached as a non-root SSH user."""
+    _stub(tmp_path, 'id', 'case "$1" in -u) echo 1000;; -un) echo bk;; -gn) echo bk;; *) echo "uid=1000(bk)";; esac\n')
+    _stub(tmp_path, 'sudo', 'echo 0; exit 0\n' if sudo_ok else 'echo "sudo: a password is required" >&2; exit 1\n')
+    _stub(tmp_path, 'mysqlbinlog',
+          'case "$1" in --defaults-file=*) ;; *) echo "' + CHARSET_ERROR + '" >&2; exit 7;; esac\n'
+          'for a; do [ "$a" = --version ] && echo "mysqlbinlog Ver 3.4 for debian-linux-gnu at x86_64"; done\n'
+          'exit 0\n')
+    _stub(tmp_path, 'mysqldump', 'echo "' + MARIADB_103['dump_client_version'] + '"\n')
+    _stub(tmp_path, 'mysql', 'for a; do last="$a"; done\n'
+          'case "$last" in *"SHOW GRANTS"*) echo "' + MARIADB_103['grants'].rstrip('|') + '"; exit 0;; esac\n'
+          'printf "version\\t10.3.39-MariaDB\\nuser\\tbk@localhost\\nlog_bin\\t1\\nbinlog_format\\tROW\\n'
+          'server_id\\t1\\nbinlog_expire_seconds\\t172800\\n"\n')
+    _stub(tmp_path, 'docker', 'exit 1\n')
+    env = dict(os.environ, PATH=f'{tmp_path}{os.pathsep}{os.environ.get("PATH", "")}')
+    proc = subprocess.run([BASH, '-s'], input=scripts.mysql_prereq_script(dict(DB_CONFIG, docker_container='')),
+                          capture_output=True, text=True, env=env, timeout=60)
+    facts = pitr.parse_kv_output(proc.stdout)
+    assert facts.get('uid') == '1000' and facts.get('user_name') == 'bk', proc.stdout + proc.stderr
+    checks = by_name(pitr.evaluate_mysql_prereqs(facts))
+    root = checks['Root or passwordless sudo']
+    if sudo_ok:
+        assert root['status'] == 'ok' and 'sudo -n works' in root['current']
+    else:
+        assert root['status'] == 'fail' and 'password is required' in root['current']
+    assert 'default-character-set' in facts['binlog_host_defaults_error']
+    assert 'binlog_client_error' not in facts                       # the --defaults-file run started
+    assert checks['mysqlbinlog matches the server']['status'] == 'ok'
+    assert checks['mysqlbinlog reads the host option files']['status'] == 'warn'
+
+
+def test_streamer_runs_mysqlbinlog_with_only_its_own_option_file():
+    lines = [line for line in scripts.STREAMER_SCRIPT.splitlines() if 'pitr_client' in line and '"$BINLOG"' in line]
+    assert len(lines) == 2
+    for line in lines:
+        # --defaults-file must be the first option; --no-defaults + --defaults-extra-file is rejected
+        assert '"$BINLOG" --defaults-file="$CNF"' in line, line
+        assert '--defaults-extra-file' not in line and '--no-defaults' not in line
+    assert scripts.STREAMER_VERSION != '1'  # changed content: installed hosts get the new script + restart
+
+
+# ---------------------------------------------------------------------------
+# WAL-G: an idle server is not lagging
+# ---------------------------------------------------------------------------
+
+DSPACE_IDLE = {  # DSpace 2026-10-31 13:41 UTC: nothing written since 3D was archived at 12:19
+    'archiver_last_archived_wal': '00000001000000020000003D', 'archiver_last_archived_time': '1793449186',
+    'archiver_failed_count': '0', 'archiver_last_failed_wal': '', 'archiver_last_failed_epoch': '',
+    'current_wal_file': '00000001000000020000003D',  # pg_walfile_name('2/3E000000'): segment boundary
+    'current_wal_lsn': '2/3E000000', 'wal_segment_size': '16777216',
+}
+
+
+def test_walg_archiver_health_idle_open_backlog_failing():
+    h = pitr.walg_archiver_health(DSPACE_IDLE)
+    assert h['idle'] and h['pending'] == 0 and not h['failing']
+    h = pitr.walg_archiver_health(dict(DSPACE_IDLE, current_wal_file='00000001000000020000003E'))
+    assert not h['idle'] and h['pending'] == 1                  # open segment, archived at archive_timeout
+    h = pitr.walg_archiver_health(dict(DSPACE_IDLE, current_wal_file='000000010000000200000041'))
+    assert h['pending'] == 4
+    h = pitr.walg_archiver_health(dict(DSPACE_IDLE, archiver_last_archived_wal='0000000100000002000000FF',
+                                       current_wal_file='000000010000000300000000'))
+    assert h['pending'] == 1                                    # crosses the xlogid boundary (16 MB segments)
+    h = pitr.walg_archiver_health(dict(DSPACE_IDLE, wal_segment_size='',
+                                       current_wal_file='00000001000000020000003E'))
+    assert h['pending'] == 1                                    # default 16 MB when unknown
+    h = pitr.walg_archiver_health(dict(DSPACE_IDLE, archiver_failed_count='3',
+                                       archiver_last_failed_wal='00000001000000020000003E',
+                                       archiver_last_failed_epoch='1793449800',
+                                       current_wal_file='00000001000000020000003E'))
+    assert h['failing'] and not h['idle'] and 'archive_command failing' in h['detail']
+    # an old failure followed by successes is history, not a failure
+    h = pitr.walg_archiver_health(dict(DSPACE_IDLE, archiver_failed_count='1',
+                                       archiver_last_failed_epoch='1793440000'))
+    assert not h['failing'] and h['idle']
+    h = pitr.walg_archiver_health(dict(DSPACE_IDLE, current_wal_file=''))
+    assert h['pending'] is None and not h['idle']               # unknown position: time-based lag as before
+
+
+def test_derive_state_complete_at_extends_freshness():
+    window = [{'chain_id': 1, 'reason': 'start', 'from': T0, 'to': T0 + timedelta(minutes=10), 'anchored': True,
+               'anchor_ids': []}]
+    now = T0 + timedelta(minutes=90)
+    assert pitr.derive_state(True, True, window, now, 25)[0] == pitr.STATE_LAGGING
+    idle = [dict(window[0], complete_at=(now - timedelta(minutes=2)).isoformat())]
+    state_, _, lag = pitr.derive_state(True, True, idle, now, 25)
+    assert state_ == pitr.STATE_OK and round(lag) == 2
+    stale = [dict(window[0], complete_at=(now - timedelta(minutes=40)).isoformat())]  # ticks stopped
+    assert pitr.derive_state(True, True, stale, now, 25)[0] == pitr.STATE_LAGGING
+
+
+PG_NOW = datetime(2026, 10, 31, 13, 45, tzinfo=UTC)
+PG_FACTS = dict(DSPACE_IDLE, server_version_num='100023', server_version='10.23', wal_level='replica',
+                archive_mode='on', archive_command='/usr/local/bin/wal-g-archive.sh %p', archive_timeout='15min')
+
+
+def _pg_tick_env(monkeypatch, facts, rows, mirror_ok=True):
+    from app import pitr_service as ps
+    import app.main as main
+    r2 = dict(TARGET, id='st2', name='Cloudflare R2', endpoint='r2.example.com')
+    job = dict(JOB, id='dspace', name='Dspace DB', backup_prefix='dspace')
+    sent, mirrored = [], []
+    monkeypatch.setattr(ps, 'load_state', lambda job_id: dict(rows))
+    monkeypatch.setattr(ps, 'save_state', lambda job_id, **kw: rows.update(kw))
+    monkeypatch.setattr(main, 'send_notification', lambda *a: sent.append(a))
+    monkeypatch.setattr(ps, '_now', lambda: PG_NOW)
+
+    def fake_run(server, script, timeout):
+        if 'backup-list' in script:
+            out = json.dumps([{'start_time': '2026-10-31T12:04:42.160314Z'}])
+        else:
+            out = '\n'.join(f'PITR\t{k}\t{v}' for k, v in facts.items())
+        return subprocess.CompletedProcess([], 0, out, '')
+    monkeypatch.setattr(ps, '_run', fake_run)
+
+    def fake_mirror(prefix, primary, others):
+        mirrored.append(prefix)
+        return [{'storage': 'Cloudflare R2', 'ok': mirror_ok, 'error': '' if mirror_ok else 'AccessDenied'}]
+    monkeypatch.setattr(ps, '_mirror_wal', fake_mirror)
+    targets = [dict(TARGET), r2]
+    t = targets[0]
+    info = {'walg_version': 'wal-g version v2.0.1',
+            'walg_env_hash': ps._hash(t['endpoint'], t['bucket'], t['access_key'], t['secret_key'], 'dspace'),
+            'verify_at': '2026-10-31T13:30:00+00:00', 'integrity': 'OK'}
+    rows.update({'kind': 'postgres', 'info': json.dumps(info), 'last_tick_at': T0, 'state': pitr.STATE_LAGGING,
+                 'alerted_state': pitr.STATE_LAGGING, 'streamer_active': 'active'})
+    return ps, job, targets, sent, mirrored
+
+
+def test_pg_tick_idle_server_recovers_and_records_a_ship(monkeypatch):
+    rows = {}
+    ps, job, targets, sent, mirrored = _pg_tick_env(monkeypatch, PG_FACTS, rows)
+    ok, message = ps._pg_tick('dspace', job, dict(SERVER), {'type': 'postgresql'}, targets)
+    assert ok and 'idle' in message
+    assert rows['state'] == pitr.STATE_OK and rows['lag_minutes'] == 0
+    assert rows.get('last_ship_at') is not None
+    assert mirrored == ['dspace'] and rows['last_error'] is None
+    assert [s[2] for s in sent] == ['recovered']                    # it had alerted "lagging"
+    assert rows['alerted_state'] is None
+    # the window end stays the real last archived time (what a restore can replay to)
+    assert pitr._utc(rows['window_end']) == pitr._utc(1793449186)
+
+
+def test_pg_tick_failing_archiver_is_lagging_with_reason(monkeypatch):
+    rows = {}
+    facts = dict(PG_FACTS, current_wal_file='00000001000000020000003E', archiver_failed_count='7',
+                 archiver_last_failed_wal='00000001000000020000003E', archiver_last_failed_epoch='1793452000',
+                 archiver_last_failed_time='2026-10-31 13:06:40+00')
+    ps, job, targets, sent, _ = _pg_tick_env(monkeypatch, facts, rows)
+    rows.update(state=pitr.STATE_OK, alerted_state=None)
+    ps._pg_tick('dspace', job, dict(SERVER), {'type': 'postgresql'}, targets)
+    assert rows['state'] == pitr.STATE_LAGGING and rows['streamer_active'] == 'failing'
+    assert 'archive_command failing' in rows['last_error'] and 'last_ship_at' not in rows
+    assert [s[2] for s in sent] == ['failed'] and 'archive_command failing' in sent[0][3]
+
+
+def test_pg_tick_mirror_failure_is_not_a_ship(monkeypatch):
+    rows = {}
+    ps, job, targets, sent, _ = _pg_tick_env(monkeypatch, PG_FACTS, rows, mirror_ok=False)
+    rows.update(state=pitr.STATE_OK, alerted_state=None)
+    ps._pg_tick('dspace', job, dict(SERVER), {'type': 'postgresql'}, targets)
+    assert 'last_ship_at' not in rows and 'WAL mirror failed' in rows['last_error']
+    assert rows['state'] == pitr.STATE_OK                           # the primary still has every WAL
+
+
+def test_pg_tick_writing_server_keeps_time_based_lag(monkeypatch):
+    rows = {}
+    facts = dict(PG_FACTS, current_wal_file='00000001000000020000003E')  # data written, not archived yet
+    ps, job, targets, sent, _ = _pg_tick_env(monkeypatch, facts, rows)
+    ps._pg_tick('dspace', job, dict(SERVER), {'type': 'postgresql'}, targets)
+    assert rows['state'] == pitr.STATE_LAGGING                      # 86 min since the last archive
+    assert json.loads(rows['info'])['idle_at'] is None

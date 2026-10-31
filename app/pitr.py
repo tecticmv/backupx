@@ -262,6 +262,30 @@ def _grants_have(grants, privilege):
     return 'ALL PRIVILEGES ON *.*' in text or bool(re.search(r'\b' + privilege + r'\b', text))
 
 
+def _sql_string(value):
+    """A MySQL single-quoted string literal."""
+    return "'" + str(value).replace('\\', '\\\\').replace("'", "''") + "'"
+
+
+def mysql_account(current_user):
+    """CURRENT_USER() ('user@host', host may be %, an IP, a netmask or a name) -> "'user'@'host'".
+
+    The user name may itself contain '@', the host never does, so split at the
+    last one. Already quoted forms ('u'@'h', `u`@`h`) are unwrapped first.
+    """
+    text = (current_user or '').strip()
+    if not text:
+        return "'user'@'%'"
+    match = re.fullmatch(r"""(['`"])(.*)\1@(['`"])(.*)\3""", text)
+    if match:
+        user, host = match.group(2), match.group(4)
+    elif '@' in text:
+        user, host = text.rsplit('@', 1)
+    else:
+        user, host = text, '%'
+    return f'{_sql_string(user)}@{_sql_string(host or "%")}'
+
+
 def evaluate_mysql_prereqs(facts, mode='direct', client_image=''):
     """Turn what the prerequisite script found into a table of checks.
 
@@ -325,31 +349,52 @@ def evaluate_mysql_prereqs(facts, mode='direct', client_image=''):
             'next dump. Managed services may not allow changing it.'))
 
     grants = facts.get('grants', '')
+    account = mysql_account(facts.get('user', ''))
     for privilege, why in (('REPLICATION SLAVE', 'stream binary logs'),
                            ('REPLICATION CLIENT', 'list binary logs (SHOW BINARY LOGS)')):
         alt = 'REPLICATION REPLICA' if privilege == 'REPLICATION SLAVE' else 'BINLOG MONITOR'
         ok = _grants_have(grants, privilege) or _grants_have(grants, alt)
         checks.append(_check(f'Privilege {privilege}', 'ok' if ok else 'fail', 'granted' if ok else 'missing',
                              f'needed to {why}',
-                             '' if ok else f"GRANT {privilege} ON *.* TO '{facts.get('user', 'user')}'@'%';"))
+                             '' if ok else f"GRANT {privilege} ON *.* TO {account};"))
     reload_ok = _grants_have(grants, 'RELOAD') or _grants_have(grants, 'BACKUP_ADMIN')
     checks.append(_check('Privilege RELOAD', 'ok' if reload_ok else 'warn', 'granted' if reload_ok else 'missing',
                          'consistent dump position (--source-data)',
                          '' if reload_ok else
-                         "GRANT RELOAD ON *.* TO the backup user. Without it the nightly dump can't record "
+                         f"GRANT RELOAD ON *.* TO {account}; Without it the nightly dump can't record "
                          "its binlog position (it falls back to a plain dump and PITR stays unanchored)."))
 
     _append_host_checks(checks, facts, mode, client_image, server_version=version)
     return checks
 
 
+def root_check(facts, purpose):
+    """'Root or passwordless sudo' from what the check script measured on the host.
+
+    Passes only on evidence: `id -u` printed 0, or `sudo -n id -u` printed 0
+    (sudo works without a password AND gives root). Anything else, including
+    the script not reporting at all, fails.
+    """
+    name = 'Root or passwordless sudo'
+    uid = (facts.get('uid') or '').strip()
+    user = (facts.get('user_name') or '').strip()
+    sudo_uid = (facts.get('sudo_uid') or '').strip()
+    who = f"{user or '?'} (uid {uid})" if uid else ''
+    if not uid:
+        return _check(name, 'fail', 'not checked (no uid reported)', purpose,
+                      'The check script could not run `id -u` on the server; check the SSH user.')
+    if uid == '0':
+        return _check(name, 'ok', f'{who}: root', purpose)
+    if sudo_uid == '0':
+        return _check(name, 'ok', f'{who}: sudo -n works', purpose)
+    error = (facts.get('sudo_error') or '').strip()
+    return _check(name, 'fail', f"{who}: no passwordless sudo" + (f' ({error[:200]})' if error else ''), purpose,
+                  'Use root for this server, or allow this user passwordless sudo '
+                  f"(e.g. '{user or 'USER'} ALL=(ALL) NOPASSWD: ALL' in /etc/sudoers.d/).")
+
+
 def _append_host_checks(checks, facts, mode, client_image, server_version=''):
-    is_root = facts.get('is_root') == '1'
-    sudo = facts.get('sudo') == '1'
-    checks.append(_check('Root or passwordless sudo', 'ok' if (is_root or sudo) else 'fail',
-                         'root' if is_root else ('sudo -n works' if sudo else 'neither'),
-                         'install the systemd unit and /etc/backupx-pitr',
-                         '' if (is_root or sudo) else 'Use root for this server or allow passwordless sudo.'))
+    checks.append(root_check(facts, 'install the systemd unit and /etc/backupx-pitr'))
     systemd = facts.get('systemd') == '1'
     checks.append(_check('systemd', 'ok' if systemd else 'fail', 'yes' if systemd else 'no', 'systemd host',
                          '' if systemd else 'The streamer runs as a systemd unit.'))
@@ -362,11 +407,22 @@ def _append_host_checks(checks, facts, mode, client_image, server_version=''):
                              '' if docker else 'Install docker, or clear the client image to use local binaries.'))
     client = facts.get('binlog_client', '')
     client_version = facts.get('binlog_client_version', '')
+    start_error = (facts.get('binlog_client_error') or '').strip()
+    host_defaults_error = (facts.get('binlog_host_defaults_error') or '').strip()
+    if client and host_defaults_error:
+        checks.append(_check('mysqlbinlog reads the host option files', 'warn', host_defaults_error[:300],
+                             'starts with the host my.cnf', binlog_start_hint(host_defaults_error, server_version) +
+                             ' backupx runs it with --defaults-file (only its own option file), so the streamer '
+                             'is not affected; this only matters when you run it by hand.'))
     if not client:
         suggestion = suggested_client_image(server_version)
         checks.append(_check('mysqlbinlog', 'fail', 'not found', 'mysqlbinlog / mariadb-binlog',
                              'Install the client matching the server' +
                              (f', or set the client image to {suggestion}' if suggestion else '') + '.'))
+    elif start_error and not client_version.strip():
+        # It never got as far as printing its version: that's not a version mismatch
+        checks.append(_check('mysqlbinlog starts', 'fail', start_error[:300], f'{client} --version runs',
+                             binlog_start_hint(start_error, server_version)))
     elif server_version:
         server_flav = server_flavor(server_version)
         dump_version = facts.get('dump_client_version', '')
@@ -400,6 +456,21 @@ def _append_host_checks(checks, facts, mode, client_image, server_version=''):
     if free is not None:
         checks.append(_check('Free space for the spool', 'ok' if free >= 2048 else 'warn', f'{free} MB',
                              '2 GB+ under /var/lib', '' if free >= 2048 else 'Binlogs queue here if shipping stalls.'))
+
+
+def binlog_start_hint(error, server_version=''):
+    """Fix hint for a binlog client that exits before doing anything (option file / install problems)."""
+    suggestion = suggested_client_image(server_version)
+    image = f' or set the client image to {suggestion}' if suggestion else ''
+    match = re.search(r"unknown (?:variable|option) '?-*([A-Za-z0-9_-]+)", error or '')
+    if match and match.group(1).replace('_', '-') == 'default-character-set':
+        return ("mysqlbinlog doesn't accept default-character-set, which the [client] section of the host's "
+                "option files sets (MariaDB 10.3: /etc/mysql/mariadb.conf.d/50-client.cnf and "
+                "50-mysql-clients.cnf). Move it from [client] to [mysql] and [mysqldump]" + image + '.')
+    if match:
+        return (f"An option file sets '{match.group(1)}', which this mysqlbinlog doesn't know. Move it from "
+                "[client] to the sections of the programs that use it" + image + '.')
+    return 'mysqlbinlog fails to start; fix the error above' + image + '.'
 
 
 def _dump_client_check(facts, server_version):
@@ -756,7 +827,10 @@ def derive_state(enabled, has_run, windows, now, lag_minutes, streamer_live=True
         previous = next((w for w in reversed(windows[:-1]) if w['anchored']), None)
         state = STATE_UNANCHORED if current['reason'] == 'start' else STATE_BROKEN
         return state, previous, None
-    lag = (_utc(now) - current['to']).total_seconds() / 60 if current['to'] else None
+    # complete_at: the source verified nothing newer than 'to' exists yet (an idle
+    # PostgreSQL has no new WAL to archive), so the window is current up to then.
+    fresh = max((t for t in (current['to'], _utc(current.get('complete_at'))) if t), default=None)
+    lag = max(0.0, (_utc(now) - fresh).total_seconds() / 60) if fresh else None
     if lag is None or lag > lag_minutes or not streamer_live:
         return STATE_LAGGING, current, lag
     return STATE_OK, current, lag
@@ -929,6 +1003,54 @@ def postgres_conf_changes(archive_timeout=900):
     ]
 
 
+_WAL_NAME = re.compile(r'^([0-9A-F]{8})([0-9A-F]{8})([0-9A-F]{8})$')
+
+
+def _wal_position(name, segment_size):
+    """WAL file name -> (timeline, absolute segment number), or None."""
+    match = _WAL_NAME.match((name or '').strip().upper())
+    if not match:
+        return None
+    tli, log, seg = (int(x, 16) for x in match.groups())
+    return tli, log * (0x100000000 // segment_size) + seg
+
+
+def walg_archiver_health(facts):
+    """Is the PostgreSQL archiver keeping up? From pg_stat_archiver + the current WAL position.
+
+    Returns {'idle', 'pending', 'failing', 'detail'}:
+      idle     everything written so far is archived: the segment holding the current
+               write position is the last archived one (an idle server writes nothing,
+               so archive_timeout never switches WAL and the last archive time just ages)
+      pending  segments between the last archived one and the current one (1 = only the
+               open segment, archived at archive_timeout / when full; None = unknown)
+      failing  archive_command failed after the last success (pg_stat_archiver)
+    """
+    try:
+        size = int(facts.get('wal_segment_size') or 0) or 16 * 1024 * 1024
+    except ValueError:
+        size = 16 * 1024 * 1024
+    last = _wal_position(facts.get('archiver_last_archived_wal'), size)
+    current = _wal_position(facts.get('current_wal_file'), size)
+    pending = None
+    if last and current and last[0] == current[0]:
+        pending = max(0, current[1] - last[1])
+    failed_at = _int_or_none(facts.get('archiver_last_failed_epoch'))
+    archived_at = _int_or_none(facts.get('archiver_last_archived_time'))
+    failing = failed_at is not None and (archived_at is None or failed_at > archived_at)
+    if failing:
+        detail = (f"archive_command failing: last failed WAL {facts.get('archiver_last_failed_wal') or '?'} "
+                  f"at {facts.get('archiver_last_failed_time') or '?'} "
+                  f"({facts.get('archiver_failed_count') or '?'} failures); check the PostgreSQL log")
+    elif pending is None:
+        detail = 'current WAL position unknown'
+    elif pending == 0:
+        detail = f"idle: nothing written since {facts.get('archiver_last_archived_wal')} was archived"
+    else:
+        detail = f'{pending} segment(s) not archived yet (current {facts.get("current_wal_file")})'
+    return {'idle': pending == 0 and not failing, 'pending': pending, 'failing': failing, 'detail': detail}
+
+
 def evaluate_pg_prereqs(facts):
     checks = []
     if facts.get('connect_error') or not facts.get('server_version_num'):
@@ -966,11 +1088,7 @@ def evaluate_pg_prereqs(facts):
         t = 0
     checks.append(_check('archive_timeout', 'ok' if 0 < t <= 900 else 'warn', timeout or '0', '900 (15 min)',
                          '' if 0 < t <= 900 else 'archive_timeout = 900 then SELECT pg_reload_conf().'))
-    is_root = facts.get('is_root') == '1'
-    sudo = facts.get('sudo') == '1'
-    checks.append(_check('Root or passwordless sudo', 'ok' if (is_root or sudo) else 'fail',
-                         'root' if is_root else ('sudo -n works' if sudo else 'neither'),
-                         'install wal-g and /etc/wal-g', '' if (is_root or sudo) else 'Use root or passwordless sudo.'))
+    checks.append(root_check(facts, 'install wal-g and /etc/wal-g'))
     build = walg_build_for(facts.get('glibc', ''), major or None)
     checks.append(_check('WAL-G build', 'ok' if build else 'fail', facts.get('glibc', 'unknown glibc'),
                          'glibc 2.27+ amd64', f'{build[0]} {build[1]}' if build else 'No WAL-G build for this host.'))
