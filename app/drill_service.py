@@ -1,20 +1,28 @@
 """
 Restore drills: the weekly "can we really restore it?" proof for PITR jobs.
 
-Task `restore_drill` (one job) / `restore_drill_all` (the weekly schedule, one job
-at a time, off-hours): checksum production (read-only) -> wait until the
-binlogs/WAL covering "now" are shipped -> scratch restore to that second on the
-backupx server (the P2 restore machinery, never production) -> checksum the copy
--> checksum production again -> compare (app.drill.compare) -> remove the copy.
+Backups only - a drill never connects to production (no SSH, no SQL, no PITR
+tick; tests/test_drill.py enforces it). Task `restore_drill` (one job) /
+`restore_drill_all` (the weekly schedule, one job at a time, off-hours), all on
+the backupx server with the P2 scratch-restore machinery, one scratch copy at a
+time:
+
+  A. newest anchored dump alone (MySQL/MariaDB) / newest WAL-G base backup alone
+     (PostgreSQL, recovery_target = immediate) -> checksum every table -> remove;
+  B. point-in-time restore to that backup's own point (dump + binlogs to the
+     anchor time / base + WAL to the base's finish time) -> checksum -> remove;
+     A and B must match (app.drill.compare_copies);
+  C. point-in-time restore to the latest shipped point -> must apply cleanly,
+     start, and every table must answer COUNT(*) -> remove.
+
 The result goes to health_probes `drill:<job>` (dashboard "last verified
 restore") and the job history; a failed drill sends a critical alert and shows
-up as a health issue.
+up as a health issue. Not enough scratch disk = skipped with a warning.
 """
 
 import json
 import logging
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from . import drill as d, restore as r, restore_scripts as rs, tasks
 
@@ -60,91 +68,106 @@ def _save(job_id, result):
     health_service.save_probe(PROBE_PREFIX + job_id, result)
 
 
-def _prod(job, db_config, server, body, timeout):
-    res = _svc().prod_sql(job, db_config, server, body, timeout=timeout)
+def _scratch_sql(row, engine, body, timeout):
+    info = _svc()._json(row.get('info'), {})
+    script = rs.PREAMBLE + rs.scratch_runner(engine, row['container'], info.get('superuser') or 'postgres') + body
+    res = _svc().capture_local(script, timeout=timeout)
     return r.parse_marked_output(res.stdout), res
 
 
-def _list_tables(job, db_config, server, engine, databases):
+def _list_tables(row, engine, databases):
+    """Base tables of a scratch copy: [(db, table, estimated rows)]."""
     if engine == r.ENGINE_POSTGRES:
         dbs = databases
         if not dbs:
-            marked, _ = _prod(job, db_config, server, rs.RUN_SQL + 'run_sql dbs "" ' + rs.q(
+            marked, _ = _scratch_sql(row, engine, rs.RUN_SQL + 'run_sql dbs "" ' + rs.q(
                 'SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY 1') + '\n', 120)
             dbs = [x.strip() for x in (marked.get('dbs') or (1, []))[1] if x.strip()]
         body = rs.RUN_SQL + ''.join(f'run_sql {rs.q("t:" + db)} {rs.q(db)} {rs.q(d.list_tables_sql(engine, []))}\n'
                                     for db in dbs)
     else:
         body = rs.RUN_SQL + f'run_sql t "" {rs.q(d.list_tables_sql(engine, databases))}\n'
-    marked, res = _prod(job, db_config, server, body, 300)
+    marked, res = _scratch_sql(row, engine, body, 300)
     tables = []
     for label, (rc, lines) in marked.items():
         if label.startswith('t'):
             if rc != 0:
-                raise tasks.TaskError('Listing the production tables failed: ' + ' '.join(lines[-2:]))
+                raise tasks.TaskError('Listing the tables of the scratch copy failed: ' + ' '.join(lines[-2:]))
             tables += d.parse_tables(lines)
     if not marked:
-        raise tasks.TaskError('Listing the production tables failed: ' + (res.stderr.strip()[-300:] or 'no output'))
+        raise tasks.TaskError('Listing the tables of the scratch copy failed: '
+                              + (res.stderr.strip()[-300:] or 'no output'))
     return tables
 
 
-def _checksums_prod(job, db_config, server, engine, tables, big):
-    marked, _res = _prod(job, db_config, server, d.checksum_body(engine, tables, big), 6 * 3600)
+def _checksums(row, engine, tables, big):
+    marked, _res = _scratch_sql(row, engine, d.checksum_body(engine, tables, big), 6 * 3600)
     return d.parse_checksums(marked)
-
-
-def _checksums_scratch(row, engine, tables, big):
-    info = _svc()._json(row.get('info'), {})
-    script = rs.PREAMBLE + rs.scratch_runner(engine, row['container'], info.get('superuser') or 'postgres') + \
-        d.checksum_body(engine, tables, big)
-    res = _svc().capture_local(script, timeout=6 * 3600)
-    return d.parse_checksums(r.parse_marked_output(res.stdout))
 
 
 class DrillSkipped(Exception):
     """The drill can't run here right now (not enough scratch disk): a warning, not a failed drill."""
 
 
-def _disk_precheck(svc, job_id):
-    """Refuse early (before reading production) when the backupx host lacks scratch disk."""
-    try:
-        plan, error = svc.derive_plan({'job_id': job_id, 'point_type': r.POINT_LATEST, 'target': 'scratch'})
-    except Exception as e:  # the real plan below reports restorability problems
-        logger.info(f'Drill disk pre-check for {job_id} could not plan: {e}')
-        return
+def _plan(svc, data):
+    plan, error = svc.derive_plan(dict(data, target='scratch'))
     reason = d.disk_skip_reason(plan, error)
     if reason:
         raise DrillSkipped(reason)
+    if error:
+        raise tasks.TaskError(error)
+    return plan
 
 
-def _wait_shipped(ctx, job_id, target, minutes):
-    from . import pitr_service
-    deadline = time.monotonic() + minutes * 60
-    while True:
-        pitr_service.run_tick(job_id)
-        state = pitr_service.load_state(job_id)
-        end = r.utc(state.get('window_end')) if state.get('window_end') else None
-        if end and end >= target:
-            ctx.log(f'Shipped up to {end.isoformat()}', stream='system')
-            return
-        if time.monotonic() >= deadline:
-            raise tasks.TaskError(f"PITR data doesn't reach {target.isoformat()} after {minutes} min "
-                                  f"(state {state.get('state')}, window end {end})")
-        ctx.log(f"Waiting for the binlogs/WAL up to {target.isoformat()} to be shipped "
-                f"(window ends {end.isoformat() if end else 'nowhere'})", stream='system')
-        if ctx.cancel_event.wait(20):
-            raise tasks.TaskCancelled()
+def _reference(svc, job_id):
+    """The latest point-in-time plan (also the disk pre-check) and the backup the drill compares against."""
+    latest = _plan(svc, {'job_id': job_id, 'point_type': r.POINT_LATEST})
+    if latest['method'] == 'binlog':
+        dump = latest.get('dump') or {}
+        if not dump.get('snapshot_id') or not dump.get('time'):
+            raise tasks.TaskError('the newest anchored dump has no snapshot on this storage')
+        return latest, {'method': 'binlog', 'snapshot_id': dump['snapshot_id'], 'time': dump['time']}
+    if latest['method'] == 'walg':
+        wal = latest.get('wal') or {}
+        if not wal.get('base_backup') or not wal.get('base_time'):
+            raise tasks.TaskError("couldn't list the WAL-G base backups")
+        return latest, {'method': 'walg', 'base_backup': wal['base_backup'], 'time': wal['base_time']}
+    raise tasks.TaskError('point-in-time recovery has no restorable window on this storage (the latest point is '
+                          'a plain snapshot)')
+
+
+def _restore(ctx, svc, job, plan, label):
+    restore_id = tasks.new_id()
+    row = svc.create_row({
+        'id': restore_id, 'job_id': job['id'], 'job_name': job.get('name'), 'engine': plan['engine'],
+        'point_type': plan['point_type'], 'snapshot_id': (plan.get('dump') or {}).get('snapshot_id'),
+        'target_time': svc._naive(plan.get('target_time')), 'storage_id': plan['storage']['id'],
+        'target_type': 'scratch', 'server': 'backupx', 'container': r.container_name(restore_id), 'plan': plan,
+        'info': {'drill': label, 'compare_production': False}, 'status': r.S_RUNNING,
+        'created_by': ctx.created_by or 'restore-drill', 'task_id': ctx.id})
+    return svc.do_scratch(ctx, row, verify_production=False)
+
+
+def _drop(svc, ctx, row):
+    if row is None:
+        return
+    try:
+        svc.remove_scratch(row, log=lambda t: ctx.log(t, stream='system'))
+    finally:
+        svc.update_row(row['id'], status=r.S_REMOVED)
 
 
 def run_drill(ctx, job_id):
-    """One drill. Returns the result dict (also saved); raises on infrastructure errors only after saving."""
+    """One drill. Returns the result dict (also saved); never touches production."""
     svc = _svc()
     cfg = d.settings()
     started = _now()
-    result = {'job_id': job_id, 'started_at': started.isoformat(), 'ok': False, 'task_id': ctx.id}
-    row = None
+    result = {'job_id': job_id, 'started_at': started.isoformat(), 'ok': False, 'task_id': ctx.id,
+              'mode': 'backup-vs-backup'}
+    current = None
     try:
-        job, db_config, server, engine, state = svc.job_context(job_id)
+        job, db_config, _server, engine, _state = svc.job_context(job_id)
+        job = dict(job, id=job.get('id') or job_id)
         result['job_name'] = job.get('name')
         if not job.get('pitr_enabled'):
             raise tasks.TaskError('point-in-time recovery is off for this job')
@@ -153,49 +176,64 @@ def run_drill(ctx, job_id):
         ctx.add_secret(*_m()._job_secret_values(job, _m().get_job_storage_targets(job)),
                        db_config.get('password') or '')
         databases = r.configured_databases(db_config)
-        ctx.progress(3, 'Drill: checking free disk for the scratch copy')
-        _disk_precheck(svc, job_id)
-        ctx.progress(5, 'Drill: listing production tables')
-        tables = _list_tables(job, db_config, server, engine, databases)[:cfg['max_tables']]
         configured = svc.verify_config(job).get('drill_count_only_tables') or []
+
+        ctx.progress(3, 'Drill: planning (and checking free disk for the scratch copies)')
+        latest, ref = _reference(svc, job_id)
+        storage_id = latest['storage']['id']
+        result.update(target_time=ref['time'], method=ref['method'], storage=latest['storage'].get('name'))
+
+        # A: the backup alone
+        if ref['method'] == 'binlog':
+            plan_a = _plan(svc, {'job_id': job_id, 'point_type': r.POINT_SNAPSHOT,
+                                 'snapshot_id': ref['snapshot_id'], 'storage_id': storage_id})
+            what_a = f"dump snapshot {ref['snapshot_id'][:8]} alone"
+        else:
+            plan_a = _plan(svc, {'job_id': job_id, 'point_type': 'time', 'target_time': ref['time'],
+                                 'storage_id': storage_id})
+            plan_a['recovery_target'] = 'immediate'
+            plan_a['wal'] = dict(plan_a.get('wal') or {}, base_backup=ref['base_backup'])
+            what_a = f"base backup {ref['base_backup']} alone (recovery_target immediate)"
+        ctx.progress(10, f'Drill A: restoring the {what_a}')
+        current = _restore(ctx, svc, job, plan_a, 'A')
+        engine = current.get('engine') or engine
+        tables = _list_tables(current, engine, databases)[:cfg['max_tables']]
         big = d.count_only_keys(engine, tables, configured, cfg['max_table_rows'])
         per_job = sorted(set(configured) & big)
         ctx.log(f'{len(tables)} tables ({len(big)} compared by row count only'
                 + (f"; per job setting: {', '.join(per_job)}" if per_job else '') + ')', stream='system')
-        ctx.progress(10, 'Drill: checksumming production (read-only)')
-        before = _checksums_prod(job, db_config, server, engine, tables, big)
-        target = (_now() + timedelta(seconds=1)).replace(microsecond=0) + timedelta(seconds=1)
-        while _now() < target:
-            time.sleep(0.2)
-        result['target_time'] = target.isoformat()
-        ctx.progress(20, f'Drill: waiting until {target.isoformat()} is shipped')
-        _wait_shipped(ctx, job_id, target, cfg['ship_wait_minutes'])
-        plan, error = svc.derive_plan({'job_id': job_id, 'point_type': 'time', 'target_time': target.isoformat(),
-                                       'target': 'scratch'})
-        reason = d.disk_skip_reason(plan, error)
-        if reason:
-            raise DrillSkipped(reason)
-        if error:
-            raise tasks.TaskError(error)
-        restore_id = tasks.new_id()
-        row = svc.create_row({
-            'id': restore_id, 'job_id': job_id, 'job_name': job.get('name'), 'engine': plan['engine'],
-            'point_type': 'time', 'snapshot_id': (plan.get('dump') or {}).get('snapshot_id'),
-            'target_time': svc._naive(target), 'storage_id': plan['storage']['id'], 'target_type': 'scratch',
-            'server': 'backupx', 'container': r.container_name(restore_id), 'plan': plan,
-            'info': {'drill': True}, 'status': r.S_RUNNING, 'created_by': ctx.created_by or 'restore-drill',
-            'task_id': ctx.id})
-        result['restore_id'] = restore_id
-        ctx.progress(30, f"Drill: scratch restore to {target.isoformat()} ({plan['method']})")
-        row = svc.do_scratch(ctx, row)
-        engine = row.get('engine') or engine
-        ctx.progress(80, 'Drill: checksumming the restored copy')
-        restored = _checksums_scratch(row, engine, tables, big)
-        ctx.progress(90, 'Drill: checksumming production again')
-        after = _checksums_prod(job, db_config, server, engine, tables, big)
-        comparison = d.compare(before, after, restored)
-        result.update(ok=comparison['ok'], comparison=comparison, method=plan['method'],
-                      storage=plan['storage'].get('name'))
+        ctx.progress(30, 'Drill A: checksumming the copy')
+        a = _checksums(current, engine, tables, big)
+        _drop(svc, ctx, current)
+        current = None
+
+        # B: the point-in-time path to the same point
+        ctx.progress(40, f"Drill B: point-in-time restore to {ref['time']} (the backup's own point)")
+        plan_b = _plan(svc, {'job_id': job_id, 'point_type': 'time', 'target_time': ref['time'],
+                             'storage_id': storage_id})
+        current = _restore(ctx, svc, job, plan_b, 'B')
+        ctx.progress(60, 'Drill B: checksumming the copy')
+        b = _checksums(current, engine, tables, big)
+        # tables only B has (created by replayed events) count as differences too
+        b_tables = {f'{t[0]}.{t[1]}' for t in _list_tables(current, engine, databases)}
+        for key in sorted(b_tables - set(a)):
+            b[key] = 'present'
+        _drop(svc, ctx, current)
+        current = None
+        comparison = d.compare_copies(a, b)
+
+        # C: the latest shipped point applies cleanly and every table reads
+        ctx.progress(70, f"Drill C: point-in-time restore to the latest point {latest.get('target_time')}")
+        plan_c = _plan(svc, {'job_id': job_id, 'point_type': 'time', 'target_time': latest['target_time'],
+                             'storage_id': storage_id})
+        current = _restore(ctx, svc, job, plan_c, 'C')
+        c_tables = _list_tables(current, engine, databases)[:cfg['max_tables']]
+        ctx.progress(90, f'Drill C: reading {len(c_tables)} tables')
+        counts = _checksums(current, engine, c_tables, {f'{t[0]}.{t[1]}' for t in c_tables})
+        _drop(svc, ctx, current)
+        current = None
+        latest_check = dict(d.readable(counts), target_time=latest.get('target_time'))
+        result.update(ok=comparison['ok'] and latest_check['ok'], comparison=comparison, latest=latest_check)
     except tasks.TaskCancelled:
         result['error'] = 'cancelled'
         raise
@@ -205,9 +243,11 @@ def run_drill(ctx, job_id):
     except Exception as e:
         result['error'] = _m().sanitize_error_message(str(e) or type(e).__name__, 500)
     finally:
-        if row is not None:
-            svc.remove_scratch(row, log=lambda t: ctx.log(t, stream='system'))
-            svc.update_row(row['id'], status=r.S_REMOVED)
+        if current is not None:
+            try:
+                _drop(svc, ctx, current)
+            except Exception as e:
+                logger.error(f'Drill: removing scratch copy {current.get("id")} failed: {e}')
         result['finished_at'] = _now().isoformat()
         result['duration_s'] = int((_now() - started).total_seconds())
         result['summary'] = d.summary(result)
@@ -306,12 +346,15 @@ def serialize(result):
     if not result:
         return None
     keys = ('ok', 'started_at', 'finished_at', 'target_time', 'summary', 'method', 'storage', 'duration_s',
-            'task_id', 'error', 'skipped', 'warning')
+            'task_id', 'error', 'skipped', 'warning', 'mode')
     out = {k: result.get(k) for k in keys}
     c = result.get('comparison') or {}
     out['tables_compared'] = c.get('compared')
     out['tables'] = c.get('tables')
-    out['mismatches'] = c.get('mismatches') or []
+    out['mismatches'] = [{'table': m.get('table'), 'production': m.get('backup', m.get('production')),
+                          'restored': m.get('pitr', m.get('restored'))} for m in (c.get('mismatches') or [])]
+    latest = result.get('latest') or {}
+    out['latest'] = {k: latest.get(k) for k in ('ok', 'tables', 'errors', 'target_time')} if latest else None
     return out
 
 

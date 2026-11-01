@@ -1495,15 +1495,18 @@ def _exec_unlock_lock(ctx, plan, issue):
 
 
 @fix('restore_drill', health.TIER_SAFE, 'Run the drill again',
-     'Restores the job into a scratch copy on the backupx server and compares it with production.', order=85)
+     'Restores the newest backup alone and the point-in-time chain to the same point into scratch copies on the '
+     'backupx server and compares them (backups only, never production).', order=85)
 def _plan_restore_drill(issue):
     job = _job_of(issue)
     if not job.get('pitr_enabled'):
         raise NotApplicable('PITR is off for this job')
     return _plan('restore_drill', f"Restore drill of {job.get('name')}",
-                 ['Checksum production (read-only)', 'Scratch restore to a recent second on the backupx server',
-                  'Checksum the copy and production again, compare quiet tables', 'Remove the copy'],
-                 downtime='None (reads production; the copy runs on the backupx server)',
+                 ['Scratch restore of the newest backup alone, checksum it',
+                  "Point-in-time restore to the same point, checksum and compare"
+                  'Point-in-time restore to the latest point: must apply cleanly and read',
+                  'Remove each copy'],
+                 downtime='None (backups only; production is not contacted)',
                  details={'job': job.get('name')})
 
 

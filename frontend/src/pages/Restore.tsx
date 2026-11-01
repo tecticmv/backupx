@@ -84,6 +84,7 @@ export default function Restore() {
   const [pointType, setPointType] = useState<PointType>(snapshotParam ? "snapshot" : "latest");
   const [timeMs, setTimeMs] = useState<number | null>(null);
   const [target, setTarget] = useState<RestoreTarget>("scratch");
+  const [compareProduction, setCompareProduction] = useState(true);
 
   // ---------- the loaded restore (polled while it runs) ----------
   const [restoreState, setRestoreState] = useState<{ id: string; data: RestoreRecord | null; error: string | null } | null>(null);
@@ -237,7 +238,12 @@ export default function Restore() {
         planRequest.point_type === "latest" && plan.plan.target_time
           ? { target_time: plan.plan.target_time }
           : {};
-      const response = await startRestore({ ...planRequest, ...echo, plan_hash: plan.plan_hash });
+      const response = await startRestore({
+        ...planRequest,
+        ...echo,
+        plan_hash: plan.plan_hash,
+        ...(target === "scratch" ? { compare_production: compareProduction } : {}),
+      });
       const data = (await response.json().catch(() => ({}))) as RestoreStartResponse;
       if (response.ok && data.task) {
         track(data.task, { autoDownload: target === "download" });
@@ -460,6 +466,8 @@ export default function Restore() {
               error={startError}
               starting={starting}
               onStart={start}
+              compareProduction={compareProduction}
+              onCompareProductionChange={setCompareProduction}
             />
           )}
         </TabsContent>

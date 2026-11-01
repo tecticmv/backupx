@@ -541,7 +541,8 @@ def start_restore(data, user=None, ip=None):
         'target_type': 'scratch' if plan['target'] == r.TARGET_SCRATCH else 'download', 'server': 'backupx',
         'container': r.container_name(restore_id) if plan['engine'] in r.DB_ENGINES and kind == 'restore_scratch'
         else None,
-        'plan': plan, 'info': {'files_target': 'scratch'} if kind == 'restore_files_paths' else {},
+        'plan': plan, 'info': ({'files_target': 'scratch'} if kind == 'restore_files_paths' else
+                               {'compare_production': (data or {}).get('compare_production', True) is not False}),
         'status': r.S_RUNNING, 'created_by': user,
     })
     if kind == 'restore_files_paths':
@@ -747,7 +748,10 @@ def _scratch_walg(ctx, row, plan, job, db_config, target, work):
     ctx.add_secret(env['AWS_SECRET_ACCESS_KEY'], env['AWS_ACCESS_KEY_ID'])
     ctx.step(1, 5, 'Choosing the base backup')
     backups, err = walg_backups(job, target)
-    base = _pick_base(backups, target_time)
+    immediate = plan.get('recovery_target') == 'immediate'
+    wanted = (plan.get('wal') or {}).get('base_backup') if immediate else None
+    base = next((b for b in backups if b.get('backup_name') == wanted), None) if wanted else \
+        _pick_base(backups, target_time)
     if not base:
         raise tasks.TaskError(err or f'No base backup finished before {r.fmt_time(target_time)}')
     pgdata = os.path.join(work, 'pgdata')
@@ -773,7 +777,9 @@ def _scratch_walg(ctx, row, plan, job, db_config, target, work):
             f.write(f'{k}={rs.q(v)}\n')
     t = target_time.strftime('%Y-%m-%d %H:%M:%S+00')
     restore_cmd = "restore_command = '/var/lib/postgresql/data/backupx-walg/fetch.sh \"%f\" \"%p\"'\n"
-    settings = (restore_cmd + f"recovery_target_time = '{t}'\nrecovery_target_action = 'promote'\n")
+    # immediate: stop as soon as the base backup is consistent (the base alone, for restore drills)
+    target_line = "recovery_target = 'immediate'\n" if immediate else f"recovery_target_time = '{t}'\n"
+    settings = restore_cmd + target_line + "recovery_target_action = 'promote'\n"
     try:
         is_old = int(major.split('.')[0]) < 12
     except ValueError:
@@ -830,8 +836,17 @@ def _scratch_files(ctx, row, plan, job, target, work):
     return {'host_dir': host_dir}
 
 
-def do_scratch(ctx, row):
-    """Run the scratch restore of `row` (status running -> ready). Cleans up on failure; raises."""
+def compares_production(row):
+    """Whether a scratch restore's checks also read production row counts (default yes; per restore)."""
+    return _json(row.get('info'), {}).get('compare_production', True) is not False
+
+
+def do_scratch(ctx, row, verify_production=True):
+    """Run the scratch restore of `row` (status running -> ready). Cleans up on failure; raises.
+
+    verify_production=False (restore drills, or the restore's compare_production=false) checks the copy
+    alone: production is never queried.
+    """
     cfg = r.settings()
     plan = _json(row['plan'], {})
     job, db_config, server, engine, state = job_context(row['job_id'])
@@ -860,9 +875,12 @@ def do_scratch(ctx, row):
                    work_dir=info.get('host_dir'))
         row = get_row(row['id'])
         if engine in r.DB_ENGINES:
-            ctx.log('BACKUPX-STEP 4/4 Comparing row counts with production', stream='system')
+            with_prod = verify_production and compares_production(row)
+            ctx.log('BACKUPX-STEP 4/4 ' + ('Comparing row counts with production' if with_prod
+                                           else 'Counting rows in the copy (production not queried)'),
+                    stream='system')
             try:
-                verify = run_verify(row, phase='scratch')
+                verify = run_verify(row, phase='scratch', production=with_prod)
                 update_row(row['id'], verify=verify)
                 ctx.log(_verify_line(verify), stream='system')
             except Exception as e:
@@ -939,6 +957,10 @@ def _parse_verify(out, engine):
     return est, exact, check, errors, dbs
 
 
+class _NotQueried(Exception):
+    pass
+
+
 def prod_sql(job, db_config, server, body, timeout=600):
     m = _m()
     if not server:
@@ -948,8 +970,11 @@ def prod_sql(job, db_config, server, body, timeout=600):
     return m._ssh_run(m._build_ssh_cmd_for_server(server, timeout=30), script, timeout=timeout)
 
 
-def run_verify(row, phase='scratch'):
-    """Compare the scratch copy with production. Returns the verify dict (never raises on prod errors)."""
+def run_verify(row, phase='scratch', production=True):
+    """Compare the scratch copy with production. Returns the verify dict (never raises on prod errors).
+
+    production=False: the copy's counts only (prod_error says production wasn't queried).
+    """
     job, db_config, server, engine, state = job_context(row['job_id'])
     engine = row.get('engine') or engine  # the dump header may have corrected it (MariaDB)
     info = _json(row.get('info'), {})
@@ -965,6 +990,8 @@ def run_verify(row, phase='scratch'):
         update_row(row['id'], info=info)
     p_est, p_exact, p_check, prod_error = {}, {}, None, None
     try:
+        if not production:
+            raise _NotQueried()
         res = prod_sql(job, db_config, server, body)
         p_est, p_exact, p_check, p_errors, _ = _parse_verify(r.parse_marked_output(res.stdout), engine)
         if res.returncode != 0 and not p_est:
@@ -972,6 +999,8 @@ def run_verify(row, phase='scratch'):
                                                      f'exit {res.returncode}')
         elif p_errors and not p_est:
             prod_error = _m().sanitize_error_message(p_errors[0])
+    except _NotQueried:
+        prod_error = 'not compared: production is not queried for this restore'
     except Exception as e:
         prod_error = _m().sanitize_error_message(str(e))
     secrets_ = _m()._job_secret_values(job)
@@ -1016,7 +1045,7 @@ def _task_verify(ctx):
     ctx.add_secret(*_m()._job_secret_values(job))
     ctx.step(1, 1, 'Comparing row counts')
     phase = 'after_replace' if row['status'] == r.S_REPLACED else 'scratch'
-    verify = run_verify(row, phase=phase)
+    verify = run_verify(row, phase=phase, production=phase == 'after_replace' or compares_production(row))
     update_row(row['id'], verify=verify)
     return {'message': _verify_line(verify), 'restore_id': row['id']}
 

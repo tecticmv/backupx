@@ -25,6 +25,8 @@ export interface DrillResult {
   tables_compared: number | null;
   tables: number | null;
   mismatches: { table: string; production: string; restored: string | null }[];
+  mode?: string | null;
+  latest?: { ok: boolean; tables: number; errors: string[]; target_time: string | null } | null;
 }
 
 interface DrillInfo {
@@ -93,8 +95,9 @@ export default function RestoreDrillCard({ jobId }: { jobId: string }) {
           Restore drill <DrillBadge result={last} />
         </CardTitle>
         <CardDescription>
-          Restores this job into a scratch copy on the backupx server to a recent second and compares every table
-          that didn&apos;t change meanwhile with production (checksums).{" "}
+          Backups only, never production: restores the newest nightly backup alone and the point-in-time chain to
+          the same point into scratch copies on the backupx server and compares every table (checksums), then checks
+          that a restore to the latest point applies cleanly.{" "}
           {info?.enabled ? `Runs weekly (cron ${info.cron}).` : "Weekly drills are off (RESTORE_DRILL_ENABLED)."}
         </CardDescription>
         <CardAction>
@@ -116,7 +119,8 @@ export default function RestoreDrillCard({ jobId }: { jobId: string }) {
               <ul className="list-disc pl-5 text-destructive">
                 {last.mismatches.map((m) => (
                   <li key={m.table}>
-                    {m.table}: production {m.production}, restored {m.restored ?? "missing"}
+                    {m.table}: {last.mode === "backup-vs-backup" ? "backup" : "production"} {m.production},{" "}
+                    {last.mode === "backup-vs-backup" ? "point-in-time" : "restored"} {m.restored ?? "missing"}
                   </li>
                 ))}
               </ul>

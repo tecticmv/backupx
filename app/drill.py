@@ -1,12 +1,17 @@
 """
 Restore drills: pure helpers (no I/O).
 
-A drill proves a PITR job can really be restored: it checksums the job's tables
-in production (read-only), restores the job into a scratch copy on the backupx
-server to the time right after that, checksums the copy, and checksums
-production again. A table that didn't change between the two production reads
-("quiet") must be identical in the copy, or the drill fails. Tables written to
-during the drill can't be compared exactly (they're reported, not judged).
+A drill proves a PITR job can really be restored, using backups only - it never
+connects to production:
+
+  A. the newest anchored nightly dump (MySQL/MariaDB) / WAL-G base backup
+     (PostgreSQL, recovery_target = immediate) restored alone into a scratch copy;
+  B. the point-in-time path (the same dump + binlogs / base + WAL) restored to
+     that backup's own point (the dump's anchor time / the base's finish time);
+  A and B must be identical table by table (CHECKSUM TABLE; row counts for big
+  tables and the job's drill_count_only_tables);
+  C. a point-in-time restore to the latest shipped point must apply cleanly,
+     start, and every table in it must be readable.
 """
 
 import os
@@ -31,8 +36,6 @@ def settings():
         # Tables estimated larger than this are compared by row count only (checksums read every row)
         'max_table_rows': _env_int('RESTORE_DRILL_MAX_TABLE_ROWS', 5_000_000),
         'max_tables': _env_int('RESTORE_DRILL_MAX_TABLES', 2000),
-        # Minutes to wait for the binlogs/WAL covering the drill time to be shipped
-        'ship_wait_minutes': _env_int('RESTORE_DRILL_SHIP_WAIT', 20),
     }
 
 
@@ -149,31 +152,36 @@ def disk_skip_reason(plan, error):
     return None
 
 
-def compare(before, after, restored):
-    """Judge a drill. before/after: production checksums around the restore; restored: the copy.
+def compare_copies(a, b):
+    """Judge A (backup alone) vs B (point-in-time path to the same point).
 
-    Returns {ok, compared, quiet, changed: [...], mismatches: [...], missing: [...], errors: [...]}.
+    Returns {ok, compared, identical, tables, mismatches: [...], missing: [...], errors: [...]}.
     """
-    quiet, changed, mismatches, missing, errors = [], [], [], [], []
-    for table, b in sorted(before.items()):
-        a = after.get(table)
-        got = restored.get(table)
-        if b is None or a is None:
+    mismatches, missing, errors = [], [], []
+    for table, va in sorted(a.items()):
+        if va is None:
             errors.append(table)
             continue
-        if a != b:
-            changed.append(table)
-            continue
-        quiet.append(table)
-        if table not in restored:
+        if table not in b:
             missing.append(table)
-        elif got != b:
-            mismatches.append({'table': table, 'production': b, 'restored': got})
-    ok = not mismatches and not missing and not errors
-    identical = len(quiet) - len(mismatches) - len(missing)
-    return {'ok': ok, 'compared': len(quiet), 'identical': identical, 'quiet': len(quiet), 'changed': changed[:50],
-            'mismatches': mismatches[:50], 'missing': missing[:50], 'errors': errors[:50],
-            'tables': len(before)}
+            continue
+        vb = b.get(table)
+        if vb is None:
+            errors.append(table)
+        elif vb != va:
+            mismatches.append({'table': table, 'backup': va, 'pitr': vb})
+    extra = sorted(set(b) - set(a))
+    ok = not mismatches and not missing and not errors and not extra
+    compared = len(a) - len(errors)
+    return {'ok': ok, 'compared': compared, 'identical': compared - len(mismatches) - len(missing),
+            'tables': len(a), 'mismatches': mismatches[:50], 'missing': missing[:50], 'errors': errors[:50],
+            'extra': extra[:50]}
+
+
+def readable(counts):
+    """C: every table of the latest-point copy must answer a COUNT(*). {ok, tables, errors}."""
+    errors = sorted(t for t, v in counts.items() if v is None)
+    return {'ok': bool(counts) and not errors, 'tables': len(counts), 'errors': errors[:50]}
 
 
 def summary(result):
@@ -182,14 +190,23 @@ def summary(result):
     if result.get('error'):
         return f"failed: {result['error']}"
     c = result.get('comparison') or {}
-    text = (f"{c.get('identical', c.get('compared', 0))} of {c.get('tables', 0)} tables identical to production at "
-            f"{result.get('target_time')}")
-    if c.get('changed'):
-        text += f"; {len(c['changed'])} changed during the drill (not compared)"
+    text = (f"{c.get('identical', 0)} of {c.get('tables', 0)} tables identical between the backup alone and "
+            f"the point-in-time restore to {result.get('target_time')}")
     if c.get('mismatches'):
         text += f"; {len(c['mismatches'])} DIFFER: " + ', '.join(m['table'] for m in c['mismatches'][:5])
     if c.get('missing'):
-        text += f"; missing in the copy: {', '.join(c['missing'][:5])}"
+        text += f"; missing after point-in-time restore: {', '.join(c['missing'][:5])}"
+    if c.get('extra'):
+        text += f"; only after point-in-time restore: {', '.join(c['extra'][:5])}"
+    if c.get('errors'):
+        text += f"; unreadable: {', '.join(c['errors'][:5])}"
+    latest = result.get('latest') or {}
+    if latest:
+        if latest.get('ok'):
+            text += f"; latest point {latest.get('target_time')} restored cleanly ({latest.get('tables')} tables readable)"
+        else:
+            text += (f"; latest point {latest.get('target_time')} NOT readable: "
+                     + ', '.join((latest.get('errors') or [])[:5]))
     return text
 
 

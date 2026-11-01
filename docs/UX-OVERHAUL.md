@@ -670,24 +670,31 @@ manual image there).
 job, `POST /api/jobs/:id/restore-drill`, also the safe health fix
 `restore_drill`) and `restore_drill_all` (leader cron `RESTORE_DRILL_CRON`,
 default Saturday 03:30 scheduler TZ; one job at a time; `RESTORE_DRILL_ENABLED`
-default true). Checksum production read-only (`CHECKSUM TABLE`; PostgreSQL md5
-of the ordered row md5s; tables over `RESTORE_DRILL_MAX_TABLE_ROWS` 5 M by
-count), wait until that second is shipped (`RESTORE_DRILL_SHIP_WAIT` 20 min),
-scratch restore on the backupx server (P2 machinery), checksum the copy and
-production again; every table that didn't change between the two production
-reads must match exactly. Result: `health_probes` `drill:<job>`, a history
+default true). Backups only, never production (since 2026-11-02; see
+`docs/PITR-VERIFICATION.md`): scratch copy A = newest anchored dump alone /
+WAL-G base alone (`recovery_target = 'immediate'`), B = point-in-time restore to
+that backup's own point, compared table by table (`CHECKSUM TABLE`; PostgreSQL
+md5 of the ordered row md5s; tables over `RESTORE_DRILL_MAX_TABLE_ROWS` 5 M or in
+`drill_count_only_tables` by count); C = point-in-time restore to the latest
+point must apply cleanly and every table must read. Drill copies use
+`do_scratch(verify_production=False)`. Result: `health_probes` `drill:<job>`, a history
 row, job card "Verified restore", job page drill card; failure -> critical
 alert + issue `restore_drill_failed`.
 
 Per job, `jobs.restore_verify.drill_count_only_tables` (job page "Key tables
 and checks", or `PUT /api/jobs/:id/restore-verify`) lists big tables compared by
-row count instead of a checksum (E-Petition `activity_log`, ~4 GB, so the weekly
-drill doesn't read it all twice on production). A PUT without the key keeps the
-stored list. Before reading production the drill plans a scratch restore of the
-latest point and checks free disk (estimated size x `RESTORE_DISK_FACTOR`); not
-enough disk (there or at the real plan) = drill *skipped* (history `skipped`,
-`warning` in the result, badge "skipped"), not a failed drill: no alert, no
-issue.
+row count instead of a checksum (E-Petition `activity_log`, ~4 GB). A PUT
+without the key keeps the stored list. The drill first plans the latest point
+(the largest of its three restores) and checks free disk (estimated size x
+`RESTORE_DISK_FACTOR`); copies run one at a time, so that one check covers them.
+Not enough disk (there or at any later plan) = drill *skipped* (history
+`skipped`, `warning` in the result, badge "skipped"), not a failed drill: no
+alert, no issue.
+
+Scratch restores started from the wizard take `compare_production` (default
+true; checkbox on the Start step): false = the Verify step counts rows in the
+copy only and never queries production (also for *Re-check*); kept in
+`restores.info.compare_production`.
 
 ### Health hooks
 

@@ -1,6 +1,8 @@
 import { AlertTriangle, Download, Info, Loader2, Play } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
 import PlanSummary from "@/components/restore/PlanSummary";
 import { formatUtc } from "@/lib/restore";
 import type { PlanResponse, RestoreTarget } from "@/types/restore";
@@ -16,11 +18,15 @@ interface RunStartProps {
   error: string | null;
   starting: boolean;
   onStart: () => void;
+  /** Scratch database restores: compare with production afterwards (reads production row counts). */
+  compareProduction?: boolean;
+  onCompareProductionChange?: (value: boolean) => void;
 }
 
 /** Step 4 before anything runs: the final plan and the Start button. */
 export default function RunStart(props: RunStartProps) {
   const { target, scriptTime, plan, planLoading, planError, notice, error, starting, onStart } = props;
+  const { compareProduction, onCompareProductionChange } = props;
 
   if (target === "download" && scriptTime) {
     return (
@@ -65,6 +71,21 @@ export default function RunStart(props: RunStartProps) {
           <AlertTitle>Could not start</AlertTitle>
           <AlertDescription>{error}</AlertDescription>
         </Alert>
+      )}
+      {target === "scratch" && plan?.plan && plan.plan.engine !== "files" && onCompareProductionChange && (
+        <div className="flex items-start gap-2">
+          <Checkbox
+            id="restore-compare-production"
+            checked={compareProduction ?? true}
+            onCheckedChange={(v) => onCompareProductionChange(v === true)}
+          />
+          <div className="grid gap-1">
+            <Label htmlFor="restore-compare-production">Compare row counts with production afterwards</Label>
+            <p className="text-xs text-muted-foreground">
+              Runs read-only count queries on the production database. Untick to check the restored copy only.
+            </p>
+          </div>
+        </div>
       )}
       <div className="flex justify-end">
         <Button onClick={onStart} disabled={!canStart}>

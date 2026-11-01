@@ -85,6 +85,8 @@ export interface RestorePlanRequest {
   storage_id?: string | null;
   target: RestoreTarget;
   plan_hash?: string;
+  /** Scratch restores: also compare row counts with production afterwards (reads production). Default true. */
+  compare_production?: boolean;
 }
 
 export interface RestorePlan {

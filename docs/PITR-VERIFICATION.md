@@ -48,10 +48,37 @@ absent, the last rotation's rows present. Earlier P2/P3 rigs add MySQL 8.4 + GTI
 percona client on a systemd host, MariaDB 10.3/10.11 host and docker installs and PostgreSQL 10
 (WAL-G) restores to the exact second.
 
-Restore drill (`e2e_drill.py`, MySQL 8.4 job): clean drill passes (2 of 2 tables identical, job
-card shows *verified*); a production change made with `sql_log_bin=0` -> the drill fails naming
-`app.t2`, critical alert, health issue `restore_drill_failed`; the drill's statements on
-production were all reads (`CHECKSUM TABLE`, SELECT); scratch copies removed.
+Restore drill, first version (`e2e_drill.py`, MySQL 8.4 job): it compared production with a
+scratch copy (2 of 2 tables identical; a `sql_log_bin=0` change was caught). **Replaced on
+2026-11-02 by the backup-only drill below**: production is no longer read at all.
+
+### Restore drill: backups only (since 2026-11-02)
+
+A drill never connects to production (no SSH, no SQL, no PITR tick); everything runs on the
+backupx server from what is already in the repositories, one scratch copy at a time:
+
+| Step | MySQL / MariaDB | PostgreSQL (WAL-G) | Judged |
+|---|---|---|---|
+| A | newest anchored nightly dump alone | newest base backup alone (`recovery_target = 'immediate'`) | checksums taken |
+| B | same dump + binlogs to the dump's anchor time | same base + WAL to the base's finish time | every table identical to A (`CHECKSUM TABLE` / ordered md5; row count for big tables and `drill_count_only_tables`); tables only in B count as differences |
+| C | dump + binlogs to the latest shipped point | base + WAL to the latest archived point | restore applies without error, server starts, every table answers `COUNT(*)` |
+
+Pass = A and B identical and C clean. Disk: the plan of the latest point (the largest of the
+three) is checked first; too little free disk = drill *skipped* with a warning (no alert, no
+issue). Copies are removed after each step and on any failure. `tests/test_drill.py` replaces
+every production helper (`prod_sql`, ssh, `run_tick`, `run_verify`) with a failing stub and
+checks the drill never calls one, and that `app/drill_service.py` doesn't reference them.
+
+What it proves: the backups and the point-in-time machinery (restic, binlog decoding with the
+pinned client image, WAL fetch/replay, scratch server images) reproduce the nightly backup
+exactly and reach the latest point cleanly. What it no longer proves: that the binlog stream
+contains *every* production change (e.g. `sql_log_bin=0` writes) - that needed a production
+read and is out of scope by decision; the scratch restore's optional production row-count
+comparison (restore wizard) still offers that check on demand.
+
+Edge: a MySQL transaction whose statements started before the dump began but committed after
+its binlog position would be replayed in B (its event time is before the anchor time) and show
+as a difference; rare, and reported by table so it can be judged.
 
 Mid-chain upgrades (same data directory, new server image):
 
@@ -70,8 +97,8 @@ everything still restored correctly.
 
 ## Guarantees (enforced in code, tested)
 
-**(a) Backup, streaming, prerequisite, health, verify and drill paths only read
-production.** `tests/test_prod_safety.py` renders every script these paths send
+**(a) Backup, streaming, prerequisite, health and verify paths only read
+production; restore drills don't connect to production at all.** `tests/test_prod_safety.py` renders every script these paths send
 and fails on any statement other than SELECT / SHOW / SET SESSION and on any
 DDL/DML/GRANT/SET GLOBAL/FLUSH/RESET/PURGE/CHANGE MASTER/START REPLICA keyword.
 The matrix additionally records what actually reached each server
@@ -83,7 +110,7 @@ read-consistency statements:
 | `SET SESSION ...`, `SET NAMES`, `SET optimizer_switch` (no GLOBAL) | client/dump session settings | every connection |
 | `START TRANSACTION WITH CONSISTENT SNAPSHOT`, `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT` | `mysqldump --single-transaction`: one consistent read | nightly dump |
 | `FLUSH TABLES`, `FLUSH TABLES WITH READ LOCK`, `UNLOCK TABLES` | `--source-data=2` / `--master-data=2`: a global read lock held only while the binlog position is read (milliseconds when no long query runs; a long-running query delays it) | anchored nightly dump only |
-| `CHECKSUM TABLE` | restore drill (reads every row) | weekly drill |
+| `CHECKSUM TABLE` | restore drill - on the scratch copies only since 2026-11-02, never on production | weekly drill |
 
 backupx never runs `FLUSH BINARY LOGS`, `PURGE BINARY LOGS` or `RESET MASTER`
 (the e2e harness flushes binlogs as root to force rotations; that is not
@@ -121,18 +148,18 @@ credentials reach them on stdin into the tmpfs, never in argv or env.
 
 - A restore is only as good as the binlogs: changes made with `sql_log_bin=0`
   (or filtered out of the binlog) are not in point-in-time restores. The
-  drill detects this for tables that were quiet during the drill (tested).
+  backup-only drill can't detect this (it would need a production read).
 - Binlogs the server purged before the streamer read them (DigitalOcean keeps
   ~10-15 min) are a gap: the chain breaks until the next anchored dump (alerted).
 - The anchored dump's `FLUSH TABLES WITH READ LOCK` waits for running queries;
   on a server with very long queries it can stall writes briefly. If FTWRL is
   not allowed, the dump falls back to a plain one and PITR goes unanchored
   (alerted), never failing the backup.
-- `CHECKSUM TABLE` values are compared between the same server version (the
-  scratch image matches production); tables written to during a drill are
-  reported, not judged; tables above `RESTORE_DRILL_MAX_TABLE_ROWS` or in the
-  job's `drill_count_only_tables` are compared by row count only. A drill
-  without enough scratch disk on the backupx host is skipped with a warning.
+- Drill checksums compare two scratch copies built from the same scratch
+  image; tables above `RESTORE_DRILL_MAX_TABLE_ROWS` or in the job's
+  `drill_count_only_tables` are compared by row count only. A drill without
+  enough scratch disk on the backupx host is skipped with a warning. A drill
+  restores the job three times (A, B, C), so it takes about 3x one restore.
 - PostgreSQL (WAL-G) is covered by the P2/P3 rigs (PostgreSQL 10, exact-time
   restore, maintenance flow); PostgreSQL 12+ restore layout (`recovery.signal`)
   is not tested end to end.
@@ -148,9 +175,10 @@ credentials reach them on stdin into the tmpfs, never in argv or env.
    client, Koha the host MariaDB 10.6 client, DSpace WAL-G). Nothing about
    their streaming, dumps or configuration changes.
 2. **Weekly restore drill** (`RESTORE_DRILL_ENABLED=true`, Saturday 03:30
-   scheduler time, one job at a time, scratch copy on the backupx server,
-   critical alert on failure, *Verified restore* on the job card). Run one by
-   hand from each PITR job's page right after the deploy.
+   scheduler time, one job at a time, backups only - scratch copies on the
+   backupx server, nothing on production; critical alert on failure, *Verified
+   restore* on the job card). Run one by hand from each PITR job's page right
+   after the deploy.
 3. **Switch one job at a time to automatic matching** after it has a passing
    drill: PITR setup wizard -> only the *Match the client tools* item ->
    apply; then watch the next ticks, the next nightly anchored dump and the

@@ -258,7 +258,9 @@ export default function RestoreVerify({ restore, onChanged }: RestoreVerifyProps
             {verify?.prod_error && (
               <Alert>
                 <AlertTriangle className="h-4 w-4" />
-                <AlertTitle>Production couldn't be queried</AlertTitle>
+                <AlertTitle>
+                  {verify.prod_error.startsWith("not compared") ? "Not compared with production" : "Production couldn't be queried"}
+                </AlertTitle>
                 <AlertDescription className="break-words">
                   {verify.prod_error} The restored copy is still usable; only the comparison is missing.
                 </AlertDescription>

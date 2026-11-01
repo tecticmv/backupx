@@ -246,7 +246,7 @@ one any time from the job page (*Run drill now*).
 | `PITR_MANAGED_HOSTS` | (empty) | extra regex of managed database hosts (built in: DigitalOcean, RDS, Azure, Aiven, PlanetScale) |
 | `CREDENTIAL_TTL` | 900 | seconds a one-time admin login waits for its task |
 | `RESTORE_DRILL_ENABLED` / `RESTORE_DRILL_CRON` | true / `30 3 * * 6` | weekly restore drills |
-| `RESTORE_DRILL_MAX_TABLE_ROWS` / `RESTORE_DRILL_SHIP_WAIT` | 5000000 / 20 | larger tables compared by count / minutes to wait for shipping |
+| `RESTORE_DRILL_MAX_TABLE_ROWS` | 5000000 | larger tables compared by count (drills compare backups only, never production) |
 
 Per job: *Point-in-time recovery* toggle, *Ship every (minutes)* (1–60),
 *Keep (days)* (1–365), *Client image*.
