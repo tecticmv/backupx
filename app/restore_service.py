@@ -688,6 +688,8 @@ def _scratch_dump(ctx, row, plan, job, db_config, target, work, engine):
         raise tasks.TaskError('No .sql.gz dump in the snapshot')
     header = _read_header(dump)
     version = r.server_version_from_dump(header)
+    if engine == r.ENGINE_MYSQL and 'mariadb' in (version or '').lower():
+        engine = r.ENGINE_MARIADB  # configured as mysql, the dump says MariaDB
     image = plan.get('image') or r.scratch_image(engine, version)
     if not image:
         image = 'mysql:8.4' if engine == r.ENGINE_MYSQL else ('mariadb:11.4' if engine == r.ENGINE_MARIADB else None)
@@ -695,7 +697,7 @@ def _scratch_dump(ctx, row, plan, job, db_config, target, work, engine):
         raise tasks.TaskError("Can't tell the PostgreSQL version from the dump header")
     ctx.log(f'Dump: {os.path.basename(dump)}; server version {version or "unknown"}; scratch image {image}',
             stream='system')
-    info = {'server_version': version, 'image': image}
+    info = {'server_version': version, 'image': image, 'engine': engine}
     d_args = rs.docker_args(row['id'], job['id'])
     if engine == r.ENGINE_POSTGRES:
         dbs = r.configured_databases(db_config)
@@ -829,6 +831,7 @@ def do_scratch(ctx, row):
     cfg = r.settings()
     plan = _json(row['plan'], {})
     job, db_config, server, engine, state = job_context(row['job_id'])
+    engine = row.get('engine') or engine  # the dump header may have corrected it (MariaDB)
     target = _storage(job, row.get('storage_id'))
     ctx.add_secret(*_m()._job_secret_values(job, [target]))
     work = os.path.join(cfg['work_dir'], row['id'])
@@ -846,6 +849,9 @@ def do_scratch(ctx, row):
                 info = _scratch_files(ctx, row, plan, job, target, work)
             else:
                 raise tasks.TaskError(f'unknown restore method {method}')
+        if info.get('engine') and info['engine'] != engine:
+            engine = info['engine']
+            update_row(row['id'], engine=engine)
         update_row(row['id'], info=dict(_json(row.get('info'), {}), **info),
                    work_dir=info.get('host_dir'))
         row = get_row(row['id'])
@@ -941,6 +947,7 @@ def prod_sql(job, db_config, server, body, timeout=600):
 def run_verify(row, phase='scratch'):
     """Compare the scratch copy with production. Returns the verify dict (never raises on prod errors)."""
     job, db_config, server, engine, state = job_context(row['job_id'])
+    engine = row.get('engine') or engine  # the dump header may have corrected it (MariaDB)
     info = _json(row.get('info'), {})
     cfg = verify_config(job, engine)
     key_tables, _bad = r.normalize_key_tables(cfg['key_tables'], engine)
@@ -1019,6 +1026,7 @@ def _task_download(ctx):
     row = _row_or_fail(ctx)
     plan = _json(row['plan'], {})
     job, db_config, server, engine, state = job_context(row['job_id'])
+    engine = row.get('engine') or engine  # the dump header may have corrected it (MariaDB)
     target = _storage(job, row.get('storage_id'))
     ctx.add_secret(*_m()._job_secret_values(job, [target]))
     path = plan['dump'].get('path')
@@ -1080,6 +1088,7 @@ def _task_dump(ctx):
         raise tasks.TaskError('This restore has no scratch database any more')
     _require_docker()
     job, db_config, server, engine, state = job_context(row['job_id'])
+    engine = row.get('engine') or engine  # the dump header may have corrected it (MariaDB)
     info = _json(row.get('info'), {})
     dbs = _restored_databases(row, db_config)
     name = f'{ctx.id}.sql.gz'
@@ -1127,6 +1136,7 @@ def replace_plan(row, action='replace'):
     if not row:
         raise RestoreError('Restore not found', 'not_found', 404)
     job, db_config, server, engine, state = job_context(row['job_id'])
+    engine = row.get('engine') or engine  # the dump header may have corrected it (MariaDB)
     if engine not in r.DB_ENGINES:
         raise RestoreError('Only database restores can replace production', 'not_ready', 409)
     if not server:
@@ -1247,6 +1257,7 @@ def do_replace(ctx, row, action, plan, n0=0, m_total=7):
     m = _m()
     cfg = r.settings()
     job, db_config, server, engine, state = job_context(row['job_id'])
+    engine = row.get('engine') or engine  # the dump header may have corrected it (MariaDB)
     targets = m.get_job_storage_targets(job)
     ctx.add_secret(*m._job_secret_values(job, targets))
     databases = plan['production']['databases']
@@ -1504,6 +1515,7 @@ def _task_files(ctx):
         row = do_scratch(ctx, row)
         return {'message': f"Extracted to {row.get('work_dir')} on the backupx server", 'restore_id': row['id']}
     job, db_config, server, engine, state = job_context(row['job_id'])
+    engine = row.get('engine') or engine  # the dump header may have corrected it (MariaDB)
     target = _storage(job, row.get('storage_id'))
     ctx.add_secret(*m._job_secret_values(job, [target]))
     pre_restore = plan['target'] == 'original'

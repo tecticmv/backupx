@@ -196,13 +196,13 @@ for i in $(seq 1 "$WAIT_TRIES"); do
     if [ "$(docker inspect -f '{{{{.State.Running}}}}' "$NAME" 2>/dev/null)" = false ]; then
         docker logs --tail 40 "$NAME" >&2; die "the scratch server exited during recovery"
     fi
-    line=$(docker logs "$NAME" 2>&1 | grep -E 'restored log file|recovery stopping|last completed transaction|database system is ready' | tail -n1)
+    line=$(docker logs "$NAME" 2>&1 | grep -E 'restored log file|recovery stopping|last completed transaction|database system is ready' | tail -n1) || true
     [ -n "$line" ] && [ "$line" != "$last" ] && echo "$line" && last="$line"
     for su in postgres "$ALT_SU"; do
         [ -n "$su" ] || continue
         if [ "$(docker exec "$NAME" psql -X -U "$su" -d postgres -tAc 'select pg_is_in_recovery()' 2>/dev/null)" = f ]; then
             echo "BACKUPX-SUPERUSER $su"
-            docker logs "$NAME" 2>&1 | grep -E 'recovery stopping|last completed transaction|recovery target' | tail -n 3
+            docker logs "$NAME" 2>&1 | grep -E 'recovery stopping|last completed transaction|recovery target' | tail -n 3 || true
             exit 0
         fi
     done
