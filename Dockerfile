@@ -51,6 +51,36 @@ RUN set -eux; \
     rm -f /tmp/restic; \
     restic version
 
+# Restore wizard (P2): the docker CLI drives scratch restore containers on the
+# host daemon (mounted /var/run/docker.sock; the backupx user gets the socket's
+# group via DOCKER_GID in docker-compose.yml), and wal-g restores PostgreSQL
+# PITR base backups. wal-g v2.0.1 (ubuntu-18.04 build) also runs inside the
+# postgres:<major>-bullseye scratch images, where it is copied as restore_command.
+ARG DOCKER_CLI_VERSION=27.5.1
+ARG DOCKER_CLI_SHA256_AMD64=4f798b3ee1e0140eab5bf30b0edc4e84f4cdb53255a429dc3bbae9524845d640
+ARG DOCKER_CLI_SHA256_ARM64=e6b53725a73763ab3f988c73f8772eaed429754c1a579db5ff11f21990fd1817
+ARG WALG_VERSION=v2.0.1
+ARG WALG_SHA256_AMD64=21ee4ad9e1e874d1adf7f7fd3b1a79c3d1c6a754bc7d33c7478118fcdf1950d8
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+    amd64) darch=x86_64; dsha="$DOCKER_CLI_SHA256_AMD64" ;; \
+    arm64) darch=aarch64; dsha="$DOCKER_CLI_SHA256_ARM64" ;; \
+    esac; \
+    curl -fsSL -o /tmp/docker.tgz "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_CLI_VERSION}.tgz"; \
+    echo "$dsha  /tmp/docker.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/docker.tgz -C /tmp docker/docker; \
+    install -m 0755 /tmp/docker/docker /usr/local/bin/docker; \
+    rm -rf /tmp/docker /tmp/docker.tgz; \
+    if [ "$arch" = amd64 ]; then \
+    curl -fsSL -o /tmp/walg.tgz "https://github.com/wal-g/wal-g/releases/download/${WALG_VERSION}/wal-g-pg-ubuntu-18.04-amd64.tar.gz"; \
+    echo "$WALG_SHA256_AMD64  /tmp/walg.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/walg.tgz -C /tmp; \
+    install -m 0755 /tmp/wal-g-pg-ubuntu-18.04-amd64 /usr/local/bin/wal-g; \
+    rm -f /tmp/walg.tgz /tmp/wal-g-pg-ubuntu-18.04-amd64; \
+    fi; \
+    docker --version
+
 # Create non-root user for running the application
 RUN groupadd -r backupx && useradd -r -g backupx -d /app -s /sbin/nologin backupx
 
@@ -66,7 +96,7 @@ COPY static/ ./static/
 COPY --from=frontend-builder /app/frontend/dist/ ./frontend/dist/
 
 # Create directories with proper ownership
-RUN mkdir -p /app/config /app/logs /app/data /home/backupx/.ssh \
+RUN mkdir -p /app/config /app/logs /app/data/restores /home/backupx/.ssh \
     && chown -R backupx:backupx /app /home/backupx
 
 # Switch to non-root user

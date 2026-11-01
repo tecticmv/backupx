@@ -3,6 +3,10 @@ services:
     build: .
     container_name: backup-ui
     restart: unless-stopped
+    # Restore wizard: the backupx user talks to the mounted docker socket. Set
+    # DOCKER_GID to the socket's group id on the host: stat -c %g /var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
     ports:
       - "9090:9090"
     volumes:
@@ -38,6 +42,10 @@ services:
       - RETENTION_DRY_RUN=${RETENTION_DRY_RUN:-false}
       - RETENTION_PRUNE_CRON=${RETENTION_PRUNE_CRON:-0 4 * * sun}
       - RETENTION_PRUNE_MAX_UNUSED=${RETENTION_PRUNE_MAX_UNUSED:-10%}
+      # Restore wizard (scratch restores on this host; see docs/UX-OVERHAUL.md P2)
+      - RESTORE_TTL_HOURS=${RESTORE_TTL_HOURS:-24}
+      - PRE_RESTORE_KEEP_DAYS=${PRE_RESTORE_KEEP_DAYS:-30}
+      - RESTORE_DOCKER_NETWORK=${RESTORE_DOCKER_NETWORK:-}
     depends_on:
       postgres:
         condition: service_healthy
