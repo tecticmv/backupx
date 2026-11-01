@@ -548,9 +548,10 @@ def mysql_restore_script(job, plan, target_time, storage, main_repo, binlog_repo
     base, start_seq = pitr.split_binlog_name(anchor['binlog_file'])
     is_maria = flavor == 'mariadb'
     insecure = ' --insecure-tls' if storage.get('skip_ssl_verify') else ''
-    client = 'mariadb' if is_maria else 'mysql'
-    admin = 'mariadb-admin' if is_maria else 'mysqladmin'
-    dump_tool = 'mariadb-dump' if is_maria else 'mysqldump'
+    from .restore_scripts import mysql_flavor_bits
+    bits = mysql_flavor_bits('mariadb' if is_maria else 'mysql')
+    client, admin, dump_tool = bits['client'], bits['admin'], bits['dump']
+    client_name, dump_name = bits['client_name'], ('mariadb-dump' if is_maria else 'mysqldump')
     root_env = '-e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1' if is_maria else '-e MYSQL_ALLOW_EMPTY_PASSWORD=yes'
     # GTID mode on, so the dump's SET @@GLOBAL.GTID_PURGED loads; the replay itself is by position
     server_args = '' if is_maria else '--gtid-mode=ON --enforce-gtid-consistency=ON'
@@ -670,8 +671,8 @@ docker exec -i "$NAME" {client} -uroot < "$WORK/replay.sql"
 
 echo
 note "Done. The database as of $TARGET_TIME UTC is in container $NAME:"
-echo "   docker exec -it $NAME {client} -uroot"
-echo "   docker exec $NAME {dump_tool} -uroot --all-databases --single-transaction | gzip > restored.sql.gz"
+echo "   docker exec -it $NAME {client_name} -uroot   (mysql on MariaDB < 10.4)"
+echo "   docker exec $NAME {dump_name} -uroot --all-databases --single-transaction | gzip > restored.sql.gz"
 echo "   Remove when finished: docker rm -f $NAME && rm -rf $WORK"
 '''
 

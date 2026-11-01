@@ -151,7 +151,7 @@ def serialize(row):
         if engine == r.ENGINE_POSTGRES:
             hint = f"docker exec -it {container} psql -U {info.get('superuser') or 'postgres'}"
         else:
-            hint = f"docker exec -it {container} {rs.mysql_flavor_bits(engine)['client']} -uroot"
+            hint = f"docker exec -it {container} {rs.mysql_flavor_bits(engine)['client_name']} -uroot"
     elif row.get('work_dir') and row.get('target_type') == 'scratch':
         hint = f"ls {row['work_dir']}   (on the backupx server)"
     now = r.utcnow()

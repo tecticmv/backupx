@@ -52,12 +52,18 @@ def docker_args(restore_id, job_id, network=None, labels_only=False):
 # Scratch database: MySQL / MariaDB
 # ---------------------------------------------------------------------------
 
+def _either(new, old):
+    """`docker exec` program words that run `new` or, if the image lacks it, `old`."""
+    return f"sh -c 'exec \"$(command -v {new} || command -v {old})\" \"$@\"' sh"
+
+
 def mysql_flavor_bits(flavor):
     is_maria = flavor == r.ENGINE_MARIADB
     return {
-        'client': 'mariadb' if is_maria else 'mysql',
-        'admin': 'mariadb-admin' if is_maria else 'mysqladmin',
-        'dump': 'mariadb-dump' if is_maria else 'mysqldump',
+        'client': _either('mariadb', 'mysql') if is_maria else 'mysql',
+        'admin': _either('mariadb-admin', 'mysqladmin') if is_maria else 'mysqladmin',
+        'dump': _either('mariadb-dump', 'mysqldump') if is_maria else 'mysqldump',
+        'client_name': 'mariadb' if is_maria else 'mysql',
         'root_env': '-e MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=1' if is_maria else '-e MYSQL_ALLOW_EMPTY_PASSWORD=yes',
         # GTID on so a dump's SET @@GLOBAL.GTID_PURGED loads; replays go by position
         'server_args': '' if is_maria else '--gtid-mode=ON --enforce-gtid-consistency=ON',
