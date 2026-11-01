@@ -72,7 +72,7 @@ function timeAgo(iso: string | null): string {
 }
 
 /** Live log of one task, polled while it runs. */
-function TaskLog({ task }: { task: Task }) {
+export function TaskLog({ task, className }: { task: Task; className?: string }) {
   const [lines, setLines] = useState<TaskLogLine[]>([]);
   const lastSeq = useRef(0);
   const bottom = useRef<HTMLDivElement>(null);
@@ -107,7 +107,7 @@ function TaskLog({ task }: { task: Task }) {
   }, [lines.length]);
 
   return (
-    <ScrollArea className="h-56 rounded-md border bg-muted/30">
+    <ScrollArea className={cn("h-56 rounded-md border bg-muted/30", className)}>
       <pre className="p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all">
         {lines.length === 0 ? (
           <span className="text-muted-foreground">{active ? "Waiting for output..." : "No output"}</span>

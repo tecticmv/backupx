@@ -1876,8 +1876,11 @@ class BackupRun:
     re-run to some storages, task (a tasks.TaskContext) gets progress/log lines.
     """
 
-    def __init__(self, job_id, run_id=None, trigger='scheduled', storage_ids=None, task=None):
+    def __init__(self, job_id, run_id=None, trigger='scheduled', storage_ids=None, task=None, tags=None):
         self.job_id = job_id
+        # Extra restic tags instead of "automated" (a pre-restore backup: retention
+        # forgets only --tag automated, so these snapshots are never forgotten by it)
+        self.tags = list(tags) if tags else None
         self.run_id = run_id or tasks.new_id()
         self.trigger = trigger
         self.storage_ids = list(storage_ids) if storage_ids else None
@@ -1891,6 +1894,18 @@ _run_context = threading.local()
 
 def _current_run():
     return getattr(_run_context, 'run', None)
+
+
+def _run_tag_args():
+    """restic --tag arguments for the snapshot of the current run.
+
+    Normal runs are tagged "automated" (the tag retention forgets by). Runs with
+    their own tags (pre-restore backups) don't get it, so retention never removes
+    them; the restore service expires them itself after PRE_RESTORE_KEEP_DAYS.
+    """
+    run = _current_run()
+    tags = run.tags if run is not None and run.tags else ['automated']
+    return ' '.join(f'--tag {shlex.quote(t)}' for t in tags)
 
 
 @contextmanager
@@ -2018,16 +2033,17 @@ def _purge_old_run_results():
     db.commit()
 
 
-def run_backup(job_id, storage_ids=None, trigger='scheduled', task=None, run_id=None):
+def run_backup(job_id, storage_ids=None, trigger='scheduled', task=None, run_id=None, tags=None):
     """Execute a backup job, unless a run of the same job is already in progress.
 
     storage_ids: only these of the job's storages (re-run the failed ones).
     task: the tasks.TaskContext when started from the API (gets progress and log).
+    tags: restic tags instead of "automated" (pre-restore backups; never forgotten by retention).
 
     Never raises: any error is logged and reported (job status, history row,
     notification), so a run can't fail without a trace.
     """
-    run = BackupRun(job_id, run_id=run_id, trigger=trigger, storage_ids=storage_ids, task=task)
+    run = BackupRun(job_id, run_id=run_id, trigger=trigger, storage_ids=storage_ids, task=task, tags=tags)
     # The run lock lives on its own dedicated connection; pooled connections are
     # only borrowed per query, so a long run doesn't tie one up.
     with _short_lived_db(), _backup_run_context(run):
@@ -2914,7 +2930,7 @@ def run_filesystem_backup(job_id, job, targets):
                 job.get('ssh_key', '/home/backupx/.ssh/id_rsa'))
 
         # Build remote command with proper escaping
-        backup_cmd = f"restic backup --json --compression auto --tag automated {' '.join(exclude_args)} {directories}"
+        backup_cmd = f"restic backup --json --compression auto {_run_tag_args()} {' '.join(exclude_args)} {directories}"
         remote_cmd = f"""
 export PATH="$HOME/.local/bin:$PATH"
 export RESTIC_PASSWORD={restic_password}
@@ -3150,7 +3166,7 @@ trap 'rm -f "$MYCNF"' EXIT
             dump_error_msg = 'mysqldump failed'
 
         # Build remote command with proper escaping
-        backup_cmd = f'restic backup --json --compression auto --tag automated --tag {backup_tag} $ANCHOR_TAGS "$BACKUP_FILE"'
+        backup_cmd = f'restic backup --json --compression auto {_run_tag_args()} --tag {backup_tag} $ANCHOR_TAGS "$BACKUP_FILE"'
         if pitr_mysql:
             dump_step = f'''
 PITR_T0=$(date +%s)
