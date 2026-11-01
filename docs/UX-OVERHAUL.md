@@ -817,7 +817,15 @@ mount and a managed host: manual only; PostgreSQL 10 (reload item, forced
 unhealthy -> rollback via ALTER SYSTEM RESET, scheduled window 2 min later ->
 restart, base backup, ok). No admin password or other secret in tasks,
 task_logs, audit, probes, the app log, any argv in the backupx container or
-files left on the hosts. Version matrix: see `docs/PITR-VERIFICATION.md`.
+files left on the hosts. Version matrix: see `docs/PITR-VERIFICATION.md`. The matrix (MySQL 8.0, 8.4 with and
+without GTID, MariaDB 10.3, 10.6, 10.11, 11.4; upgrades 8.0 -> 8.4 and 10.6 ->
+10.11) passed every check: automatic image + digest pin, prerequisites,
+rotations shipped to two storages, anchored dump, scratch restore to the second
+from the second storage with `CHECKSUM TABLE` equal to the source, no replica
+registration, general_log of backupx's login read-only. Restore drill e2e: a
+clean drill passes; a change made with `sql_log_bin=0` fails the drill on that
+table with an alert and a health issue. The rig was torn down afterwards
+(`teardown.sh`; images kept, `--images` removes them).
 
 Not covered end to end: the wizard UI clicked against the real backend
 (type-checked, linted, built); PostgreSQL conf.d fallback (unit only); a
