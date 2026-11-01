@@ -56,6 +56,8 @@ TASK_SCHEMA_SQL = """
         result TEXT,
         error TEXT
     );
+    -- Only this runner may claim the task (it holds a one-time credential in memory)
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS pinned_worker TEXT;
     CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_active_idempotency
         ON tasks(idempotency_key)
         WHERE status IN ('queued', 'running') AND idempotency_key IS NOT NULL;

@@ -175,8 +175,11 @@ def _run(server, script, timeout):
 # Prerequisites
 # ---------------------------------------------------------------------------
 
-def check_prereqs(job_id, job=None, overrides=None):
-    """Run the prerequisite check for a job; returns {'kind', 'checks', 'ok', 'needs_restart', ...}."""
+def check_prereqs(job_id, job=None, overrides=None, with_facts=False):
+    """Run the prerequisite check for a job; returns {'kind', 'checks', 'ok', 'needs_restart', ...}.
+
+    with_facts: also return the raw facts the script reported (the enable wizard plans from them).
+    """
     job, server, db_config, kind = _job_context(job_id, job)
     if overrides:
         job.update({k: v for k, v in overrides.items() if k.startswith('pitr_')})
@@ -198,6 +201,8 @@ def check_prereqs(job_id, job=None, overrides=None):
         checks.insert(0, {'check': 'SSH', 'status': 'fail',
                           'current': _m().sanitize_error_message(res.stderr.strip() or 'ssh failed'),
                           'required': 'backupx can run commands on the server', 'fix': '', 'needs_restart': False})
+    if with_facts:
+        extra['facts'] = facts
     return dict(extra, kind=kind, checks=checks, ok=pitr.prereqs_ok(checks),
                 needs_restart=any(c['needs_restart'] and c['status'] != 'ok' for c in checks))
 
@@ -370,6 +375,10 @@ def _apply_plan(job_id, state, plan, scan, targets, shipped, in_sync, now):
     if plan['server_uuid']:
         conn.execute("UPDATE pitr_anchors SET server_uuid = ? WHERE job_id = ? AND server_uuid = ''",
                      (plan['server_uuid'], job_id))
+        # A chain started before the streamer had recorded the server (first tick right after
+        # enabling) belongs to this server: without its uuid no dump could anchor it
+        conn.execute("UPDATE pitr_chains SET server_uuid = ? WHERE job_id = ? AND chain_id = ? "
+                     "AND COALESCE(server_uuid, '') = ''", (plan['server_uuid'], job_id, plan['chain_id']))
     for index, seg in enumerate(plan['segments']):
         snaps = {_storage_key(t): r['segments'].get(index) for t, r in zip(targets, shipped or [])}
         conn.execute('''
@@ -807,15 +816,10 @@ def _pg_tick(job_id, job, server, db_config, targets):
     info = _json(state.get('info'), {})
     primary = targets[0]
     prefix = job.get('backup_prefix') or job_id
-    env_hash = _hash(primary.get('endpoint'), primary.get('bucket'), primary.get('access_key'),
-                     primary.get('secret_key'), prefix)
+    env_hash = walg_env_hash(primary, prefix)
     if info.get('walg_env_hash') != env_hash or not info.get('walg_version'):
-        res = _run(server, scripts.walg_install_script(primary, prefix), timeout=300)
-        facts = pitr.parse_kv_output(res.stdout)
-        if 'INSTALLED' not in facts:
-            raise PitrError(facts.get('ERROR') or res.stderr.strip()[-300:] or 'wal-g install failed')
-        info.update(walg_env_hash=env_hash, walg_version=facts.get('WALG_VERSION', ''),
-                    pgdata=facts.get('PGDATA', ''))
+        info.update(install_walg(server, primary, prefix))
+        info['walg_env_hash'] = env_hash
     res = _run(server, scripts.pg_prereq_script(), timeout=90)
     facts = pitr.parse_kv_output(res.stdout)
     if facts.get('connect_error'):
@@ -879,6 +883,20 @@ def _pg_tick(job_id, job, server, db_config, targets):
                server_version=facts.get('server_version'), **fields)
     refresh_state(job_id, job, live=archiving and not health['failing'])
     return True, message or ('ok (' + health['detail'] + ')' if archiving else 'ok')
+
+
+def install_walg(server, primary, prefix):
+    """Install wal-g + its env file + the archive script on the database host. Returns the info fields."""
+    res = _run(server, scripts.walg_install_script(primary, prefix), timeout=300)
+    facts = pitr.parse_kv_output(res.stdout)
+    if 'INSTALLED' not in facts:
+        raise PitrError(facts.get('ERROR') or res.stderr.strip()[-300:] or 'wal-g install failed')
+    return {'walg_version': facts.get('WALG_VERSION', ''), 'pgdata': facts.get('PGDATA', '')}
+
+
+def walg_env_hash(primary, prefix):
+    return _hash(primary.get('endpoint'), primary.get('bucket'), primary.get('access_key'),
+                 primary.get('secret_key'), prefix)
 
 
 def _hash(*parts):

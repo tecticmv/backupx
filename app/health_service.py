@@ -342,7 +342,7 @@ def serialize_issue(issue, finding=None, active=None):
         'first_seen': _iso(finding.get('first_seen')) or _now().isoformat(),
         'last_seen': _iso(finding.get('last_seen')) or _now().isoformat(),
         'snoozed_until': None, 'evidence': d['evidence'], 'evidence_text': d['evidence_text'],
-        'fix': fix, 'manual': d['manual'], 'active_task': (active or {}).get(d['id']),
+        'fix': fix, 'manual': d['manual'], 'wizard': d.get('wizard'), 'active_task': (active or {}).get(d['id']),
     }
     snoozed = health.utc(finding.get('snoozed_until'))
     if snoozed and snoozed > _now():
@@ -755,7 +755,9 @@ def probe_prereqs(job_id, job):
     try:
         res = pitr_service.check_prereqs(job_id, job)
         data = {'ok': bool(res.get('ok')), 'kind': res.get('kind'),
-                'failing': [c['check'] for c in res.get('checks', []) if c['status'] == 'fail'][:10]}
+                'failing': [c['check'] for c in res.get('checks', []) if c['status'] == 'fail'][:10],
+                'warnings': [c['check'] for c in res.get('checks', []) if c['status'] == 'warn'][:10],
+                'needs_restart': bool(res.get('needs_restart'))}
         suggested = res.get('suggested_client_image') or ''
         current = (job.get('pitr_client_image') or '').strip()
         bad = [c for c in res.get('checks', []) if c['check'] in IMAGE_CHECKS and c['status'] in ('fail', 'warn')]
@@ -870,7 +872,8 @@ def sweep(ctx=None, resource_type=None, resource_id=None, force_expensive=False)
         ctx.check_cancelled()
     # Probes of deleted jobs/servers
     if resource_type is None:
-        valid = {f'ssh:{s}' for s in state['servers']} | {f'prereq:{j}' for j in state['jobs']}
+        valid = {f'ssh:{s}' for s in state['servers']} | {f'prereq:{j}' for j in state['jobs']} \
+            | {f'pitrplan:{j}' for j in state['jobs']}
         for jid, storages in state['job_storages'].items():
             for s in storages:
                 for p in ('repo', 'check', 'stats'):

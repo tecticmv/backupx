@@ -42,6 +42,7 @@ from . import pitr
 from . import pitr_service
 from . import health_service
 from . import restore_service
+from . import pitr_enable_service
 from .cron import cron_fields, cron_trigger
 
 # =============================================================================
@@ -3947,6 +3948,54 @@ def api_job_pitr_ship(job_id):
                                   title=f"PITR check/ship: {job.get('name', job_id)}",
                                   resource_type='job', resource_id=job_id,
                                   idempotency_key=f'pitr_ship:{job_id}', message='PITR check/ship started')
+
+
+def _enable_error_response(e):
+    body = {'error': str(e), 'code': e.code}
+    body.update(e.extra or {})
+    return jsonify(body), e.status
+
+
+@app.route('/api/jobs/<job_id>/pitr/plan', methods=['POST'])
+@login_required
+def api_job_pitr_plan(job_id):
+    """Enable-PITR wizard: prerequisite check + host probe -> remediation plan (+ plan hash)."""
+    try:
+        _plan, body = pitr_enable_service.plan_for(job_id, request.get_json(silent=True) or {})
+    except pitr_enable_service.EnableError as e:
+        return _enable_error_response(e)
+    return jsonify(body)
+
+
+@app.route('/api/jobs/<job_id>/pitr/apply', methods=['POST'])
+@login_required
+def api_job_pitr_apply(job_id):
+    """Start the enable run (maintenance tier: step-up + plan hash + typed database name).
+
+    A one-time admin login in the body is held in this worker's memory for the task only.
+    """
+    if not security.has_step_up():
+        return security.step_up_required_response()
+    user, ip = _actor()
+    try:
+        row = pitr_enable_service.start(job_id, request.get_json(silent=True) or {}, user=user, ip=ip)
+    except pitr_enable_service.EnableError as e:
+        return _enable_error_response(e)
+    return jsonify({'success': True, 'task': tasks.serialize(row), 'message': 'PITR setup started'}), 202
+
+
+@app.route('/api/jobs/<job_id>/pitr/enable')
+@login_required
+@limiter.exempt
+def api_job_pitr_enable_run(job_id):
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    try:
+        status = pitr_service.status(job_id, dict(job, id=job_id))
+    except Exception:
+        status = None
+    return jsonify({'run': pitr_enable_service.current_run(job_id), 'pitr': status})
 
 
 @app.route('/api/jobs/<job_id>/pitr/restore-script', methods=['POST'])

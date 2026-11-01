@@ -255,27 +255,31 @@ def enqueue(kind: str, params: Optional[dict] = None, *, title: Optional[str] = 
             resource_type: Optional[str] = None, resource_id: Optional[str] = None,
             parent_id: Optional[str] = None, tier: Optional[str] = None,
             idempotency_key: Optional[str] = None, created_by: Optional[str] = None,
-            ip: Optional[str] = None, not_before: Optional[datetime] = None, db=None):
+            ip: Optional[str] = None, not_before: Optional[datetime] = None, db=None,
+            pinned_worker: Optional[str] = None, task_id: Optional[str] = None):
     """Queue a task. Returns (task_row, created).
 
     created is False when an active task with the same idempotency_key
-    exists; that task is returned instead.
+    exists; that task is returned instead. pinned_worker: only that runner may
+    claim it (the task needs something held in that process's memory, e.g. a
+    one-time credential, see app.credentials).
     """
     spec = get_kind(kind)
     if spec is None:
         raise ValueError(f'unknown task kind {kind}')
     db = db or _get_db()
-    task_id = new_id()
+    task_id = task_id or new_id()
     stored_params = json.dumps(redact_params(params or {}), default=str)
     cur = db.execute(
         '''INSERT INTO tasks (id, kind, title, parent_id, resource_type, resource_id, params, tier,
-                              status, progress, idempotency_key, created_by, ip, created_at, not_before)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued', 0, %s, %s, %s, %s, %s)
+                              status, progress, idempotency_key, created_by, ip, created_at, not_before,
+                              pinned_worker)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued', 0, %s, %s, %s, %s, %s, %s)
            ON CONFLICT (idempotency_key) WHERE status IN ('queued', 'running') AND idempotency_key IS NOT NULL
            DO NOTHING
            RETURNING *''',
         (task_id, kind, title or spec.title, parent_id, resource_type, resource_id, stored_params,
-         tier or spec.tier, idempotency_key, created_by, ip, utcnow(), not_before))
+         tier or spec.tier, idempotency_key, created_by, ip, utcnow(), not_before, pinned_worker))
     row = cur.fetchone()
     db.commit()
     if row:
@@ -288,7 +292,7 @@ def enqueue(kind: str, params: Optional[dict] = None, *, title: Optional[str] = 
     # The active one finished between the INSERT and the SELECT: try once more
     return enqueue(kind, params, title=title, resource_type=resource_type, resource_id=resource_id,
                    parent_id=parent_id, tier=tier, idempotency_key=idempotency_key,
-                   created_by=created_by, ip=ip, not_before=not_before, db=db)
+                   created_by=created_by, ip=ip, not_before=not_before, db=db, pinned_worker=pinned_worker)
 
 
 def get_task(task_id: str, db=None) -> Optional[dict]:
@@ -372,6 +376,29 @@ def mark_interrupted(stale_after: Optional[int] = None, db=None) -> int:
     for r in rows:
         logger.warning(f"Task {r['id']} marked interrupted (no heartbeat for {stale_after}s)")
     return len(rows)
+
+
+def fail_orphaned_pinned(max_age: Optional[int] = None, db=None) -> int:
+    """Fail queued tasks pinned to a worker that never claimed them (it restarted, so the
+    one-time credential it held is gone). Returns how many."""
+    from . import credentials
+    db = db or _get_db()
+    max_age = max_age if max_age is not None else credentials.ttl()
+    cutoff = datetime.fromtimestamp(utcnow().timestamp() - max_age, timezone.utc).replace(tzinfo=None)
+    cur = db.execute(
+        "UPDATE tasks SET status = 'failed', finished_at = %s, error = %s, step = 'Credential expired'"
+        " WHERE status = 'queued' AND pinned_worker IS NOT NULL AND created_at < %s"
+        " AND (not_before IS NULL OR not_before < %s) RETURNING id",
+        (utcnow(), 'The one-time credential expired before the task started (backupx restarted); start again',
+         cutoff, cutoff))
+    rows = cur.fetchall()
+    db.commit()
+    return len(rows)
+
+
+def local_worker_id() -> Optional[str]:
+    """This process's runner id (None when this process runs no tasks)."""
+    return _runner.worker_id if _runner is not None else None
 
 
 def purge_old(keep_days: Optional[int] = None, db=None) -> int:
@@ -756,11 +783,12 @@ def claim_one(worker: str, db=None) -> Optional[dict]:
            WHERE id = (
                SELECT id FROM tasks
                WHERE status = 'queued' AND (not_before IS NULL OR not_before <= %s)
+                 AND (pinned_worker IS NULL OR pinned_worker = %s)
                ORDER BY created_at
                LIMIT 1
                FOR UPDATE SKIP LOCKED)
            AND status = 'queued'
-           RETURNING *''', (now, now, worker, now))
+           RETURNING *''', (now, now, worker, now, worker))
     row = cur.fetchone()
     db.commit()
     return dict(row) if row else None
@@ -874,6 +902,7 @@ class TaskRunner:
             self._last_sweep = now
             try:
                 mark_interrupted(self.cfg['stale_after'])
+                fail_orphaned_pinned()
             except Exception as e:
                 logger.debug(f"Interrupted-task sweep failed: {e}")
         if now - self._last_purge >= 3600:

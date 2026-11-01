@@ -59,6 +59,7 @@ class Issue:
     fix: Optional[str] = None   # action name in health_service.FIXES
     manual: Optional[Dict[str, List[str]]] = None
     alert: bool = True          # False: already notified elsewhere (backup failure mails, PITR transitions)
+    wizard: Optional[Dict[str, Any]] = None  # {'kind': 'pitr_enable', 'job_id'}: fixed in a wizard
 
     @property
     def id(self) -> str:
@@ -69,7 +70,7 @@ class Issue:
             'id': self.id, 'family': self.family, 'kind': self.kind, 'severity': self.severity,
             'title': self.title, 'explanation': self.explanation, 'resource': dict(self.resource),
             'evidence': dict(self.evidence), 'evidence_text': self.evidence_text,
-            'fix_action': self.fix, 'manual': self.manual, 'alert': self.alert,
+            'fix_action': self.fix, 'manual': self.manual, 'alert': self.alert, 'wizard': self.wizard,
         }
 
 
@@ -415,12 +416,16 @@ def detect_pitr(state) -> List[Issue]:
                     'pitr_streamer', 'wal_archiving_off', SEV_WARNING,
                     f"{job.get('name')}: WAL archiving is not switched on yet",
                     "backupx installed wal-g, but postgresql.conf doesn't archive with it yet. backupx never "
-                    "restarts PostgreSQL itself: apply the settings below and restart in a quiet moment.",
+                    "restarts PostgreSQL outside the confirmed maintenance flow: open the PITR setup, or apply "
+                    "the settings below yourself and restart in a quiet moment.",
                     res, key=(job_id,), evidence=evidence,
-                    manual={'steps': ["Add these settings to postgresql.conf (or ALTER SYSTEM SET ...).",
-                                      "Restart PostgreSQL (archive_mode needs a restart).",
-                                      "Press Re-check."],
-                            'commands': list(state.get('pg_conf_changes') or [])}))
+                    manual={'steps': ["Open the PITR setup: it applies these with ALTER SYSTEM and restarts "
+                                      "PostgreSQL through the confirmed maintenance flow (backup first, validation, "
+                                      "health check, automatic rollback), now or in a window.",
+                                      "Or by hand: add these settings to postgresql.conf, restart PostgreSQL "
+                                      "(archive_mode needs a restart) and press Re-check."],
+                            'commands': list(state.get('pg_conf_changes') or [])},
+                    wizard=_wizard(job_id)))
             mirror = [m for m in (info.get('mirror') or []) if not m.get('ok')]
             if mirror:
                 out.append(Issue(
@@ -448,13 +453,40 @@ def detect_pitr(state) -> List[Issue]:
                                "no downtime)."
             else:
                 explanation += "The prerequisite check fails, so an anchored dump wouldn't help yet."
-                manual = {'steps': ["Open the job's PITR settings and run Check prerequisites.",
-                                    "Fix the failing checks, then press Re-check."], 'commands': []}
+                manual = {'steps': ["Open the PITR setup: it shows each failing check and fixes what it can.",
+                                    "Then press Re-check."], 'commands': []}
             out.append(Issue(
                 'pitr_unanchored', 'pitr_broken' if broken else 'pitr_unanchored',
                 SEV_CRITICAL if broken else SEV_WARNING, title, explanation, res, key=(job_id,),
-                evidence=evidence, fix=fix, manual=manual, alert=False))
-        mismatch = ((state.get('probes') or {}).get(f'prereq:{job_id}') or {}).get('data', {}).get('image_mismatch')
+                evidence=evidence, fix=fix, manual=manual, alert=False,
+                wizard=None if fix else _wizard(job_id)))
+        prereq_data = ((state.get('probes') or {}).get(f'prereq:{job_id}') or {}).get('data') or {}
+        failing = list(prereq_data.get('failing') or [])
+        image_only = failing and all(c in IMAGE_CHECK_NAMES for c in failing) and prereq_data.get('image_mismatch')
+        if prereq_data.get('ok') is False and failing and not image_only:
+            log_bin = 'Binary log (log_bin)' in failing
+            out.append(Issue(
+                'pitr_prereq', 'pitr_log_bin_off' if log_bin else 'pitr_prereq_failing',
+                SEV_CRITICAL if st in ('lagging', 'broken') else SEV_WARNING,
+                f"{job.get('name')}: " + ('binary log is off' if log_bin else
+                                          'point-in-time recovery prerequisites fail'),
+                ("The database doesn't write a binary log, so there is nothing to stream. " if log_bin else
+                 "Some point-in-time recovery prerequisites fail on the database server. ") +
+                "The PITR setup shows the plan: no-downtime fixes, and config changes with a confirmed restart "
+                "(backup first, validation, health check, automatic rollback), now or in a window.",
+                res, key=(job_id,), evidence={'failing': ', '.join(failing)[:300]},
+                manual={'steps': ['Open the PITR setup.'], 'commands': []}, wizard=_wizard(job_id)))
+        if 'Privilege RELOAD' in (prereq_data.get('warnings') or []):
+            out.append(Issue(
+                'pitr_reload', 'pitr_reload_missing', SEV_WARNING,
+                f"{job.get('name')}: the backup user lacks RELOAD",
+                "Without RELOAD (or BACKUP_ADMIN) the nightly dump can't record its binlog position, so point-in-"
+                "time recovery stays unanchored. The PITR setup grants it with a one-time admin login (never "
+                "stored), or shows the GRANT to run yourself.",
+                res, key=(job_id,), evidence={},
+                manual={'steps': ['Open the PITR setup, or run as an admin: GRANT RELOAD ON *.* TO <the job user>;'],
+                        'commands': []}, wizard=_wizard(job_id)))
+        mismatch = prereq_data.get('image_mismatch')
         if mismatch and mismatch.get('suggested'):
             out.append(Issue(
                 'pitr_client_image', 'pitr_client_image', SEV_WARNING,
@@ -467,6 +499,13 @@ def detect_pitr(state) -> List[Issue]:
                           'suggested_image': mismatch['suggested'], 'server_version': mismatch.get('server_version')},
                 fix='pitr_client_image'))
     return out
+
+
+IMAGE_CHECK_NAMES = ('mysqlbinlog matches the server', 'mysqldump can record the binlog position')
+
+
+def _wizard(job_id):
+    return {'kind': 'pitr_enable', 'job_id': job_id}
 
 
 def detect_scheduler(state) -> List[Issue]:
