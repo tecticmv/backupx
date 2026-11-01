@@ -379,8 +379,11 @@ exit 0
 # PostgreSQL
 # ---------------------------------------------------------------------------
 
+# su postgres from /root warns 'could not change directory'; run PostgreSQL scripts from /
+PG_CD = 'cd / 2>/dev/null\n'
+
 def pg_host_probe_script():
-    return HEAD + ps._AS_PG + '\n' + ps.ROOT_FACTS + r'''
+    return HEAD + PG_CD + ps._AS_PG + '\n' + ps.ROOT_FACTS + r'''
 if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then fact systemd 1; else fact systemd 0; fi
 Q() { printf '%s' "$1" | as_pg 'psql -XtA' 2>/dev/null; }
 DD=$(Q 'SHOW data_directory'); fact data_directory "$DD"
@@ -425,7 +428,7 @@ done
     if query:
         body += f'''printf '%s\\n' {q(query)} | as_pg 'psql -XtA -F "	"' 2>/dev/null | line row
 '''
-    return HEAD + ps._AS_PG + '\n' + body + 'exit 0\n'
+    return HEAD + PG_CD + ps._AS_PG + '\n' + body + 'exit 0\n'
 
 
 def pg_backup_config_script(tag, data_directory, config_file):
@@ -448,7 +451,9 @@ def pg_validate_script(postgres_bin, config_file, names):
         for n in names)
     return HEAD + ps._AS_PG + f'''
 ERR=$(mktemp); chmod 644 "$ERR"; trap 'rm -f "$ERR"' EXIT
-E=$(printf '%s' "SELECT coalesce(sourcefile,'?') || ':' || coalesce(sourceline::text,'?') || ' ' || coalesce(name,'') || ': ' || error FROM pg_file_settings WHERE error IS NOT NULL" | as_pg 'psql -XtA' 2>&1)
+cd / 2>/dev/null
+# 'setting could not be applied' = waits for the restart (that's the point); anything else is an error
+E=$(printf '%s' "SELECT coalesce(sourcefile,'?') || ':' || coalesce(sourceline::text,'?') || ' ' || coalesce(name,'') || ': ' || error FROM pg_file_settings WHERE error IS NOT NULL AND error <> 'setting could not be applied'" | as_pg 'psql -XtA' 2>&1)
 if [ -n "$E" ]; then fact valid 0; printf '%s\\n' "$E" | line verr; exit 0; fi
 {checks if postgres_bin and conf_dir else ''}
 fact valid_done 1
@@ -471,7 +476,7 @@ def pg_status_script(unit, names, since, log_file=''):
     log = (f'''LF={q(log_file)}
 if [ -n "$LF" ] && $SUDO test -f "$LF" && [ "$($SUDO stat -c %Y "$LF")" -ge {int(since)} ]; then $SUDO tail -n 40 "$LF" | line log; fi
 ''' if log_file else '')
-    return HEAD + ps._AS_PG + f'''
+    return HEAD + PG_CD + ps._AS_PG + f'''
 fact state "$(systemctl show -p ActiveState --value {u})"
 fact sub "$(systemctl show -p SubState --value {u})"
 fact restart_count "$(systemctl show -p NRestarts --value {u} 2>/dev/null)"

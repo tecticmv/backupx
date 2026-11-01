@@ -770,6 +770,7 @@ UNION ALL SELECT 'server_version', current_setting('server_version')
 UNION ALL SELECT 'wal_level', current_setting('wal_level')
 UNION ALL SELECT 'archive_mode', current_setting('archive_mode')
 UNION ALL SELECT 'archive_command', current_setting('archive_command')
+UNION ALL (SELECT 'archive_command_file', setting FROM pg_file_settings WHERE name = 'archive_command' AND applied ORDER BY seqno DESC LIMIT 1)
 UNION ALL SELECT 'archive_timeout', current_setting('archive_timeout')
 UNION ALL SELECT 'data_directory', current_setting('data_directory')
 UNION ALL SELECT 'archiver_archived_count', archived_count::text FROM pg_stat_archiver

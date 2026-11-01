@@ -1075,6 +1075,9 @@ def evaluate_pg_prereqs(facts):
                                                             '(schedule a window; backupx never restarts PostgreSQL).',
                          needs_restart=mode not in ('on', 'always')))
     command = facts.get('archive_command', '')
+    if command == '(disabled)' and facts.get('archive_command_file'):
+        # archive_mode off hides the setting; pg_file_settings has what is configured
+        command = facts['archive_command_file']
     ok = WALG_ARCHIVE_COMMAND.split()[0] in command
     checks.append(_check('archive_command', 'ok' if ok else 'fail', command or '(empty)', WALG_ARCHIVE_COMMAND,
                          '' if ok else f"archive_command = '{WALG_ARCHIVE_COMMAND}' then SELECT pg_reload_conf() "

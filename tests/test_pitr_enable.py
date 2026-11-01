@@ -673,3 +673,36 @@ def test_health_issues_point_to_the_wizard():
     state['probes'] = {}
     issues = {i.kind: i for i in health.detect_pitr(state)}
     assert issues['wal_archiving_off'].wizard and issues['wal_archiving_off'].manual['commands'] == []
+
+
+def test_every_maintenance_script_is_valid_bash():
+    """Render each script with representative inputs and run `bash -n` on it."""
+    import shutil
+    import subprocess
+    if not shutil.which('bash'):
+        pytest.skip('no bash')
+    host_t = {'install': 'host', 'flavor': 'mariadb', 'version': '10.3.39', 'service': 'mariadb.service',
+              'container': None, 'config_path': '/etc/mysql/mariadb.conf.d/zz-backupx-pitr.cnf'}
+    dock_t = dict(host_t, install='docker', container='db', service=None, config_path='/srv/conf/zz-backupx-pitr.cnf')
+    scripts = [
+        ms.mysql_host_probe_script(DB), ms.mysql_host_probe_script(dict(DB, docker_container='db')),
+        ms.mysql_sql_script(DB, ['SELECT 1', "GRANT RELOAD ON *.* TO 'a'@'%'"], '', None, query='SELECT 1'),
+        ms.mysql_sql_script(DB, ['SELECT 1'], 'percona/percona-server:8.4',
+                            {'mode': 'password', 'username': 'r', 'password': ADMIN_PW}),
+        ms.mysql_sql_script(DB, ['SELECT 1'], '', {'mode': 'socket'}),
+        ms.mysql_backup_config_script('t', host_t), ms.mysql_backup_config_script('t', dock_t),
+        ms.write_file_script('t', '/etc/x.cnf', "[mysqld]\nlog_bin = x\n"), ms.restore_file_script('t', '/etc/x.cnf'),
+        ms.mysql_validate_script(host_t), ms.mysql_validate_script(dict(host_t, flavor='mysql', version='8.4.3')),
+        ms.mysql_validate_script(dock_t), ms.mysql_restart_script(host_t), ms.mysql_restart_script(dock_t),
+        ms.mysql_status_script(host_t, DB, '', ['log_bin'], 1, '/var/log/mysql/error.log'),
+        ms.mysql_status_script(dock_t, dict(DB, docker_container='db'), '', ['log_bin'], 1),
+        ms.charset_fix_script('t', ['/etc/mysql/a.cnf'], 'utf8mb4', '/etc/mysql/conf.d'),
+        ms.pg_host_probe_script(), ms.pg_sql_script(["ALTER SYSTEM SET a = 'b'"], query='SELECT 1'),
+        ms.pg_backup_config_script('t', '/var/lib/pg', '/etc/pg/postgresql.conf'),
+        ms.pg_validate_script('/usr/lib/postgresql/10/bin/postgres', '/etc/pg/postgresql.conf', ['archive_mode']),
+        ms.pg_restart_script('postgresql@10-main.service'), ms.pg_status_script('postgresql@10-main.service',
+                                                                                  ['archive_mode'], 1, '/var/log/p.log'),
+    ]
+    for script in scripts:
+        res = subprocess.run(['bash', '-n'], input=script, capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr + script[:400]
