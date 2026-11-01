@@ -3165,9 +3165,12 @@ fi
                                'else DOCKER="sudo -n docker"; fi\n')
                 dump_prog = (f'$DOCKER run --rm -i --network host --read-only --tmpfs /tmp:rw,mode=1777,size=64m '
                              f'--cap-drop ALL --security-opt no-new-privileges --entrypoint sh {image} -c '
-                             '\'cat > /tmp/my.cnf && exec mysqldump --defaults-extra-file=/tmp/my.cnf "$@"\' sh')
+                             # MariaDB 11 images ship only mariadb-dump
+                             '\'cat > /tmp/my.cnf && exec "$(command -v mysqldump || command -v mariadb-dump)" '
+                             '--defaults-extra-file=/tmp/my.cnf "$@"\' sh')
                 dump_stdin = ' < "$MYCNF"'
-                help_cmd = f'$DOCKER run --rm --entrypoint mysqldump {image} --help'
+                help_cmd = (f'$DOCKER run --rm --entrypoint sh {image} -c '
+                            '\'exec "$(command -v mysqldump || command -v mariadb-dump)" --help\'')
             else:
                 dump_prefix, dump_prog, dump_stdin = '', 'mysqldump --defaults-extra-file="$MYCNF"', ''
                 help_cmd = 'mysqldump --help'

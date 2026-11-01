@@ -300,8 +300,10 @@ run_client() {{ prog=$1; shift; {{ cat "$BXD/my.cnf"; printf '\\n__BACKUPX_CNF_E
     $DOCKER run --rm -i -u 0:0 --network host --read-only --tmpfs /tmp:rw,mode=1777,size=64m --cap-drop ALL \\
         --security-opt no-new-privileges --entrypoint sh {img} -c '
     umask 077; while IFS= read -r l; do [ "$l" = __BACKUPX_CNF_END__ ] && break; printf "%s\\n" "$l"; done > /tmp/my.cnf
-    p=$1; shift; exec "$p" --defaults-extra-file=/tmp/my.cnf "$@"' sh "$prog" "$@"; }}
-GTID_FLAG=$($DOCKER run --rm --entrypoint mysqldump {img} --help 2>/dev/null | grep -q -- '--set-gtid-purged' && echo --set-gtid-purged=OFF)
+    p=$1; shift
+    case "$p" in mysql) p=$(command -v mysql || command -v mariadb) ;; mysqldump) p=$(command -v mysqldump || command -v mariadb-dump) ;; esac
+    exec "$p" --defaults-extra-file=/tmp/my.cnf "$@"' sh "$prog" "$@"; }}
+GTID_FLAG=$($DOCKER run --rm --entrypoint sh {img} -c 'exec "$(command -v mysqldump || command -v mariadb-dump)" --help' 2>/dev/null | grep -q -- '--set-gtid-purged' && echo --set-gtid-purged=OFF)
 bxsql() {{ run_client mysql -N -B; }}
 bximport() {{ run_client mysql {init}; }}
 bxdump() {{ run_client mysqldump --databases "$@" {dump_flags} $GTID_FLAG; }}
