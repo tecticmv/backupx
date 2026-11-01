@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ClipboardList,
   FileText,
+  History,
   ListChecks,
   Loader2,
   MoreHorizontal,
@@ -179,6 +180,14 @@ export default function IssueItem({
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
+          {issue.wizard?.kind === "pitr_enable" && issue.wizard.job_id && (
+            <Button size="sm" variant={tier === "safe" || tier === "confirm" ? "outline" : "default"} asChild>
+              <Link to={`/jobs/${encodeURIComponent(issue.wizard.job_id)}/pitr-setup`}>
+                <History />
+                Open PITR setup
+              </Link>
+            </Button>
+          )}
           {tier === "safe" && issue.fix && (
             <Tooltip>
               <TooltipTrigger asChild>

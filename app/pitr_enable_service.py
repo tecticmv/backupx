@@ -23,6 +23,7 @@ follow the run after a page reload (GET /api/jobs/:id/pitr/enable).
 
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -408,7 +409,9 @@ def _validate_mysql(ctx, server, target, settings_, tag):
     facts = ms.parse(res.stdout)
     problems = []
     if facts.get('valid') != '1':
-        problems = ms.parse_lines(res.stdout, 'verr') or [res.stderr.strip()[-300:] or 'validation failed']
+        lines = ms.parse_lines(res.stdout, 'verr') or [res.stderr.strip()[-300:] or 'validation failed']
+        # mysqld prints notes before the error: lead with the lines that say what's wrong
+        problems = sorted(lines, key=lambda x: 0 if re.search(r'error|unknown|invalid', x, re.I) else 1)
     else:
         bad = pe.overridden_settings(pe.effective_options(ms.parse_lines(res.stdout, 'pd')), settings_)
         if bad:

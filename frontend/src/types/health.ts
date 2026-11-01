@@ -40,6 +40,13 @@ export interface Issue {
   fix: IssueFix | null;
   manual?: { steps: string[]; commands: string[] } | null;
   active_task?: Task | null;
+  /** Guided wizard that fixes this issue (e.g. the enable-PITR wizard). */
+  wizard?: IssueWizard | null;
+}
+
+export interface IssueWizard {
+  kind: "pitr_enable" | string;
+  job_id: string;
 }
 
 export interface HealthSummary {

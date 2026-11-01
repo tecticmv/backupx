@@ -7,6 +7,7 @@ import {
   Database,
   ExternalLink,
   FolderSync,
+  History,
   Loader2,
   MinusCircle,
   MoreHorizontal,
@@ -103,6 +104,8 @@ export default function JobCard({ job, onRun, onDetailPage = false }: JobCardPro
     }
   };
 
+  const isDb = job.backup_type === "database";
+  const pitrSetupHref = `/jobs/${encodeURIComponent(job.id)}/pitr-setup`;
   const pitr = job.pitr?.enabled
     ? { ...job.pitr, state: job.pitr.state as PitrState, last_error: job.pitr.last_error ?? null }
     : null;
@@ -197,6 +200,14 @@ export default function JobCard({ job, onRun, onDetailPage = false }: JobCardPro
             Restore
           </Link>
         </Button>
+        {isDb && !pitr && (
+          <Button size="sm" variant="ghost" asChild>
+            <Link to={pitrSetupHref}>
+              <History />
+              Enable PITR
+            </Link>
+          </Button>
+        )}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
@@ -223,6 +234,14 @@ export default function JobCard({ job, onRun, onDetailPage = false }: JobCardPro
                 Snapshots
               </Link>
             </DropdownMenuItem>
+            {isDb && (
+              <DropdownMenuItem asChild>
+                <Link to={pitrSetupHref}>
+                  <History className="mr-2 h-4 w-4" />
+                  PITR setup
+                </Link>
+              </DropdownMenuItem>
+            )}
             {job.failed_storage_ids.length > 0 && (
               <>
                 <DropdownMenuSeparator />

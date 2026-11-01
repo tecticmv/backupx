@@ -97,7 +97,7 @@ fact local_ips "$( (hostname -I 2>/dev/null; hostname -i 2>/dev/null; hostname 2
 [ -n "$DOCKER" ] && fact docker 1 || fact docker 0
 C={q(container)}
 if [ -n "$C" ]; then
-    if [ -n "$DOCKER" ] && $DOCKER inspect "$C" >/dev/null 2>&1; then
+    if [ -n "$DOCKER" ] && $DOCKER container inspect "$C" >/dev/null 2>&1; then
         fact container_found 1
         fact docker_mounts "$($DOCKER inspect -f '{{{{range .Mounts}}}}{{{{.Destination}}}}|{{{{.Source}}}}|{{{{.RW}}}}|{{{{.Type}}}};{{{{end}}}}' "$C")"
         fact docker_image "$($DOCKER inspect -f '{{{{.Config.Image}}}}' "$C")"
@@ -137,7 +137,8 @@ done
 MPD=$(command -v my_print_defaults || command -v mariadb-print-defaults)
 fact my_print_defaults "$MPD"
 if [ -n "$MPD" ]; then
-    LE=$("$MPD" --mysqld 2>/dev/null | sed -n 's/^--log[-_]error=//p' | tail -n1)
+    # MariaDB: --mysqld (all server groups); MySQL 8.4 dropped that option: name the groups
+    LE=$( {{ "$MPD" --mysqld 2>/dev/null || "$MPD" mysqld server 2>/dev/null; }} | sed -n 's/^--log[-_]error=//p' | tail -n1)
     fact error_log "$LE"
 fi
 # [client] sections that set default-character-set (mysqlbinlog rejects it)
@@ -262,7 +263,7 @@ def mysql_validate_script(target):
 MPD=$({run} sh -c 'command -v my_print_defaults || command -v mariadb-print-defaults' | tail -n1)
 [ -n "$MYSQLD" ] || {{ fact valid 0; fact verr "mysqld not found"; exit 0; }}
 if [ -n "$MPD" ]; then
-    {run} "$MPD" --mysqld 2>&1 | {MASK} | line pd
+    {{ {run} "$MPD" --mysqld 2>/dev/null || {run} "$MPD" mysqld server 2>/dev/null; }} | {MASK} | line pd
 fi
 ERR=$(mktemp)
 if {'true' if validate else 'false'}; then

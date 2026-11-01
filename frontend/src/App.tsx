@@ -18,6 +18,7 @@ import Notifications from "@/pages/Notifications";
 import AuditLog from "@/pages/AuditLog";
 import Settings from "@/pages/Settings";
 import Restore from "@/pages/Restore";
+import PitrSetup from "@/pages/PitrSetup";
 import { Loader2 } from "lucide-react";
 import { TasksProvider } from "@/hooks/useTasks";
 import { StepUpProvider } from "@/hooks/useStepUp";
@@ -91,6 +92,14 @@ function AppRoutes() {
               element={
                 <ProtectedRoute>
                   <SnapshotBrowser />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/jobs/:jobId/pitr-setup"
+              element={
+                <ProtectedRoute>
+                  <PitrSetup />
                 </ProtectedRoute>
               }
             />

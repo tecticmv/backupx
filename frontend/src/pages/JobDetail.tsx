@@ -1,6 +1,6 @@
 import { useCallback, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { ArrowLeft, Database, FolderSync, Loader2, Pencil, Play, RotateCcw } from "lucide-react";
+import { ArrowLeft, Database, FolderSync, History, Loader2, Pencil, Play, RotateCcw } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -221,13 +221,21 @@ export default function JobDetail() {
               <JobRestoresList jobId={jobId} />
             </CardContent>
           </Card>
-          {job.pitr?.enabled && (
+          {job.pitr?.enabled ? (
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                   Point-in-time recovery <PitrBadge pitr={job.pitr} />
                 </CardTitle>
                 <CardDescription>Restorable to any second inside this window</CardDescription>
+                <CardAction>
+                  <Button variant="outline" size="sm" asChild>
+                    <Link to={`/jobs/${encodeURIComponent(jobId)}/pitr-setup`}>
+                      <History />
+                      Re-run PITR setup
+                    </Link>
+                  </Button>
+                </CardAction>
               </CardHeader>
               <CardContent className="space-y-1 text-sm">
                 <p>{formatWindow(job.pitr.window_start, job.pitr.window_end)}</p>
@@ -237,6 +245,29 @@ export default function JobDetail() {
                 {job.pitr.last_error && <p className="text-destructive">Last error: {job.pitr.last_error}</p>}
               </CardContent>
             </Card>
+          ) : (
+            job.backup_type === "database" && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <History className="h-5 w-5" />
+                    Point-in-time recovery
+                  </CardTitle>
+                  <CardDescription>
+                    Off. Turn it on to restore this database to any second, not just to the last backup. The setup
+                    checks the server, shows every change and its downtime, and takes a fresh backup first.
+                  </CardDescription>
+                  <CardAction>
+                    <Button asChild>
+                      <Link to={`/jobs/${encodeURIComponent(jobId)}/pitr-setup`}>
+                        <History />
+                        Set up point-in-time recovery
+                      </Link>
+                    </Button>
+                  </CardAction>
+                </CardHeader>
+              </Card>
+            )
           )}
         </TabsContent>
 
