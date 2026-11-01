@@ -706,3 +706,28 @@ def test_every_maintenance_script_is_valid_bash():
     for script in scripts:
         res = subprocess.run(['bash', '-n'], input=script, capture_output=True, text=True)
         assert res.returncode == 0, res.stderr + script[:400]
+
+
+def test_auto_matching_learns_the_version_with_a_probe_image(monkeypatch):
+    """Host client can't log in (MariaDB client vs MySQL 8): probe with a current image, then check with the match."""
+    import subprocess
+    from app import pitr_service
+    seen = []
+
+    def fake_run(server, script, timeout):
+        image = next((i for i in ('percona/percona-server:8.4', 'percona/percona-server:8.0', 'mariadb:11.4')
+                      if f'PITR_IMAGE={i}' in script), '')
+        seen.append(image)
+        out = 'PITR\tdocker\t1\nPITR\tuid\t0\n'
+        if image:
+            out += 'PITR\tversion\t8.0.40\nPITR\tuser\tbx@%\nPITR\tlog_bin\t1\n'
+        else:
+            out += "PITR\tconnect_error\tAuthentication plugin 'caching_sha2_password' cannot be loaded\n"
+        return subprocess.CompletedProcess([], 0, out, '')
+    monkeypatch.setattr(pitr_service, '_run', fake_run)
+    monkeypatch.setattr(pitr_service, '_job_context', lambda job_id, job=None: (
+        {'id': 'j', 'pitr_client_auto': True}, {'host': 'x'}, {'type': 'mysql', 'host': '10.0.0.9'}, 'mysql'))
+    monkeypatch.setattr(pitr_service, 'load_state', lambda job_id: {})
+    res = pitr_service.check_prereqs('j')
+    assert seen == ['', 'percona/percona-server:8.4', 'percona/percona-server:8.0']
+    assert res['server_version'] == '8.0.40'

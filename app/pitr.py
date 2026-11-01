@@ -254,6 +254,8 @@ def suggested_client_image(version_text):
 # images have no mysqlbinlog; Percona Server's have it, built from the same code base.
 CLIENT_IMAGE_MYSQL = ((5, 7), (8, 0), (8, 4))
 CLIENT_IMAGE_MARIADB = ((10, 3), (10, 4), (10, 5), (10, 6), (10, 11), (11, 4), (11, 8))
+# Current clients used only to read the server version when the host has no usable client
+VERSION_PROBE_IMAGES = ('percona/percona-server:8.4', 'mariadb:11.4')
 
 
 def version_key(version_text):

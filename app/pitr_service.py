@@ -195,6 +195,21 @@ def check_prereqs(job_id, job=None, overrides=None, with_facts=False):
             image = pitr.resolve_client_image(state_version).get('image') or ''
         res = _run(server, scripts.mysql_prereq_script(db_config, image), timeout=180)
         facts = pitr.parse_kv_output(res.stdout)
+        docker_db = bool((db_config.get('docker_container') or '').strip())
+        if job.get('pitr_client_auto') and not image and not docker_db and not facts.get('version') \
+                and facts.get('docker') == '1':
+            # Automatic matching, version unknown and the host client can't log in (e.g. a MariaDB
+            # client against MySQL 8's caching_sha2_password): learn the version with a current
+            # client image (same read-only check), then check again with the matching one
+            for probe_image in pitr.VERSION_PROBE_IMAGES:
+                res = _run(server, scripts.mysql_prereq_script(db_config, probe_image), timeout=600)
+                facts = pitr.parse_kv_output(res.stdout)
+                if facts.get('version'):
+                    image = pitr.resolve_client_image(facts['version']).get('image') or probe_image
+                    if image != probe_image:
+                        res = _run(server, scripts.mysql_prereq_script(db_config, image), timeout=600)
+                        facts = pitr.parse_kv_output(res.stdout)
+                    break
         mode = 'docker' if (db_config.get('docker_container') or '').strip() else 'direct'
         checks = pitr.evaluate_mysql_prereqs(facts, mode=mode, client_image=image)
         extra = {'server_version': facts.get('version', ''),
