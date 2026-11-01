@@ -294,7 +294,12 @@ bxdump() {{ $DOCKER exec {c} "$MYSQLDUMP" $CNF_ARG --databases "$@" {dump_flags}
     if client_image:
         img = q(client_image)
         return head + 'trap \'rm -rf "$BXD"\' EXIT\n' + write + _docker_detect().replace('docker ps', 'docker info') + f'''
-run_client() {{ prog=$1; shift; $DOCKER run --rm -i -u 0:0 --network host -v "$BXD/my.cnf:/tmp/my.cnf:ro" --entrypoint "$prog" {img} --defaults-extra-file=/tmp/my.cnf "$@"; }}
+# The option file goes in on stdin ahead of the data (up to a marker line), so neither
+# the password nor a host path is in docker's argv and it works with any docker daemon
+run_client() {{ prog=$1; shift; {{ cat "$BXD/my.cnf"; printf '\\n__BACKUPX_CNF_END__\\n'; cat; }} | \\
+    $DOCKER run --rm -i -u 0:0 --network host --entrypoint sh {img} -c '
+    umask 077; while IFS= read -r l; do [ "$l" = __BACKUPX_CNF_END__ ] && break; printf "%s\\n" "$l"; done > /tmp/my.cnf
+    p=$1; shift; exec "$p" --defaults-extra-file=/tmp/my.cnf "$@"' sh "$prog" "$@"; }}
 GTID_FLAG=$($DOCKER run --rm --entrypoint mysqldump {img} --help 2>/dev/null | grep -q -- '--set-gtid-purged' && echo --set-gtid-purged=OFF)
 bxsql() {{ run_client mysql -N -B; }}
 bximport() {{ run_client mysql {init}; }}
