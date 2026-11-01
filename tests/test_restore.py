@@ -142,7 +142,7 @@ def test_prod_runner_keeps_password_out_of_argv_positions():
     s = rs.prod_runner(dict(cfg, port=5432), 'postgres')
     assert 'export PGPASSWORD=' in s
     s = rs.prod_runner(cfg, 'mysql', client_image='percona/percona-server:8.4')
-    assert '__BACKUPX_CNF_END__' in s and '-v ' not in s
+    assert '__BACKUPX_CNF_END__' in s and ' -v "' not in s and ' -v /' not in s  # no volume mounts
 
 
 def test_files_restore_script_takes_pre_restore_backup_first():
