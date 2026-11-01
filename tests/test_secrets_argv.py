@@ -256,6 +256,7 @@ def test_db_connection_test_keeps_password_out_of_argv(logged_in, transport, mon
 
 def test_restore_routes_keep_secrets_out_of_argv(logged_in, transport, monkeypatch):
     import app.main as main
+    monkeypatch.setenv('ALLOW_DIRECT_DB_RESTORE', 'true')
     job = dict(JOB, backup_type='database')
     monkeypatch.setattr(main, 'get_job', lambda jid: dict(job))
     monkeypatch.setattr(main, '_job_storage_from_request', lambda j: dict(TARGET))
@@ -273,3 +274,51 @@ def test_restore_routes_keep_secrets_out_of_argv(logged_in, transport, monkeypat
         _assert_no_secret_in_argv(call['args'])
         assert RESTIC_PASSWORD in transport.stdin_of(call)
     assert '--defaults-extra-file="$RESTORE_DIR/.backupx-my.cnf"' in transport.stdin_of(transport.calls[0])
+
+
+def _db_restore_setup(monkeypatch):
+    import app.main as main
+    job = dict(JOB, backup_type='database')
+    monkeypatch.setattr(main, 'get_job', lambda jid: dict(job))
+    monkeypatch.setattr(main, '_job_storage_from_request', lambda j: dict(TARGET))
+    monkeypatch.setattr(main, 'ensure_db_client_installed', lambda server, client: (True, 'ok'))
+    monkeypatch.setattr(main, 'get_db_config', lambda cid: {
+        'id': 'db1', 'type': 'mysql', 'host': 'db.local', 'port': 3306, 'username': 'u',
+        'password': DB_PASSWORD, 'docker_container': ''})
+
+
+@pytest.mark.parametrize('value', [None, '', 'false', '0', 'no', 'TRUEISH'])
+def test_direct_db_restore_refused_unless_enabled(logged_in, transport, monkeypatch, value):
+    _db_restore_setup(monkeypatch)
+    if value is None:
+        monkeypatch.delenv('ALLOW_DIRECT_DB_RESTORE', raising=False)
+    else:
+        monkeypatch.setenv('ALLOW_DIRECT_DB_RESTORE', value)
+
+    resp = logged_in.post('/api/jobs/job1/snapshots/abc123/restore-db', json={'target_database': 'app'})
+
+    assert resp.status_code == 403
+    assert 'ALLOW_DIRECT_DB_RESTORE' in resp.get_json()['error']
+    assert transport.calls == []  # nothing ran on the target host
+
+
+@pytest.mark.parametrize('value', ['true', 'TRUE', '1', 'yes', 'on'])
+def test_direct_db_restore_runs_when_enabled(logged_in, transport, monkeypatch, value):
+    _db_restore_setup(monkeypatch)
+    monkeypatch.setenv('ALLOW_DIRECT_DB_RESTORE', value)
+
+    resp = logged_in.post('/api/jobs/job1/snapshots/abc123/restore-db', json={'target_database': 'app'})
+
+    assert resp.status_code != 403
+    assert len(transport.calls) == 1
+
+
+def test_file_restore_unaffected_by_db_restore_gate(logged_in, transport, monkeypatch):
+    _db_restore_setup(monkeypatch)
+    monkeypatch.delenv('ALLOW_DIRECT_DB_RESTORE', raising=False)
+
+    resp = logged_in.post('/api/jobs/job1/snapshots/abc123/restore',
+                          json={'source_path': '/data', 'target_path': '/restore'})
+
+    assert resp.status_code == 200
+    assert len(transport.calls) == 1

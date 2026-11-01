@@ -4305,6 +4305,12 @@ mkdir -p {safe_target}
         return jsonify({'error': str(e)}), 500
 
 
+def direct_db_restore_allowed():
+    """True only when ALLOW_DIRECT_DB_RESTORE is explicitly on (default off)."""
+    value = os.environ.get('ALLOW_DIRECT_DB_RESTORE', '')
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 @app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/restore-db', methods=['POST'])
 @login_required
 @csrf.exempt
@@ -4316,7 +4322,19 @@ def api_snapshot_restore_db(job_id, snapshot_id):
     2. Locate the dump file (it's nested in the original temp path)
     3. Pipe it through zcat into mysql/psql against the target DB
     4. Clean up the temp dir
+
+    Off unless ALLOW_DIRECT_DB_RESTORE=true: it overwrites the job's live
+    database with no pre-restore backup and no server-side confirmation.
+    The UI no longer offers it; a restore wizard will replace it.
     """
+    if not direct_db_restore_allowed():
+        return jsonify({
+            'error': 'Direct restore into a database is disabled: it overwrites the '
+                     'live database with no pre-restore backup. Download the snapshot '
+                     'or use the PITR restore script instead (set '
+                     'ALLOW_DIRECT_DB_RESTORE=true to re-enable).'
+        }), 403
+
     job = get_job(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
