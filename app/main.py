@@ -1046,6 +1046,7 @@ def get_job(job_id):
         job['s3_config_ids'] = _parse_s3_config_ids(job)
         job['schedule_enabled'] = bool(job['schedule_enabled'])
         job['pitr_enabled'] = bool(job.get('pitr_enabled'))
+        job['pitr_client_auto'] = bool(job.get('pitr_client_auto'))
         return job
     return None
 
@@ -1102,11 +1103,11 @@ def save_job(job_id, job):
 
     s3_config_ids = job.get('s3_config_ids') or ([s3_config_id] if s3_config_id else [])
     conn.execute('UPDATE jobs SET s3_config_ids=? WHERE id=?', (json.dumps(s3_config_ids), job_id))
-    conn.execute('UPDATE jobs SET pitr_enabled=?, pitr_interval=?, pitr_retention_days=?, pitr_client_image=? '
-                 'WHERE id=?',
+    conn.execute('UPDATE jobs SET pitr_enabled=?, pitr_interval=?, pitr_retention_days=?, pitr_client_image=?, '
+                 'pitr_client_auto=? WHERE id=?',
                  (bool(job.get('pitr_enabled')), int(job.get('pitr_interval') or pitr.DEFAULT_INTERVAL_MINUTES),
                   int(job.get('pitr_retention_days') or pitr.DEFAULT_RETENTION_DAYS),
-                  job.get('pitr_client_image') or None, job_id))
+                  job.get('pitr_client_image') or None, bool(job.get('pitr_client_auto')), job_id))
 
     conn.commit()
 
@@ -3148,12 +3149,13 @@ fi
             # must speak the server's dialect to record its binlog position (MySQL 8.4
             # removed SHOW MASTER STATUS, which 8.0 / MariaDB clients send). The option
             # file goes in on stdin, so the password stays out of every argv.
-            client_image = (job.get('pitr_client_image') or '').strip() if pitr_mysql else ''
+            client_image = pitr.effective_client_image(job) if pitr_mysql else ''
             if client_image:
                 image = shlex.quote(client_image)
                 dump_prefix = ('if docker info >/dev/null 2>&1; then DOCKER="docker"; '
                                'else DOCKER="sudo -n docker"; fi\n')
-                dump_prog = (f'$DOCKER run --rm -i --network host --entrypoint sh {image} -c '
+                dump_prog = (f'$DOCKER run --rm -i --network host --read-only --tmpfs /tmp:rw,mode=1777,size=64m '
+                             f'--cap-drop ALL --security-opt no-new-privileges --entrypoint sh {image} -c '
                              '\'cat > /tmp/my.cnf && exec mysqldump --defaults-extra-file=/tmp/my.cnf "$@"\' sh')
                 dump_stdin = ' < "$MYCNF"'
                 help_cmd = f'$DOCKER run --rm --entrypoint mysqldump {image} --help'

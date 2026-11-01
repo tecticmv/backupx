@@ -816,6 +816,13 @@ class PostgresBackend(DatabaseBackend):
             self.add_column('jobs', 'pitr_retention_days', 'INTEGER', '7')
         if 'pitr_client_image' not in job_columns:
             self.add_column('jobs', 'pitr_client_image', 'TEXT')
+        # Automatic client-tool matching: off for existing jobs; image pinned by digest per server version
+        if 'pitr_client_auto' not in job_columns:
+            self.add_column('jobs', 'pitr_client_auto', 'BOOLEAN', 'FALSE')
+        if 'pitr_client_image_digest' not in job_columns:
+            self.add_column('jobs', 'pitr_client_image_digest', 'TEXT')
+        if 'pitr_client_server_version' not in job_columns:
+            self.add_column('jobs', 'pitr_client_server_version', 'TEXT')
         # Restore wizard verification settings (key tables, check SQL, health URL), JSON
         if 'restore_verify' not in job_columns:
             self.add_column('jobs', 'restore_verify', 'TEXT')

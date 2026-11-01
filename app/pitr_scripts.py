@@ -65,7 +65,10 @@ pitr_client() {
     local name=""
     if [ "${1:-}" = "--name" ]; then name="$2"; shift 2; fi
     if [ -n "$PITR_RUN_IMAGE" ]; then
+        # read-only root, no capabilities, no new privileges, no published ports; the option
+        # file lives on a tmpfs inside the container (stdin), only the spool is mounted
         $DOCKER run --rm -i --init -u 0:0 --network "$PITR_NET" --entrypoint sh \
+            --read-only --tmpfs /tmp:rw,mode=1777,size=64m --cap-drop ALL --security-opt no-new-privileges \
             ${SPOOL:+-v "$SPOOL:/spool"} ${name:+--name "$name"} "$PITR_RUN_IMAGE" \
             -c 'umask 077; cat > /tmp/backupx-my.cnf && exec "$@"' sh "$@" < "$CONF_DIR/my.cnf"
     else
@@ -419,6 +422,20 @@ if [ "$BACKUPX_FAILED" = 0 ]; then
 fi
 rm -rf "$STATE/partial"
 exit $BACKUPX_FAILED
+'''
+
+
+def pull_pin_script(image):
+    """docker pull an image on the server and print its repo digest (PITR\tDIGEST\trepo@sha256:...)."""
+    return f'''
+set -u
+if docker info >/dev/null 2>&1; then DOCKER=docker; else DOCKER="sudo -n docker"; fi
+I={q(image)}
+$DOCKER pull -q "$I" >/dev/null 2>&1 || {{ printf 'PITR\\tERROR\\tdocker pull %s failed\\n' "$I"; exit 1; }}
+D=$($DOCKER image inspect -f '{{{{range .RepoDigests}}}}{{{{.}}}} {{{{end}}}}' "$I" | tr ' ' '\\n' | grep -m1 .)
+[ -n "$D" ] || {{ printf 'PITR\\tERROR\\tno digest for %s\\n' "$I"; exit 1; }}
+printf 'PITR\\tDIGEST\\t%s\\n' "$D"
+exit 0
 '''
 
 

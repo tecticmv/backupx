@@ -297,7 +297,8 @@ bxdump() {{ $DOCKER exec {c} "$MYSQLDUMP" $CNF_ARG --databases "$@" {dump_flags}
 # The option file goes in on stdin ahead of the data (up to a marker line), so neither
 # the password nor a host path is in docker's argv and it works with any docker daemon
 run_client() {{ prog=$1; shift; {{ cat "$BXD/my.cnf"; printf '\\n__BACKUPX_CNF_END__\\n'; cat; }} | \\
-    $DOCKER run --rm -i -u 0:0 --network host --entrypoint sh {img} -c '
+    $DOCKER run --rm -i -u 0:0 --network host --read-only --tmpfs /tmp:rw,mode=1777,size=64m --cap-drop ALL \\
+        --security-opt no-new-privileges --entrypoint sh {img} -c '
     umask 077; while IFS= read -r l; do [ "$l" = __BACKUPX_CNF_END__ ] && break; printf "%s\\n" "$l"; done > /tmp/my.cnf
     p=$1; shift; exec "$p" --defaults-extra-file=/tmp/my.cnf "$@"' sh "$prog" "$@"; }}
 GTID_FLAG=$($DOCKER run --rm --entrypoint mysqldump {img} --help 2>/dev/null | grep -q -- '--set-gtid-purged' && echo --set-gtid-purged=OFF)

@@ -189,7 +189,10 @@ def check_prereqs(job_id, job=None, overrides=None, with_facts=False):
         checks = pitr.evaluate_pg_prereqs(facts)
         extra = {'postgresql_conf': pitr.postgres_conf_changes()}
     else:
-        image = (job.get('pitr_client_image') or '').strip()
+        image = pitr.effective_client_image(job)
+        if job.get('pitr_client_auto') and not image:
+            state_version = load_state(job_id).get('server_version') or job.get('pitr_client_server_version')
+            image = pitr.resolve_client_image(state_version).get('image') or ''
         res = _run(server, scripts.mysql_prereq_script(db_config, image), timeout=180)
         facts = pitr.parse_kv_output(res.stdout)
         mode = 'docker' if (db_config.get('docker_container') or '').strip() else 'direct'
@@ -293,17 +296,55 @@ def _tick(job_id, force=False):
     return _mysql_tick(job_id, job, server, db_config, targets, force=force)
 
 
+def pin_client_image(job_id, job, server, server_version):
+    """Automatic matching: resolve the image for server_version, pull it on the server, pin its digest.
+
+    Returns the job with the new fields. Raises PitrError."""
+    resolved = pitr.resolve_client_image(server_version)
+    if not resolved['image']:
+        raise PitrError('automatic client matching needs the server version; run the PITR check first')
+    res = _run(server, scripts.pull_pin_script(resolved['image']), timeout=900)
+    facts = pitr.parse_kv_output(res.stdout)
+    digest = facts.get('DIGEST')
+    if not digest:
+        raise PitrError(facts.get('ERROR') or res.stderr.strip()[-300:] or f"docker pull {resolved['image']} failed")
+    conn = _db()
+    conn.execute('UPDATE jobs SET pitr_client_image_digest = ?, pitr_client_server_version = ? WHERE id = ?',
+                 (digest, server_version, job_id))
+    conn.commit()
+    if resolved['warning']:
+        logger.warning(f"PITR: job {job.get('name')}: {resolved['warning']}")
+    logger.info(f"PITR: job {job.get('name')}: client tools pinned to {digest} for {server_version}")
+    return dict(job, pitr_client_image_digest=digest, pitr_client_server_version=server_version)
+
+
 def _mysql_tick(job_id, job, server, db_config, targets, force=False):
     m = _m()
     cfg = pitr.settings()
-    res = _run(server, scripts.ensure_and_scan_script(job_id, db_config, job.get('pitr_client_image') or '',
+    state = load_state(job_id)
+    docker_db = bool((db_config.get('docker_container') or '').strip())
+    if job.get('pitr_client_auto') and not docker_db and not job.get('pitr_client_image_digest'):
+        job = pin_client_image(job_id, job, server, job.get('pitr_client_server_version') or
+                               state.get('server_version'))
+        force = True
+    res = _run(server, scripts.ensure_and_scan_script(job_id, db_config, pitr.effective_client_image(job),
                                                       force=force),
                timeout=180)
     scan = pitr.parse_scan_output(res.stdout)
     if scan['errors'] or res.returncode != 0:
         raise PitrError('; '.join(scan['errors']) or res.stderr.strip() or 'streamer setup failed')
-    state = load_state(job_id)
-    plan = pitr.plan_shipment(state, scan)
+    version_change = None
+    old_key, new_key = pitr.version_key(state.get('server_version')), pitr.version_key(scan['server_version'])
+    if old_key and new_key and old_key != new_key:
+        version_change = f'server version changed ({old_key} -> {new_key})'
+        logger.warning(f"PITR: job {job.get('name')}: {version_change}; a new chain starts, take an anchored dump")
+        if job.get('pitr_client_auto') and not docker_db and \
+                pitr.version_key(job.get('pitr_client_server_version')) != new_key:
+            job = pin_client_image(job_id, job, server, scan['server_version'])
+            # restart the streamer with the client matching the new version
+            _run(server, scripts.ensure_and_scan_script(job_id, db_config, pitr.effective_client_image(job),
+                                                        force=True), timeout=180)
+    plan = pitr.plan_shipment(state, scan, version_change=version_change)
     now = pitr._utc(scan['now']) if scan['now'] else _now()
     in_sync, alive = pitr.streamer_health(scan['active'], scan['heartbeat'],
                                           scan['now'] or int(_now().timestamp()), cfg['heartbeat_max_age'])

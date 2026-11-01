@@ -102,6 +102,7 @@ def pitr_settings_from_request(data, current=None):
         'pitr_retention_days': data.get('pitr_retention_days',
                                         current.get('pitr_retention_days') or DEFAULT_RETENTION_DAYS),
         'pitr_client_image': (data.get('pitr_client_image', current.get('pitr_client_image')) or '').strip(),
+        'pitr_client_auto': bool(data.get('pitr_client_auto', current.get('pitr_client_auto', False))),
     }
     try:
         fields['pitr_interval'] = int(fields['pitr_interval'])
@@ -249,6 +250,54 @@ def suggested_client_image(version_text):
     return f"percona/percona-server:{version[0]}.{version[1]}"
 
 
+# Client-tool images the automatic matching picks from (major, minor). The official mysql
+# images have no mysqlbinlog; Percona Server's have it, built from the same code base.
+CLIENT_IMAGE_MYSQL = ((5, 7), (8, 0), (8, 4))
+CLIENT_IMAGE_MARIADB = ((10, 3), (10, 4), (10, 5), (10, 6), (10, 11), (11, 4), (11, 8))
+
+
+def version_key(version_text):
+    """'8.4.13' / '10.6.22-MariaDB-...' -> 'mysql 8.4' / 'mariadb 10.6' (None if unknown)."""
+    v = _version_tuple(version_text)
+    if not v:
+        return None
+    return f'{server_flavor(version_text)} {v[0]}.{v[1]}'
+
+
+def resolve_client_image(version_text):
+    """Automatic client image for a server version: {'image', 'warning'} (image None if unknown).
+
+    MySQL X.Y -> percona/percona-server:X.Y, MariaDB X.Y -> mariadb:X.Y; a line not in the
+    supported list gets the nearest newer supported one (newer clients read older servers'
+    binlogs) with a warning, or the newest one if the server is newer than all of them.
+    """
+    v = _version_tuple(version_text)
+    if not v:
+        return {'image': None, 'warning': 'unknown server version'}
+    flavor = server_flavor(version_text)
+    lines = CLIENT_IMAGE_MARIADB if flavor == 'mariadb' else CLIENT_IMAGE_MYSQL
+    repo = 'mariadb' if flavor == 'mariadb' else 'percona/percona-server'
+    want = v[:2]
+    if want in lines:
+        return {'image': f'{repo}:{want[0]}.{want[1]}', 'warning': None}
+    newer = [line for line in lines if line > want]
+    pick = newer[0] if newer else lines[-1]
+    return {'image': f'{repo}:{pick[0]}.{pick[1]}',
+            'warning': f'no {repo} image for {want[0]}.{want[1]}; using the nearest '
+                       f"{'newer' if newer else 'older'} line {pick[0]}.{pick[1]}"}
+
+
+def effective_client_image(job):
+    """The image the job's MySQL client tools run from ('' = host binaries / container's own image).
+
+    Automatic matching (pitr_client_auto) uses the digest pinned for the job (never a moving tag);
+    otherwise the manual pitr_client_image.
+    """
+    if job.get('pitr_client_auto'):
+        return (job.get('pitr_client_image_digest') or '').strip()
+    return (job.get('pitr_client_image') or '').strip()
+
+
 def scratch_server_image(version_text):
     """Image for the throwaway restore server: same flavor and major.minor as production."""
     version = _version_tuple(version_text)
@@ -294,9 +343,15 @@ def evaluate_mysql_prereqs(facts, mode='direct', client_image=''):
     """
     checks = []
     if facts.get('connect_error') or not facts.get('version'):
-        checks.append(_check('Database connection', 'fail', facts.get('connect_error') or 'no answer',
-                             'the streamer host can log in to the database',
-                             'Check host/port/credentials and that this server is a trusted source of the database.'))
+        error = facts.get('connect_error') or 'no answer'
+        fix = 'Check host/port/credentials and that this server is a trusted source of the database.'
+        if re.search(r"Can't connect|Lost connection|timed out|refused|Unknown MySQL server host|"
+                     r"not allowed to connect|handshake", error, re.I):
+            fix += (' Managed databases (e.g. DigitalOcean) only accept connections from their trusted sources: '
+                    "add this server's public IP to the database's trusted sources in the provider console "
+                    '(manual step; backupx never changes it).')
+        checks.append(_check('Database connection', 'fail', error,
+                             'the streamer host can log in to the database', fix))
         _append_host_checks(checks, facts, mode, client_image)
         return checks
 
@@ -628,7 +683,7 @@ def _segment(files, chain_id):
     }
 
 
-def plan_shipment(state, scan):
+def plan_shipment(state, scan, version_change=None):
     """Decide what to ship and whether the chain broke.
 
     state: the job's pitr_state row (dict; may be empty for a first run) with
@@ -695,6 +750,12 @@ def plan_shipment(state, scan):
     elif generic_gap and chain_id:
         first = closed[0] if closed else open_file
         new_chain(binlog_seq(first['name']) if first else None, generic_gap,
+                  split_binlog_name(first['name'])[0] if first else base)
+    elif version_change and chain_id:
+        # Same server, new major.minor (upgrade): restores past this point need a dump taken by the new
+        # version, so start a new chain; times before it stay restorable from the old one
+        first = closed[0] if closed else open_file
+        new_chain(binlog_seq(first['name']) if first else None, version_change,
                   split_binlog_name(first['name'])[0] if first else base)
     if scan_uuid:
         uuid = scan_uuid

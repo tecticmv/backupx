@@ -744,8 +744,9 @@ def test_database_backup_with_pitr_anchor_flags(monkeypatch):
         assert '--tag pitr-anchor' in script and '$ANCHOR_TAGS' in script
         assert ' -p' not in script.split('--single-transaction', 1)[0].rsplit('\n', 1)[-1]
         if image:
-            assert 'docker run --rm -i --network host --entrypoint sh percona/percona-server:8.4' in \
-                script.replace('$DOCKER', 'docker')
+            run = script.replace('$DOCKER', 'docker')
+            assert 'docker run --rm -i --network host --read-only' in run and '--cap-drop ALL' in run
+            assert '--entrypoint sh percona/percona-server:8.4' in run
             assert '< "$MYCNF"' in script                       # option file on stdin
     assert recorded and recorded[-1][0] == 'epet'
 

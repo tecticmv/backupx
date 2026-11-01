@@ -438,16 +438,20 @@ def mysql_items(prereq, target, host, job, cfg=None, restart_selected=None):
     image_checks = [c for c in image_checks if c and c['status'] in ('fail', 'warn')]
     if (charset_error and charset_error['check'] == 'mysqlbinlog starts') and not image_checks:
         image_checks = [charset_error]
-    current_image = (job.get('pitr_client_image') or '').strip()
-    if image_checks and not (db_config_container(target)) and suggestion and suggestion != current_image:
+    resolved = pitr.resolve_client_image(version)
+    auto_image = resolved['image'] or suggestion
+    if image_checks and not (db_config_container(target)) and auto_image and not job.get('pitr_client_auto'):
         docker_ok = (prereq.get('facts') or {}).get('docker') == '1' or prereq.get('docker')
         worst = 'fail' if any(c['status'] == 'fail' for c in image_checks) else 'warn'
         items.append(_item(
-            'mysql.client_image', image_checks[0]['check'], worst, f'Use {suggestion} as the binlog client',
-            'job_field', auto=bool(docker_ok), settings_={'pitr_client_image': suggestion},
+            'mysql.client_image', image_checks[0]['check'], worst,
+            f'Match the client tools to the server automatically ({auto_image})',
+            'job_field', auto=bool(docker_ok), settings_={'pitr_client_auto': True, 'image': auto_image},
             default_selected=not (charset_error and len(image_checks) == 1 and image_checks[0] is charset_error),
-            description=f"Sets the job's client image to {suggestion}: mysqlbinlog/mysqldump then run from that "
-                        'image (docker on the server), matching the database.',
+            description=f'mysqlbinlog/mysqldump run from {auto_image} (docker on the server, read-only container, '
+                        'credentials on a tmpfs), pinned by digest; re-pinned only when the server version '
+                        'changes (that also starts a new chain).' +
+                        (f" Note: {resolved['warning']}." if resolved['warning'] else ''),
             manual={'steps': ['Install docker on the server, or install the client matching the database: ' +
                               (image_checks[0].get('fix') or '')], 'commands': []}))
 

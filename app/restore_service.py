@@ -910,7 +910,7 @@ def _task_scratch(ctx):
 def _client_image(job, db_config):
     if (db_config.get('docker_container') or '').strip():
         return ''
-    return (job.get('pitr_client_image') or '').strip() if job.get('pitr_enabled') else ''
+    return pitr.effective_client_image(job) if job.get('pitr_enabled') else ''
 
 
 def _parse_verify(out, engine):

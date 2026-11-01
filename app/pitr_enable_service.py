@@ -451,12 +451,16 @@ def apply_item(ctx, item, job, server, db_config, kind, target, facts, admin, ta
         pitr_service.save_state(job['id'], kind='postgres', info=json.dumps(info))
         ctx.log(f"wal-g installed ({info_fields.get('walg_version')})")
     elif action == 'job_field':
-        image = (item.get('settings') or {}).get('pitr_client_image')
+        version = facts.get('server_version') or ''
+        try:
+            pinned = pitr_service.pin_client_image(job['id'], job, server, version)
+        except pitr_service.PitrError as e:
+            raise tasks.TaskError(f'Pinning the client image failed: {e}')
         conn = m.get_db_connection()
-        conn.execute('UPDATE jobs SET pitr_client_image = ? WHERE id = ?', (image, job['id']))
+        conn.execute('UPDATE jobs SET pitr_client_auto = TRUE WHERE id = ?', (job['id'],))
         conn.commit()
-        job['pitr_client_image'] = image
-        ctx.log(f"Client image set to {image}")
+        job.update(pinned, pitr_client_auto=True)
+        ctx.log(f"Client tools matched to {version}: {pinned['pitr_client_image_digest']}")
     elif action == 'client_charset':
         dropin_dir = target.get('config_path', '').rsplit('/', 1)[0] if target.get('config_path') else None
         dropin_dir = dropin_dir or pe.host_dropin_dir((facts.get('host') or {}).get('includedirs'),
