@@ -146,7 +146,8 @@ def compare(before, after, restored):
         elif got != b:
             mismatches.append({'table': table, 'production': b, 'restored': got})
     ok = not mismatches and not missing and not errors
-    return {'ok': ok, 'compared': len(quiet), 'quiet': len(quiet), 'changed': changed[:50],
+    identical = len(quiet) - len(mismatches) - len(missing)
+    return {'ok': ok, 'compared': len(quiet), 'identical': identical, 'quiet': len(quiet), 'changed': changed[:50],
             'mismatches': mismatches[:50], 'missing': missing[:50], 'errors': errors[:50],
             'tables': len(before)}
 
@@ -155,7 +156,7 @@ def summary(result):
     if result.get('error'):
         return f"failed: {result['error']}"
     c = result.get('comparison') or {}
-    text = (f"{c.get('compared', 0)} of {c.get('tables', 0)} tables identical to production at "
+    text = (f"{c.get('identical', c.get('compared', 0))} of {c.get('tables', 0)} tables identical to production at "
             f"{result.get('target_time')}")
     if c.get('changed'):
         text += f"; {len(c['changed'])} changed during the drill (not compared)"
