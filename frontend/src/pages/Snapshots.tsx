@@ -61,7 +61,8 @@ import {
 import { useTasks } from "@/hooks/useTasks";
 import { useStepUp } from "@/hooks/useStepUp";
 
-export default function Snapshots() {
+/** Snapshot list of a job; `embedded` drops the page header (used in the job detail Snapshots tab). */
+export default function Snapshots({ embedded = false }: { embedded?: boolean }) {
   const { track } = useTasks();
   const { withStepUp } = useStepUp();
   const { jobId } = useParams<{ jobId: string }>();
@@ -266,9 +267,10 @@ export default function Snapshots() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className={`flex items-center ${embedded ? "justify-end" : "justify-between"}`}>
+        {!embedded && (
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" onClick={() => navigate("/jobs")}>
+          <Button variant="ghost" size="icon" onClick={() => navigate(`/jobs/${jobId}`)}>
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
@@ -278,6 +280,7 @@ export default function Snapshots() {
             </p>
           </div>
         </div>
+        )}
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={fetchData}>
             <RefreshCw className="h-4 w-4 mr-2" />
@@ -296,12 +299,14 @@ export default function Snapshots() {
             )}
             Run Backup
           </Button>
-          <Link to={`/jobs/${jobId}/edit`}>
-            <Button variant="outline" size="sm">
-              <Pencil className="h-4 w-4 mr-2" />
-              Edit
+          {!embedded && (
+            <Button variant="outline" size="sm" asChild>
+              <Link to={`/jobs/${jobId}?tab=settings`}>
+                <Pencil className="h-4 w-4 mr-2" />
+                Edit
+              </Link>
             </Button>
-          </Link>
+          )}
         </div>
       </div>
 
@@ -344,7 +349,13 @@ export default function Snapshots() {
             <Select
               value={storageId || storages[0]?.id || ""}
               onValueChange={(value) =>
-                setSearchParams(value === storages[0]?.id ? {} : { storage: value })
+                setSearchParams((prev) => {
+                  // Keep other params (e.g. ?tab= on the job detail page)
+                  const next = new URLSearchParams(prev);
+                  if (value === storages[0]?.id) next.delete("storage");
+                  else next.set("storage", value);
+                  return next;
+                })
               }
             >
               <SelectTrigger className="w-64">

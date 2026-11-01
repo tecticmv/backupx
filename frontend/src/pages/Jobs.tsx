@@ -398,7 +398,12 @@ export default function Jobs() {
                     </TableCell>
                     <TableCell>
                       <div>
-                        <p className="font-medium">{job.name}</p>
+                        <Link
+                          to={`/jobs/${jobId}`}
+                          className="font-medium hover:underline underline-offset-4"
+                        >
+                          {job.name}
+                        </Link>
                         <p className="text-xs text-muted-foreground">{jobId}</p>
                       </div>
                     </TableCell>

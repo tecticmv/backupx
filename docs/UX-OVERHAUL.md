@@ -8,8 +8,8 @@ the *Status* section at the end.
 | Phase | Scope | State |
 |---|---|---|
 | P0 | Foundation: task runner, task tray, per-storage results, CSRF, step-up, plan hashes, writable known_hosts, long ops as tasks | **done** |
-| P1 | Health checks + fixes + dashboard | next |
-| P2 | Restore wizard (scratch DB first, then gated replace-production) | later |
+| P1 | Health checks + fixes + dashboard | **done** |
+| P2 | Restore wizard (scratch DB first, then gated replace-production) | next |
 | P3 | Enable-PITR wizard | later |
 
 ## Decisions (from the owner, apply to every phase)
@@ -112,8 +112,8 @@ new `repo_locks(urls, exclusive=False)` keyed `repo:<sha256(url)[:16]>`.
 Backups (scheduled and manual), restores, ZIPs and repository init hold it
 **shared**; `repo_in_use(url)` tries it exclusively. P1's stale-lock fix: only
 `restic unlock` when `repo_in_use()` is false (and hold the exclusive lock while
-unlocking). Retention forget/prune don't take it yet (they run under the job
-lock; P1 should add it if the unlock fix can race them).
+unlocking). Retention forget runs inside the backup (shared lock held); prune
+takes it shared since P1.
 
 ### Per-storage run results
 
@@ -187,12 +187,173 @@ and when enabled needs step-up; P2's scratch-DB wizard replaces it.
   `logs?after=`), Cancel, Download.
 - `src/hooks/useStepUp.tsx`: `ensureStepUp(reason)` before a confirm action,
   or `withStepUp(() => fetch(...), reason)` to retry after the password dialog.
-- Dashboard activity: official shadcn `chart` (recharts) weekly stacked bars;
-  the hand-rolled `ContributionGraph` is gone.
+- Dashboard activity: P0 used a shadcn `chart` of weekly runs; P1 replaced it
+  (activity timeline + storage usage chart); the hand-rolled `ContributionGraph` is gone.
 - shadcn rule: official components only, added with the CLI (`npx
   shadcn@latest add <name>`). In this repo the CLI writes `import { cn } from
   "cn"` and adds an npm package `cn`: change the import to `@/lib/utils` and
   `npm uninstall cn` after every add.
+
+## P1 architecture (health checks, fixes, dashboard)
+
+### Model
+
+- `app/health.py` (pure, no I/O): `Issue` (family, kind, severity
+  `critical`/`warning`/`info`, title, plain explanation, resource, evidence,
+  optional log excerpt, `fix` action or `manual` steps+commands, `alert`
+  flag), `issue_id(family, *resource)` = sha256[:16] (stable across variants:
+  `backup_failed` and `storage_unreachable` of one job share an id),
+  `classify_error()` for restic/S3/SSH output, `lock_decision()` (stale-lock
+  rule), the detectors, `alert_actions()`.
+- `app/health_service.py`: state snapshot, findings, probes, sweep, alerts,
+  the fix catalogue (`FIXES`) and the fix tasks; dashboard overview/activity.
+- Tables (`TASK_SCHEMA_SQL`): `health_findings` (issue_id PK, family, kind,
+  resource, title, severity, alert, first_seen, last_seen, resolved_at,
+  snoozed_until, alerted_at, resolved_alerted_at, evidence) and
+  `health_probes` (key PK, data JSON, checked_at): the cached results of the
+  expensive checks `ssh:<server>`, `repo:<job>:<storage>`,
+  `check:<job>:<storage>`, `stats:<job>:<storage>`, `prereq:<job>`.
+  `notification_channels` got `last_error`, `last_error_at`,
+  `last_success_at` (every send records its result, token redacted).
+- `app_settings`: `scheduler_heartbeat` (the leader writes it on every lock
+  tick), `backupx_hostnames` (container hostnames, for the stale-lock rule),
+  `health_last_sweep`.
+
+### Detectors
+
+Cheap ones run on every `GET /api/health` from the database; probe-based
+ones read `health_probes`.
+
+| Kind | Source | Severity | Fix (tier) |
+|---|---|---|---|
+| `job_overdue` | overdue_since | critical | `run_now` (safe) |
+| `backup_failed` | latest `run_results` per active storage | critical if no storage succeeded, else warning | `rerun_failed` (safe, only those storages) |
+| `storage_unreachable` | same, every error a timeout/5xx/524/connection error | same | `storage_retry` (safe: endpoint test, retries with back-off `FIX_RETRY_BACKOFF`) |
+| `repo_open_error` | run error or repo probe: wrong password | critical | manual |
+| `retention_failed` / `retention_refused` / `prune_failed` | latest `retention_runs` | warning | `retry_forget` (safe: unlock-if-eligible + forget) / manual / manual |
+| `pitr_streamer_down` | pitr_state: unit not active, heartbeat older than `PITR_HEARTBEAT_MAX_AGE`, or 3+ failed ticks | critical if lagging/broken | `pitr_kick` (safe: forced reinstall + restart, waits for a fresh heartbeat) |
+| `wal_archive_failing` | pitr_state (PG) `failing` | critical if lagging | `walg_repush` (safe: re-install env/script, `wal-g st ls`) |
+| `wal_archiving_off` | pitr_state (PG) `inactive` | warning | manual (postgresql.conf lines) |
+| `wal_mirror_failed` | pitr_state info.mirror | warning | `wal_mirror_retry` (safe) |
+| `pitr_broken` / `pitr_unanchored` | pitr_state | critical / warning | `anchored_dump` (confirm; prerequisites must pass, else manual) |
+| `pitr_client_image` | prereq probe: binlog/dump client check fails or warns, docker present | warning | `pitr_client_image` (confirm: set the job field + forced kick) |
+| `scheduler_down` | heartbeat older than max(120 s, 4 x lock interval + 30 s) | critical | manual |
+| `notification_failing` | channel last_error_at > last_success_at | warning | `notification_test` (safe) |
+| `ssh_unreachable` | SSH probe | critical if a scheduled/PITR job uses the server | `ssh_retest` (safe) |
+| `host_key_changed` | SSH probe ("REMOTE HOST IDENTIFICATION HAS CHANGED") | critical | `trust_host_key` (confirm: old/new SHA256 fingerprints) |
+| `restic_missing` | SSH probe | warning | `install_restic` (safe) |
+| `low_disk` | SSH probe, `/`, `/var`, `/tmp` at 90 % or more | info | manual |
+| `repo_not_initialized` | repo probe, restic exit 10 only | warning | `init_repo` (safe; the plan re-checks exit 10) |
+| `repo_unreachable` | repo probe, any other open error | warning | `recheck_repo` (safe) |
+| `stale_lock` / `stale_lock_foreign` | repo probe locks + `lock_decision` | warning | `unlock_stale` (safe) / `unlock_lock` (confirm) |
+| `stray_key` | repo probe: a key that isn't the job's | warning | `remove_key` (confirm; phrase = key id) |
+| `repo_check_failed` | weekly `restic check` (no read-data) | critical | `repair_index` (confirm) |
+
+### Stale locks
+
+`lock_decision(lock, now, managed_hosts, backupx_hosts, advisory_held,
+repo_in_use)`: lock age under `STALE_LOCK_MIN_AGE` (1800 s) -> `wait` (never
+touched); a backupx advisory lock on any job sharing the repository (`<job>`
+= backup/prune, `<job>:pitr`, `<job>:walg-base`) or the repository lock held
+-> `wait`; host = a managed server (address or probed `hostname`) or a
+recorded backupx container hostname -> `auto` (safe fix); otherwise
+`confirm` (the plan shows host, pid, age). Advisory locks are checked
+read-only through `pg_locks`, never by taking them (that would make a
+starting backup skip). The fix holds `repo_locks(exclusive=True)`, re-reads
+the lock and decides again, then runs `restic unlock` (never `--remove-all`)
+**on the lock's own host** over SSH when backupx manages it (restic there
+also sees the pid is gone), else in the container, and lists the locks again
+to verify. Prune now holds the repository lock shared too.
+
+### Fixes
+
+Each fix is a `Fix(action, tier, label, description, order)` with
+`plan(issue)` (from current state; raises `NotApplicable`) and
+`execute(ctx, plan, issue)`, registered as task kind `fix.<action>` (task
+tier safe/confirm). Every fix task re-finds the issue (gone: succeeds with
+`skipped`), re-derives the plan and compares the stored `plan_hash` (confirm
+tier; a mismatch fails the task with nothing done), holds the advisory lock
+`fix:job:<id>[:<storage>]` (or `fix:<type>:<id>`) so two fixes never work on
+one resource at once, uses idempotency key `fix:<issue_id>`, writes audit
+`HEALTH_FIX` (enqueue) and `HEALTH_FIX_DONE` (outcome) and re-syncs the
+findings. Fix-all (`fix.all_safe`, idempotency `fix_all_safe`) re-selects
+safe, unsnoozed issues among the previewed ids and runs them as child tasks
+in waves by `order` (host key 4, SSH 5, unlock 10, install 20, init 30,
+storage retry 45, rerun 50, run now 60, retention 70, PITR 80+,
+notifications 90).
+
+### Sweep and alerts
+
+- Leader, executor `health` (1 thread): every `HEALTH_SWEEP_MINUTES` (60)
+  queue the task `health_sweep` (idempotency `health_sweep:all`; any
+  worker's runner runs it); every `HEALTH_ALERT_INTERVAL` (300 s)
+  `alert_tick` (cheap detectors + findings sync + alerts).
+- Sweep: SSH probe per server (login, hostname, restic, df); per job and
+  storage `restic cat config`, `list locks` + `cat lock`, `key list` (all
+  `--no-lock`, run in the container); `restic check` every
+  `HEALTH_CHECK_DAYS` (7); `restic stats --mode raw-data` every
+  `HEALTH_STATS_HOURS` (24); PITR prerequisites for MySQL/MariaDB jobs. Four
+  threads. Drops probes of deleted resources, then syncs and alerts.
+  `POST /api/health/recheck` runs it for one job/server/storage or all.
+- Alerts: critical, `alert=True`, not snoozed, never alerted -> one message
+  to the channels of type `HEALTH_ALERT_CHANNELS` (default `telegram`) with
+  notify-on-failure on; when it clears -> one "Resolved" message. Claimed
+  with `UPDATE ... WHERE alerted_at IS NULL RETURNING`, so each goes out once
+  across workers. A resolved issue that comes back alerts again. Kinds that
+  already notify elsewhere (backup failures, PITR state transitions,
+  retention failures, channel failures) have `alert=False`, so no duplicate
+  Telegram.
+
+### API
+
+- `GET /api/health?severity=&resource_type=&resource_id=&include_snoozed=1`
+  -> `{summary: {status, total, critical, warning, info, snoozed,
+  safe_fixable, last_sweep_at, sweep_running}, issues: [...]}` (syncs the
+  findings: first_seen / last_seen / resolved).
+- `POST /api/health/recheck {resource_type?, resource_id?}` -> 202 task.
+- `POST /api/fixes {issue_id, preview?, idempotency_key?, plan_hash?,
+  confirm?}`: preview -> `{plan, plan_hash, confirm_text?, fix}`; safe ->
+  202 task; confirm -> step-up (403 `step_up_required`), then
+  `check_confirmed` (400 `plan_hash_missing` / `confirmation_mismatch`, 409
+  `plan_changed` with the new plan); also 409 `issue_resolved`, 409
+  `not_applicable`, 400 `manual`.
+- `POST /api/fixes/all-safe {preview: true}` -> `{count, fixes}`;
+  `{issue_ids}` -> 202 parent task.
+- `POST /api/issues/:id/snooze {hours: 0..720}` (0 = unsnooze).
+- `GET /api/dashboard/overview[?job_id=]` -> job cards (latest result per
+  storage, PITR window/lag/last_error, retention state, next run, issue
+  counts), activity (history, retention_runs, tasks, PITR state changes,
+  audit; 7 days), storage usage (from the `stats:` probes).
+
+### Other changes
+
+- Backup timeout: a watchdog kills a silent restic (restic retries a
+  5xx/524 storage for about 15 min inside `cat config` without printing),
+  and storages that finished before the deadline keep their result (only
+  the unfinished ones become `timeout`; the error includes the last output).
+- `pitr_service._tick(job_id, force=True)` and `ensure_and_scan_script(...,
+  force=True)` reinstall and restart the streamer unconditionally;
+  `check_prereqs` returns `docker`.
+- `_dispatch_notification(channel, ...)` sends to one channel (raises).
+
+### Frontend
+
+- Dashboard: status bar (All good / N issues, k critical; last check;
+  Re-check; "Fix all safe issues (n)" with a Popover preview), issues
+  Accordion by severity (evidence HoverCard + log Collapsible; Fix, Review
+  (AlertDialog: plan, downtime, details, typed phrase, step-up, plan_changed
+  handling) or How to fix (steps, copyable commands, Re-check); snooze
+  menu), job cards (ToggleGroup All/Issues/Running; per-storage chips, PITR,
+  next run, retention; Run now, Restore placeholder, menu), activity
+  timeline, storage usage chart (shadcn chart).
+- `/jobs/:jobId` (`pages/JobDetail.tsx`), Tabs synced to `?tab=`: Overview
+  (card + this job's issues), Runs (per-storage results, full logs, Retry
+  failed storages), Snapshots (embedded), Recovery (P2 placeholder + PITR
+  status), Settings (JobFormModal).
+- New: `components/health/*`, `components/dashboard/*`,
+  `components/jobs/JobRuns.tsx`, `hooks/useHealth.ts`, `lib/health.ts`,
+  `lib/format.ts`, `types/health.ts`. Added shadcn components: accordion,
+  alert-dialog, hover-card, popover, tabs, toggle, toggle-group.
 
 ## Status
 
@@ -205,23 +366,47 @@ API, CSRF, step-up, plan hash, per-storage results + rerun, restore/zip/init
 as tasks, known_hosts) and `tests/test_secrets_argv.py` (file restore task:
 secrets only on stdin, never in params/task_logs).
 
-### Next (P1: health + fixes + dashboard)
+### Done (P1)
 
-- Health model: per job/server/storage/PITR checks with severity, a stable
-  `issue_key` (dedup for Telegram alerts) and suggested fixes; table of
-  check results; hourly sweep (one APScheduler entry on the leader, executor
-  `maintenance` or a task) + "Re-check" button → task.
-- Fix catalogue: each fix = task kind + tier + `plan()` function. Safe:
-  re-run failed storages (`storage_ids`), install restic, init repo,
-  stale-lock unlock (rules above). Confirm: host-key trust (edit
-  `/app/data/known_hosts`), anchored dump, config edits, grants (one-time
-  credential prompt; pass it to the task in memory, not in params - add a
-  short-lived in-process secret handoff keyed by task id).
-- Dashboard: health summary, failing items first, per-storage last run
-  (`/api/jobs/:id/runs`), Retry-failed button.
-- Critical-only Telegram alerts with per-issue dedup (reuse the PITR
-  transition idea: alert on enter/leave).
-- Consider adding repo locks to retention forget/prune.
+Everything in "P1 architecture". Tests: `tests/test_health.py` (every
+detector on fixture states, stable ids, stale-lock rules incl. live lock,
+advisory lock, repository in use and foreign host, alert dedup + resolved +
+reopen, tier enforcement: fix-all never runs a confirm fix, confirm needs
+preview + step-up + plan hash + phrase, the plan is re-derived at execution
+(host key changed after confirming -> refused, known_hosts untouched),
+idempotency, snooze, API, dashboard overview, sweep, probe classification
+and redaction, SSH unlock keeps secrets out of argv, a backup timeout keeps
+per-storage results).
+
+E2E with throwaway containers (sshd target, 2 x MinIO, a small HTTP proxy
+that answers 524 on demand, MySQL 8.4 + a systemd streamer host, Postgres):
+repositories missing -> fix all (init); kill -9 restic mid-backup -> the
+fresh lock is left alone -> fake clock +31 min -> stale lock is a safe fix
+-> fix all (unlock on the lock's host, then retry only the failed storage)
+-> next run ok; storage answers 524 -> `storage_unreachable` -> the retry
+re-ran only that storage; streamer unit stopped -> `pitr_streamer_down` ->
+restart fix -> active; SSH host key rotated -> confirm-tier trust with
+old/new fingerprints. No secrets in task logs/params/results, probes,
+findings or audit.
+
+Not covered end to end: the PostgreSQL/WAL-G fixes, repair index, key
+removal and client image change (plan/exec unit level only); the fix dialogs
+were checked against a mock API, not clicked against the real backend.
+
+### Next (P2: restore wizard)
+
+- Scratch-DB restore on 172.19.5.200 as a parent task with child tasks
+  (download -> scratch container -> verify), TTL 24 h; then
+  replace-production as `TIER_MAINTENANCE` with an automatic pre-restore
+  backup (kept 30 days) and Undo. Reuse `security.present_plan` /
+  `check_confirmed`, `useStepUp`, the `FixReviewDialog` pattern
+  (`components/health/FixReviewDialog.tsx`), the job page's Recovery tab
+  (placeholder now) and the job card's Restore button (placeholder now).
+- Health can raise "scratch DB left over" style issues the same way (a
+  detector + a safe cleanup fix in `health_service.FIXES`).
+- The one-time admin credential handoff (grants) is still to build (P3).
+- Task tray history is 60 min: activity links to older tasks open an empty
+  tray.
 
 ### Later
 

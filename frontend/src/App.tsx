@@ -7,6 +7,7 @@ import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Jobs from "@/pages/Jobs";
 import Snapshots from "@/pages/Snapshots";
+import JobDetail from "@/pages/JobDetail";
 import History from "@/pages/History";
 import Servers from "@/pages/Servers";
 import Databases from "@/pages/Databases";
@@ -65,6 +66,14 @@ function AppRoutes() {
               element={
                 <ProtectedRoute>
                   <Jobs />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/jobs/:jobId"
+              element={
+                <ProtectedRoute>
+                  <JobDetail />
                 </ProtectedRoute>
               }
             />

@@ -39,6 +39,14 @@ export default function Layout({ children }: LayoutProps) {
       ];
     }
 
+    // Job detail page
+    if (path.match(/^\/jobs\/[^/]+\/?$/)) {
+      return [
+        { path: "/jobs", label: "Backup Jobs" },
+        { path: path, label: "Job", isCurrentPage: true },
+      ];
+    }
+
     const label = routeNames[path] || "Page";
     return [{ path, label, isCurrentPage: true }];
   };

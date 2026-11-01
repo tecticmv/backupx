@@ -364,7 +364,13 @@ def lock(monkeypatch):
         state['taken'].append(job_id)
         yield state['acquired']
 
+    @contextmanager
+    def fake_repo_locks(connect, urls, exclusive=False):
+        state.setdefault('repo_locks', []).append((list(urls), exclusive))
+        yield True
+
     monkeypatch.setattr(main, 'job_run_lock', fake_lock)
+    monkeypatch.setattr(main, 'repo_locks', fake_repo_locks)
     monkeypatch.setattr(main, '_lock_connection', lambda: None)
     return state
 
@@ -373,6 +379,8 @@ def test_prune_runs_under_the_job_lock(env, lock):
     main = env['main']
     main.prune_target('job1', _job(), _target(), main.retention.settings())
     assert lock['taken'] == ['job1']
+    # ...and holds the repository lock shared, so the stale-lock fix never unlocks under it
+    assert len(lock['repo_locks']) == 1 and lock['repo_locks'][0][1] is False
     (call,) = env['fake'].restic_calls('prune')
     assert call['cmd'][:4] == ['restic', 'prune', '--max-unused', '10%']
     assert '--dry-run' not in call['cmd']

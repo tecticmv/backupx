@@ -97,6 +97,31 @@ TASK_SCHEMA_SQL = """
         created_at TIMESTAMP NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_run_logs_run ON run_logs(run_id);
+
+    -- Health checks (app/health*.py): one row per issue (first seen, snooze,
+    -- alert de-duplication) and the cached results of the expensive probes
+    CREATE TABLE IF NOT EXISTS health_findings (
+        issue_id TEXT PRIMARY KEY,
+        family TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        resource_type TEXT,
+        resource_id TEXT,
+        title TEXT,
+        severity TEXT NOT NULL,
+        alert BOOLEAN DEFAULT TRUE,
+        first_seen TIMESTAMP NOT NULL,
+        last_seen TIMESTAMP NOT NULL,
+        resolved_at TIMESTAMP,
+        snoozed_until TIMESTAMP,
+        alerted_at TIMESTAMP,
+        resolved_alerted_at TIMESTAMP,
+        evidence TEXT
+    );
+    CREATE TABLE IF NOT EXISTS health_probes (
+        key TEXT PRIMARY KEY,
+        data TEXT,
+        checked_at TIMESTAMP NOT NULL
+    );
 """
 
 
@@ -754,6 +779,13 @@ class PostgresBackend(DatabaseBackend):
             self.add_column('jobs', 'pitr_retention_days', 'INTEGER', '7')
         if 'pitr_client_image' not in job_columns:
             self.add_column('jobs', 'pitr_client_image', 'TEXT')
+
+        # Notification channels remember their last delivery result (health check)
+        channel_columns = self.get_table_columns('notification_channels')
+        for column, ctype in (('last_error', 'TEXT'), ('last_error_at', 'TIMESTAMP'),
+                              ('last_success_at', 'TIMESTAMP')):
+            if column not in channel_columns:
+                self.add_column('notification_channels', column, ctype)
 
         # History rows link to their per-storage run results
         if 'run_id' not in self.get_table_columns('history'):

@@ -40,6 +40,7 @@ from . import security
 from .security import requires_step_up
 from . import pitr
 from . import pitr_service
+from . import health_service
 from .cron import cron_fields, cron_trigger
 
 # =============================================================================
@@ -602,6 +603,8 @@ def _on_scheduler_event(event):
     if event.job_id.endswith((pitr.PITR_SCHEDULE_SUFFIX, pitr.WALG_BASE_SCHEDULE_SUFFIX)):
         # PITR ticks report through their own state/alerts; a missed tick is just late
         return
+    if event.job_id in (HEALTH_SWEEP_ID, HEALTH_ALERT_ID):
+        return
     if event.job_id == retention.PRUNE_SCHEDULE_ID:
         # Not a backup job: don't mark any job failed, just alert
         threading.Thread(target=send_notification,
@@ -623,7 +626,9 @@ def _new_scheduler(timezone):
         # backup window can't starve it.
         executors={'default': SchedulerThreadPool(BACKUP_MAX_CONCURRENT),
                    'maintenance': SchedulerThreadPool(1),
-                   'pitr': SchedulerThreadPool(pitr.settings()['max_concurrent'])},
+                   'pitr': SchedulerThreadPool(pitr.settings()['max_concurrent']),
+                   # Health: queues the hourly sweep task, runs the cheap alert ticks
+                   'health': SchedulerThreadPool(1)},
         job_defaults={
             'coalesce': True,  # several missed fire times -> one run
             'max_instances': 1,
@@ -642,6 +647,9 @@ _scheduler_state_lock = threading.RLock()
 _scheduled_crons = {}  # job_id -> cron the running scheduler has for it
 _scheduled_prune = {'cron': None}  # cron of the retention prune entry, None if not scheduled
 _scheduled_pitr = {}  # APScheduler id (<job>__pitr / <job>__walg_base) -> (kind, value) it was added with
+_scheduled_health = {'on': False}  # health sweep + alert tick entries are in the running scheduler
+HEALTH_SWEEP_ID = '__health_sweep__'
+HEALTH_ALERT_ID = '__health_alerts__'
 _scheduler_leader = None
 SCHEDULER_LOCK_INTERVAL = int(os.environ.get('SCHEDULER_LOCK_INTERVAL', 15))
 
@@ -679,6 +687,7 @@ def sync_schedules():
             _scheduled_crons.clear()
             _scheduled_prune['cron'] = None
             _scheduled_pitr.clear()
+            _scheduled_health['on'] = False
         if not scheduler.running:
             scheduler.start()
 
@@ -711,6 +720,25 @@ def sync_schedules():
 
         _sync_prune_schedule()
         _sync_pitr_schedules(jobs)
+        _sync_health_schedule()
+
+
+def _sync_health_schedule():
+    """Hourly health sweep (queued as a task) and the alert tick (call with _scheduler_state_lock)."""
+    if _scheduled_health['on']:
+        return
+    cfg = health_service.settings()
+    try:
+        scheduler.add_job(health_service.schedule_sweep, 'interval', minutes=cfg['sweep_minutes'],
+                          id=HEALTH_SWEEP_ID, executor='health', replace_existing=True,
+                          next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2))
+        scheduler.add_job(health_service.alert_tick, 'interval', seconds=cfg['alert_seconds'],
+                          id=HEALTH_ALERT_ID, executor='health', replace_existing=True,
+                          next_run_time=datetime.now(timezone.utc) + timedelta(seconds=60))
+    except Exception as e:
+        logger.error(f"Could not schedule the health checks: {e}")
+        return
+    _scheduled_health['on'] = True
 
 
 def _desired_pitr_schedules(jobs):
@@ -800,6 +828,7 @@ def _sync_prune_schedule():
 def _leader_sync():
     """sync_schedules from the lock thread, returning its DB connection to the pool after"""
     try:
+        health_service.record_scheduler_heartbeat()
         sync_schedules()
     finally:
         try:
@@ -818,6 +847,7 @@ def _stop_scheduler():
         _scheduled_crons.clear()
         _scheduled_prune['cron'] = None
         _scheduled_pitr.clear()
+        _scheduled_health['on'] = False
 
 
 def refresh_schedules():
@@ -1816,18 +1846,26 @@ def send_notification(job_id, job_name, status, message, duration):
             continue
 
         try:
-            if channel['type'] == 'email':
-                send_email_notification(channel, job_name, status, message, duration)
-            elif channel['type'] == 'slack':
-                send_slack_notification(channel, job_name, status, message, duration)
-            elif channel['type'] == 'discord':
-                send_discord_notification(channel, job_name, status, message, duration)
-            elif channel['type'] == 'telegram':
-                send_telegram_notification(channel, job_name, status, message, duration)
-            elif channel['type'] == 'webhook':
-                send_webhook_notification(channel, job_name, status, message, duration)
+            _dispatch_notification(channel, job_name, status, message, duration)
+            health_service.record_channel_result(channel.get('id'))
         except Exception as e:
             logger.error(f"Failed to send {channel['type']} notification to {channel['name']}: {e}")
+            health_service.record_channel_result(channel.get('id'), e, health_service._channel_secrets(channel))
+
+
+def _dispatch_notification(channel, job_name, status, message, duration):
+    """Send one notification to one channel; raises on failure."""
+    senders = {
+        'email': send_email_notification,
+        'slack': send_slack_notification,
+        'discord': send_discord_notification,
+        'telegram': send_telegram_notification,
+        'webhook': send_webhook_notification,
+    }
+    sender = senders.get(channel['type'])
+    if sender is None:
+        raise ValueError(f"Unknown channel type: {channel['type']}")
+    sender(channel, job_name, status, message, duration)
 
 
 class BackupRun:
@@ -1923,6 +1961,8 @@ def record_run_results(job_id, job, targets, results, preamble=None, stderr_text
             exit_code = r.get('exit_code')
             if status_override:
                 status = status_override
+            elif r.get('status'):
+                status = r['status']  # e.g. 'timeout' for a storage the run's deadline cut off
             elif exit_code == 0:
                 status = 'success'
             elif exit_code is None:
@@ -1931,7 +1971,10 @@ def record_run_results(job_id, job, targets, results, preamble=None, stderr_text
                 status = 'failed'
             error = None
             if status != 'success':
-                if exit_code is None:
+                if exit_code is None and status == 'timeout' and r.get('output'):
+                    tail = [l for l in r['output'] if l.strip()][-2:]
+                    error = f"{overall_error or 'timed out'}; last output: {' '.join(tail)}"
+                elif exit_code is None:
                     error = overall_error or (' '.join(head[-3:]) if head else 'did not run')
                 else:
                     error = _target_error(r)
@@ -2617,15 +2660,35 @@ def _stream_restic_progress(proc, job_id, timeout, target_names):
     preamble = []
     current = None
     deadline = time.monotonic() + timeout
+    # A restic that hangs without printing anything (e.g. retrying a storage
+    # that answers 5xx for 15 minutes inside `restic cat config`) would never
+    # reach the per-line deadline check: a watchdog kills it on time.
+    fired = threading.Event()
+
+    def watchdog():
+        fired.set()
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    timer = threading.Timer(timeout, watchdog)
+    timer.daemon = True
+    timer.start()
+
+    def timed_out():
+        proc.kill()
+        proc.wait()
+        err = subprocess.TimeoutExpired(cmd='restic', timeout=timeout)
+        err.partial = (preamble, results)  # what each storage did before the deadline
+        return err
 
     def label(text):
         return f"{target_names[current]}: {text}" if count > 1 and current is not None else text
 
     for line in proc.stdout:
-        if time.monotonic() > deadline:
-            proc.kill()
-            proc.wait()
-            raise subprocess.TimeoutExpired(cmd='restic', timeout=timeout)
+        if time.monotonic() > deadline or fired.is_set():
+            timer.cancel()
+            raise timed_out()
 
         line = line.strip()
         if not line:
@@ -2691,9 +2754,27 @@ def _stream_restic_progress(proc, job_id, timeout, target_names):
             if task is not None:
                 task.log(label(str(error)), stream='stderr')
 
+    timer.cancel()
+    if fired.is_set():
+        raise timed_out()
     stderr_text = proc.stderr.read() if proc.stderr else ''
     proc.wait()
     return proc.returncode, stderr_text, preamble, results
+
+
+def _timeout_results(err, targets):
+    """Per-storage results of a run that hit its timeout: finished storages keep their outcome."""
+    partial = getattr(err, 'partial', None)
+    if not partial:
+        return [], []
+    preamble, results = partial
+    out = []
+    for r in results[:len(targets)]:
+        r = dict(r)
+        if r.get('exit_code') is None:
+            r['status'] = 'timeout'
+        out.append(r)
+    return preamble, out
 
 
 def _restic_target_blocks(job, targets, backup_cmd):
@@ -2852,8 +2933,10 @@ exit $BACKUPX_FAILED
         return _finish_backup(job_id, job, targets, start_time, returncode, stderr_text,
                               preamble, results, 'Backup')
 
-    except subprocess.TimeoutExpired:
-        record_run_results(job_id, job, targets, [], overall_error='Backup timed out', status_override='timeout')
+    except subprocess.TimeoutExpired as e:
+        preamble, partial = _timeout_results(e, targets)
+        record_run_results(job_id, job, targets, partial, preamble=preamble, overall_error='Backup timed out',
+                           status_override=None if partial else 'timeout')
         update_job_status(job_id, 'timeout')
         add_history(job_id, job['name'], 'timeout', 'Backup timed out', 0)
         send_notification(job_id, job['name'], 'timeout', 'Backup timed out', 0)
@@ -3148,8 +3231,10 @@ exit $BACKUPX_FAILED
             pitr_service.record_anchor(job_id, dict(job, id=job_id), anchor, anchor_error, targets, results)
         return outcome
 
-    except subprocess.TimeoutExpired:
-        record_run_results(job_id, job, targets, [], overall_error='Database backup timed out', status_override='timeout')
+    except subprocess.TimeoutExpired as e:
+        preamble, partial = _timeout_results(e, targets)
+        record_run_results(job_id, job, targets, partial, preamble=preamble,
+                           overall_error='Database backup timed out', status_override=None if partial else 'timeout')
         update_job_status(job_id, 'timeout')
         add_history(job_id, job['name'], 'timeout', 'Database backup timed out', 0)
         send_notification(job_id, job['name'], 'timeout', 'Database backup timed out', 0)
@@ -3416,8 +3501,10 @@ def prune_target(job_id, job, target, cfg):
                 return
             logger.info(f"Retention prune: job {job_name} on {name} starting"
                         + (" (dry run)" if cfg['dry_run'] else ""))
-            proc = _restic_local(job, target, retention.prune_args(cfg['dry_run'], cfg['prune_max_unused']),
-                                 cfg['prune_timeout'], cfg['lock_wait'])
+            # Shared repository lock: the stale-lock fix never unlocks under a running prune
+            with repo_locks(_lock_connection, [job_repo_url(dict(job, id=job_id), target)]):
+                proc = _restic_local(job, target, retention.prune_args(cfg['dry_run'], cfg['prune_max_unused']),
+                                     cfg['prune_timeout'], cfg['lock_wait'])
         if proc.returncode != 0:
             raise RetentionError(_restic_error(proc, 'prune'))
         parsed = retention.parse_prune_output(proc.stdout)
@@ -6758,6 +6845,170 @@ def api_run_log(run_id):
                     'truncated': bool(row['truncated'])})
 
 
+# --- Health checks and fixes ---------------------------------------------------
+
+@app.route('/api/health')
+@login_required
+@limiter.exempt
+def api_health():
+    """Open issues + summary. ?severity=&resource_type=&resource_id=&include_snoozed=1"""
+    severity = request.args.get('severity') or None
+    if severity and severity not in ('critical', 'warning', 'info'):
+        return jsonify({'error': 'severity must be critical, warning or info'}), 400
+    try:
+        result = health_service.evaluate(
+            sync=True, severity=severity, resource_type=request.args.get('resource_type') or None,
+            resource_id=request.args.get('resource_id') or None,
+            include_snoozed=request.args.get('include_snoozed') in ('1', 'true', 'yes'))
+    except Exception as e:
+        logger.exception('Health evaluation failed')
+        try:
+            get_db().rollback()
+        except Exception:
+            pass
+        return jsonify({'error': f'Health check failed: {sanitize_error_message(str(e))}'}), 500
+    return jsonify(result)
+
+
+@app.route('/api/health/recheck', methods=['POST'])
+@login_required
+def api_health_recheck():
+    """Run the expensive checks now: everything, or one job / server / storage."""
+    data = request.get_json(silent=True) or {}
+    rtype, rid = data.get('resource_type') or None, data.get('resource_id') or None
+    if rtype not in (None, 'job', 'server', 'storage') or (rtype and not rid) or (rid and not rtype):
+        return jsonify({'error': 'resource_type must be job, server or storage, with resource_id'}), 400
+    name = None
+    if rtype == 'job':
+        job = get_job(rid)
+        name = job and job.get('name')
+    elif rtype == 'server':
+        server = get_server(rid)
+        name = server and server.get('name')
+    elif rtype == 'storage':
+        cfg = get_s3_config(rid)
+        name = cfg and cfg.get('name')
+    if rtype and not name:
+        return jsonify({'error': f'{rtype.capitalize()} not found'}), 404
+    params = {'resource_type': rtype, 'resource_id': rid}
+    return _enqueue_task_response('health_sweep', params, title=f'Re-check {name}' if name else 'Health check',
+                                  resource_type=rtype or 'system', resource_id=rid or 'health',
+                                  idempotency_key=f'health_sweep:{rtype}:{rid}' if rtype else 'health_sweep:all',
+                                  message='Health check started')
+
+
+@app.route('/api/fixes', methods=['POST'])
+@login_required
+def api_fix():
+    """Preview or start the fix of one issue.
+
+    {issue_id, preview: true} -> plan (+ plan_hash, confirm_text for the confirm tier)
+    safe tier: {issue_id} -> 202 task
+    confirm tier: {issue_id, plan_hash, confirm} + step-up -> 202 task
+    """
+    data = request.get_json(silent=True) or {}
+    issue_id = str(data.get('issue_id') or '')
+    if not issue_id:
+        return jsonify({'error': 'issue_id is required'}), 400
+    try:
+        issue, fix = health_service.prepare(issue_id)
+    except LookupError:
+        return jsonify({'error': 'This issue is no longer present', 'code': 'issue_resolved'}), 409
+    except health_service.NotApplicable:
+        return jsonify({'error': "backupx can't fix this automatically; see the steps", 'code': 'manual'}), 400
+    preview = bool(data.get('preview'))
+    confirm_tier = fix.tier == 'confirm'
+    if confirm_tier and not preview and not security.has_step_up():
+        return security.step_up_required_response()
+    plan_hash = None
+    if preview or confirm_tier:
+        try:
+            plan = fix.plan(issue)
+        except health_service.NotApplicable as e:
+            return jsonify({'error': f'This fix does not apply now: {e}', 'code': 'not_applicable'}), 409
+        confirm_text = fix.confirm_text(issue, plan)
+        if preview:
+            body = security.present_plan(plan, confirm_text)
+            body.update(issue_id=issue.id, fix=health_service.fix_info(fix.action))
+            return jsonify(body)
+        error = security.check_confirmed(plan, data, confirm_text)
+        if error:
+            return error
+        plan_hash = security.plan_hash(plan)
+    user, ip = _actor()
+    try:
+        row, created = health_service.enqueue_fix(issue, fix, plan_hash=plan_hash, created_by=user, ip=ip,
+                                                  client_key=str(data.get('idempotency_key') or '')[:100] or None)
+    except Exception as e:
+        logger.exception('Could not queue fix')
+        return jsonify({'error': f'Could not start the fix: {sanitize_error_message(str(e))}'}), 500
+    if created:
+        _audit('HEALTH_FIX', issue.resource.get('type') or 'job',
+               issue.resource.get('job_id') or issue.resource.get('id'),
+               issue.resource.get('job_name') or issue.resource.get('name'),
+               {'action': fix.action, 'tier': fix.tier, 'issue_id': issue.id, 'kind': issue.kind,
+                'plan_hash': plan_hash, 'task_id': row['id']})
+    return jsonify({'success': True, 'task': tasks.serialize(row), 'deduplicated': not created,
+                    'message': f'{fix.label} started' if created else 'Already running'}), 202
+
+
+@app.route('/api/fixes/all-safe', methods=['POST'])
+@login_required
+def api_fix_all_safe():
+    """{preview: true} -> the safe fixes it would run; {issue_ids: [...]} (from the preview) -> 202 parent task."""
+    data = request.get_json(silent=True) or {}
+    ids = data.get('issue_ids')
+    if data.get('preview') or not ids:
+        candidates = health_service.safe_candidates()
+        return jsonify({'count': len(candidates), 'fixes': [
+            {'issue_id': i.id, 'action': f.action, 'label': f.label, 'title': i.title, 'resource': i.resource}
+            for i, f in candidates]})
+    if not isinstance(ids, list) or not all(isinstance(i, str) and len(i) <= 64 for i in ids) or len(ids) > 500:
+        return jsonify({'error': 'issue_ids must be a list of issue ids'}), 400
+    _audit('HEALTH_FIX_ALL', 'system', 'health', 'Fix all safe issues', {'issue_ids': ids})
+    return _enqueue_task_response('fix.all_safe', {'issue_ids': ids}, title=f'Fix {len(ids)} safe issue(s)',
+                                  resource_type='system', resource_id='health', idempotency_key='fix_all_safe',
+                                  message='Fixing safe issues')
+
+
+@app.route('/api/issues/<issue_id>/snooze', methods=['POST'])
+@login_required
+def api_issue_snooze(issue_id):
+    """{hours: 1..720} snoozes the issue (hidden, no alert); {hours: 0} un-snoozes it."""
+    data = request.get_json(silent=True) or {}
+    try:
+        hours = int(data.get('hours', 24))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'hours must be a number'}), 400
+    if hours < 0 or hours > 720:
+        return jsonify({'error': 'hours must be between 0 and 720'}), 400
+    row = health_service.snooze(issue_id, hours)
+    if row is None:
+        return jsonify({'error': 'Issue not found'}), 404
+    _audit('HEALTH_SNOOZE' if hours else 'HEALTH_UNSNOOZE', row.get('resource_type') or 'system',
+           row.get('resource_id'), row.get('title'), {'issue_id': issue_id, 'hours': hours})
+    issue = health_service.find_issue(issue_id)
+    if issue is None:
+        return jsonify({'issue': None, 'snoozed_until': _iso_utc(row.get('snoozed_until'))})
+    return jsonify({'issue': health_service.serialize_issue(issue, row)})
+
+
+@app.route('/api/dashboard/overview')
+@login_required
+@limiter.exempt
+def api_dashboard_overview():
+    """Job cards, activity timeline and cached storage usage for the dashboard (?job_id= for one job)."""
+    try:
+        return jsonify(health_service.dashboard_overview(request.args.get('job_id') or None))
+    except Exception as e:
+        logger.exception('Dashboard overview failed')
+        try:
+            get_db().rollback()
+        except Exception:
+            pass
+        return jsonify({'error': sanitize_error_message(str(e))}), 500
+
+
 # --- Handlers ------------------------------------------------------------------
 
 def _task_job(ctx):
@@ -7005,6 +7256,9 @@ def init_app():
 
     # Writable known_hosts (merges the mounted ~/.ssh/known_hosts in)
     seed_known_hosts()
+
+    # restic locks this container leaves carry its hostname (stale-lock rule)
+    health_service.remember_backupx_hostname()
 
     # Background tasks: fail the ones a dead worker left running, start this worker's runner
     try:

@@ -1,559 +1,217 @@
-import { useState, useEffect } from "react";
-import { Link } from "react-router-dom";
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
+import { useCallback, useMemo, useState } from "react";
+import { AlertTriangle, FolderSync, Plus } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Progress } from "@/components/ui/progress";
-import { BackupActivityChart } from "@/components/BackupActivityChart";
-import { toast } from "sonner";
-import type { Jobs, HistoryEntry, PitrSummary } from "@/types/job";
-import PitrBadge from "@/components/PitrBadge";
-import { formatWindow } from "@/lib/pitr";
+import { Button } from "@/components/ui/button";
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import HealthStatusBar from "@/components/health/HealthStatusBar";
+import IssueList from "@/components/health/IssueList";
+import JobCard from "@/components/dashboard/JobCard";
+import ActivityTimeline from "@/components/dashboard/ActivityTimeline";
+import StorageUsageChart from "@/components/dashboard/StorageUsageChart";
 import JobFormModal from "@/components/JobFormModal";
-import {
-  Play,
-  Camera,
-  CheckCircle2,
-  XCircle,
-  Clock,
-  AlertCircle,
-  Loader2,
-  FolderSync,
-  TrendingUp,
-  CalendarClock,
-  Plus,
-  Activity,
-  Timer,
-  Archive,
-  RefreshCw,
-  Database,
-  Server,
-  AlertTriangle,
-} from "lucide-react";
-import { useTasks } from "@/hooks/useTasks";
+import { useHealth, usePolledJson, useRunJob } from "@/hooks/useHealth";
+import { formatDateTime, formatRelative } from "@/lib/format";
+import type { DashboardOverview, JobCardData } from "@/types/health";
 
-interface ContributionDay {
-  date: string;
-  success: number;
-  failed: number;
-  total: number;
-}
+type JobFilter = "all" | "issues" | "running";
 
-interface DashboardStats {
-  total_jobs: number;
-  success_jobs: number;
-  failed_jobs: number;
-  running_jobs: number;
-  scheduled_jobs: number;
-  overdue_jobs?: number;
-  overdue_job_names?: string[];
-  pitr?: (PitrSummary & { job_id: string; name: string })[];
-  success_rate: number;
-  success_rate_period: string;
-  last_24h: {
-    success: number;
-    failed: number;
-    total: number;
-  };
-  daily_stats: Array<{
-    date: string;
-    day: string;
-    success: number;
-    failed: number;
-    total: number;
-  }>;
-  contribution_data: ContributionDay[];
-  next_backup: string | null;
-  next_backup_job: string | null;
-  avg_duration: number;
-  total_snapshots: number;
+function hasProblems(job: JobCardData) {
+  return (
+    job.issues.critical + job.issues.warning + job.issues.info > 0 ||
+    job.failed_storage_ids.length > 0 ||
+    !!job.overdue_since ||
+    ["failed", "error", "timeout"].includes(job.status)
+  );
 }
 
 export default function Dashboard() {
-  const { track } = useTasks();
-  const [jobs, setJobs] = useState<Jobs>({});
-  const [history, setHistory] = useState<HistoryEntry[]>([]);
-  const [stats, setStats] = useState<DashboardStats | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [runningJobs, setRunningJobs] = useState<Set<string>>(new Set());
+  const [showSnoozed, setShowSnoozed] = useState(false);
+  const [filter, setFilter] = useState<JobFilter>("all");
   const [jobModalOpen, setJobModalOpen] = useState(false);
 
-  useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 30000);
-    return () => clearInterval(interval);
-  }, []);
+  const overview = usePolledJson<DashboardOverview>("/api/dashboard/overview");
+  const health = useHealth({ include_snoozed: showSnoozed });
+  const refreshOverview = overview.refresh;
+  const refreshHealth = health.refresh;
 
-  const fetchData = async () => {
-    try {
-      const [jobsRes, historyRes, statsRes] = await Promise.all([
-        fetch("/api/jobs"),
-        fetch("/api/history"),
-        fetch("/api/dashboard/stats"),
-      ]);
+  const refreshAll = useCallback(() => {
+    refreshHealth();
+    refreshOverview();
+  }, [refreshHealth, refreshOverview]);
 
-      if (jobsRes.ok) {
-        setJobs(await jobsRes.json());
-      }
-      if (historyRes.ok) {
-        const historyData = await historyRes.json();
-        setHistory(historyData.slice(0, 10));
-      }
-      if (statsRes.ok) {
-        setStats(await statsRes.json());
-      }
-    } catch (error) {
-      console.error("Failed to fetch data:", error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  const runJob = useRunJob(refreshAll);
 
-  const runBackup = async (jobId: string) => {
-    setRunningJobs((prev) => new Set(prev).add(jobId));
-    try {
-      const response = await fetch(`/api/jobs/${jobId}/run`, {
-        method: "POST",
-      });
-      const data = await response.json();
-      if (data.success) {
-        track(data.task);
-        toast.success(data.deduplicated ? "A backup of this job is already queued" : "Backup started");
-        fetchData();
-      } else {
-        toast.error(data.error || "Failed to start backup");
-      }
-    } catch {
-      toast.error("Failed to start backup");
-    } finally {
-      setRunningJobs((prev) => {
-        const next = new Set(prev);
-        next.delete(jobId);
-        return next;
-      });
-    }
-  };
+  const jobs = useMemo(() => overview.data?.jobs ?? [], [overview.data]);
+  const counts = useMemo(
+    () => ({
+      all: jobs.length,
+      issues: jobs.filter(hasProblems).length,
+      running: jobs.filter((j) => j.running).length,
+    }),
+    [jobs]
+  );
+  const visibleJobs = useMemo(() => {
+    const list = filter === "issues" ? jobs.filter(hasProblems) : filter === "running" ? jobs.filter((j) => j.running) : jobs;
+    // Problems first, then by name
+    return [...list].sort((a, b) => Number(hasProblems(b)) - Number(hasProblems(a)) || a.name.localeCompare(b.name));
+  }, [jobs, filter]);
 
-  const jobsList = Object.entries(jobs);
-
-  const getStatusIcon = (status: string) => {
-    switch (status) {
-      case "success":
-        return <CheckCircle2 className="h-4 w-4 text-emerald-500" />;
-      case "failed":
-        return <XCircle className="h-4 w-4 text-destructive" />;
-      case "running":
-        return <Loader2 className="h-4 w-4 text-primary animate-spin" />;
-      case "timeout":
-        return <Clock className="h-4 w-4 text-amber-500" />;
-      default:
-        return <AlertCircle className="h-4 w-4 text-muted-foreground" />;
-    }
-  };
-
-  const getStatusBadge = (status: string) => {
-    const variants: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
-      success: "default",
-      failed: "destructive",
-      running: "secondary",
-      timeout: "destructive",
-      pending: "outline",
-    };
-    const labels: Record<string, string> = {
-      success: "Success",
-      failed: "Failed",
-      running: "Running",
-      timeout: "Timeout",
-      pending: "Pending",
-    };
-    return (
-      <Badge variant={variants[status] || "outline"} className={status === "success" ? "bg-emerald-600 hover:bg-emerald-600" : ""}>
-        {labels[status] || status}
-      </Badge>
-    );
-  };
-
-  const formatDuration = (seconds: number) => {
-    if (seconds < 60) return `${Math.round(seconds)}s`;
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.round(seconds % 60);
-    if (mins < 60) return `${mins}m ${secs}s`;
-    const hours = Math.floor(mins / 60);
-    const remainingMins = mins % 60;
-    return `${hours}h ${remainingMins}m`;
-  };
-
-  const formatTime = (timestamp: string) => {
-    const date = new Date(timestamp);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffMins = Math.floor(diffMs / 60000);
-    const diffHours = Math.floor(diffMins / 60);
-    const diffDays = Math.floor(diffHours / 24);
-
-    if (diffMins < 1) return "Just now";
-    if (diffMins < 60) return `${diffMins}m ago`;
-    if (diffHours < 24) return `${diffHours}h ago`;
-    if (diffDays < 7) return `${diffDays}d ago`;
-    return date.toLocaleDateString();
-  };
-
-  const formatNextBackup = (isoString: string | null) => {
-    if (!isoString) return null;
-    const date = new Date(isoString);
-    const now = new Date();
-    const diffMs = date.getTime() - now.getTime();
-    const diffMins = Math.floor(diffMs / 60000);
-    const diffHours = Math.floor(diffMins / 60);
-
-    if (diffMins < 0) return "Overdue";
-    if (diffMins < 60) return `in ${diffMins}m`;
-    if (diffHours < 24) return `in ${diffHours}h ${diffMins % 60}m`;
-    const diffDays = Math.floor(diffHours / 24);
-    return `in ${diffDays}d ${diffHours % 24}h`;
-  };
-
-  // Calculate totals from contribution data
-  const totalBackupsYear = stats?.contribution_data?.reduce((sum, d) => sum + d.total, 0) ?? 0;
-  const successBackupsYear = stats?.contribution_data?.reduce((sum, d) => sum + d.success, 0) ?? 0;
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center min-h-[50vh]">
-        <Loader2 className="h-8 w-8 animate-spin text-primary" />
-      </div>
-    );
-  }
+  const summary = health.summary;
+  const showIssues = health.issues.length > 0 || (summary?.snoozed ?? 0) > 0 || showSnoozed;
 
   return (
     <div className="space-y-6">
-      {!!stats?.overdue_jobs && (
+      <HealthStatusBar summary={summary} onChanged={refreshAll} />
+
+      {health.error && !summary && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
-          <AlertTitle>
-            {stats.overdue_jobs} scheduled {stats.overdue_jobs === 1 ? "job hasn't" : "jobs haven't"} run on schedule
-          </AlertTitle>
-          <AlertDescription>
-            {(stats.overdue_job_names ?? []).join(", ")}
-          </AlertDescription>
+          <AlertTitle>Could not load health checks</AlertTitle>
+          <AlertDescription>{health.error}</AlertDescription>
         </Alert>
       )}
-      {!!stats?.pitr?.length && (
+
+      {showIssues && (
         <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Point-in-time recovery</CardTitle>
-            <CardDescription>Restorable to any second inside each window</CardDescription>
+          <CardHeader>
+            <CardTitle>Issues</CardTitle>
+            <CardDescription>Most urgent first. Safe fixes run with one click; others show the plan first.</CardDescription>
+            {(summary?.snoozed ?? 0) > 0 || showSnoozed ? (
+              <CardAction className="flex items-center gap-2">
+                <Switch id="show-snoozed" checked={showSnoozed} onCheckedChange={setShowSnoozed} />
+                <Label htmlFor="show-snoozed" className="text-sm font-normal">
+                  Show snoozed{summary?.snoozed ? ` (${summary.snoozed})` : ""}
+                </Label>
+              </CardAction>
+            ) : null}
           </CardHeader>
-          <CardContent className="space-y-2">
-            {stats.pitr.map((p) => (
-              <div key={p.job_id} className="flex flex-wrap items-center justify-between gap-2 text-sm">
-                <div className="flex items-center gap-2">
-                  <PitrBadge pitr={p} />
-                  <span className="font-medium">{p.name}</span>
-                </div>
-                <span className="text-xs text-muted-foreground">
-                  {formatWindow(p.window_start, p.window_end)}
-                  {p.lag_minutes !== null && ` · lag ${Math.round(p.lag_minutes)} min`}
-                </span>
-              </div>
-            ))}
+          <CardContent>
+            <IssueList
+              issues={health.issues}
+              onChanged={refreshAll}
+              loading={health.loading}
+              emptyTitle="No open issues"
+              emptyDescription={summary?.snoozed ? "Some issues are snoozed." : "Every check passed."}
+            />
           </CardContent>
         </Card>
       )}
-      {/* Hero Stats Section */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <Card className="bg-gradient-to-br from-emerald-500/10 to-emerald-500/5 border-emerald-500/20">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium">Success Rate</CardTitle>
-            <TrendingUp className="h-4 w-4 text-emerald-500" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-3xl font-bold text-emerald-500">{stats?.success_rate ?? 0}%</div>
-            <Progress
-              value={stats?.success_rate ?? 0}
-              className="mt-2 h-1.5"
-            />
-            <p className="text-xs text-muted-foreground mt-2">
-              Last {stats?.success_rate_period ?? '7 days'}
-            </p>
-          </CardContent>
-        </Card>
 
-        <Card className="bg-gradient-to-br from-primary/10 to-primary/5 border-primary/20">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium">Last 24 Hours</CardTitle>
-            <Activity className="h-4 w-4 text-primary" />
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-baseline gap-2">
-              <span className="text-3xl font-bold text-emerald-500">{stats?.last_24h.success ?? 0}</span>
-              <span className="text-muted-foreground">/</span>
-              <span className="text-3xl font-bold text-destructive">{stats?.last_24h.failed ?? 0}</span>
-            </div>
-            <p className="text-xs text-muted-foreground mt-2">
-              {stats?.last_24h.total ?? 0} backups completed
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium">Next Backup</CardTitle>
-            <CalendarClock className="h-4 w-4 text-primary" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-3xl font-bold">
-              {stats?.next_backup ? formatNextBackup(stats.next_backup) : "—"}
-            </div>
-            <p className="text-xs text-muted-foreground mt-2 truncate">
-              {stats?.next_backup_job ?? "No scheduled backups"}
-            </p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium">Total Snapshots</CardTitle>
-            <Archive className="h-4 w-4 text-primary" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-3xl font-bold">{stats?.total_snapshots ?? 0}</div>
-            <p className="text-xs text-muted-foreground mt-2">
-              Successful backup snapshots
-            </p>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Weekly backup activity (official shadcn chart) */}
       <Card>
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base">Backup Activity</CardTitle>
+        <CardHeader>
+          <CardTitle>Backup jobs</CardTitle>
           <CardDescription>
-            {totalBackupsYear} backups in the last year
-            {successBackupsYear > 0 && (
-              <span className="ml-2 text-emerald-500">
-                ({successBackupsYear} successful)
-              </span>
-            )}
+            {counts.all} {counts.all === 1 ? "job" : "jobs"}
+            {counts.running > 0 && ` · ${counts.running} running`}
           </CardDescription>
+          <CardAction>
+            <Button size="sm" onClick={() => setJobModalOpen(true)}>
+              <Plus />
+              New job
+            </Button>
+          </CardAction>
         </CardHeader>
-        <CardContent>
-          {stats?.contribution_data && (
-            <BackupActivityChart data={stats.contribution_data} />
+        <CardContent className="space-y-4">
+          {jobs.length > 0 && (
+            <ToggleGroup
+              type="single"
+              variant="outline"
+              size="sm"
+              value={filter}
+              onValueChange={(v) => v && setFilter(v as JobFilter)}
+              aria-label="Filter jobs"
+            >
+              <ToggleGroupItem value="all" className="px-3">
+                All ({counts.all})
+              </ToggleGroupItem>
+              <ToggleGroupItem value="issues" className="px-3">
+                Issues ({counts.issues})
+              </ToggleGroupItem>
+              <ToggleGroupItem value="running" className="px-3">
+                Running ({counts.running})
+              </ToggleGroupItem>
+            </ToggleGroup>
+          )}
+
+          {overview.loading && !overview.data ? (
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              {[0, 1, 2].map((i) => (
+                <Skeleton key={i} className="h-60 w-full rounded-xl" />
+              ))}
+            </div>
+          ) : overview.error && !overview.data ? (
+            <Alert variant="destructive">
+              <AlertTriangle className="h-4 w-4" />
+              <AlertTitle>Could not load the dashboard</AlertTitle>
+              <AlertDescription>{overview.error}</AlertDescription>
+            </Alert>
+          ) : jobs.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-10 text-center">
+              <FolderSync className="mb-4 h-12 w-12 text-muted-foreground/50" />
+              <h3 className="font-medium">No backup jobs yet</h3>
+              <p className="mb-4 mt-1 text-sm text-muted-foreground">Create your first backup job to get started</p>
+              <Button onClick={() => setJobModalOpen(true)}>
+                <Plus />
+                Create job
+              </Button>
+            </div>
+          ) : visibleJobs.length === 0 ? (
+            <p className="py-6 text-center text-sm text-muted-foreground">
+              {filter === "running" ? "Nothing is running right now." : "No jobs with problems."}
+            </p>
+          ) : (
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              {visibleJobs.map((job) => (
+                <JobCard key={job.id} job={job} onRun={runJob} />
+              ))}
+            </div>
           )}
         </CardContent>
       </Card>
 
-      {/* Quick Stats Row */}
-      <div className="grid gap-4 md:grid-cols-5">
-        <Card className="bg-card/50">
-          <CardContent className="pt-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-primary/10">
-                <FolderSync className="h-5 w-5 text-primary" />
-              </div>
-              <div>
-                <p className="text-2xl font-bold">{stats?.total_jobs ?? 0}</p>
-                <p className="text-xs text-muted-foreground">Total Jobs</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-        <Card className="bg-card/50">
-          <CardContent className="pt-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-emerald-500/10">
-                <CheckCircle2 className="h-5 w-5 text-emerald-500" />
-              </div>
-              <div>
-                <p className="text-2xl font-bold text-emerald-500">{stats?.success_jobs ?? 0}</p>
-                <p className="text-xs text-muted-foreground">Healthy</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-        <Card className="bg-card/50">
-          <CardContent className="pt-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-destructive/10">
-                <XCircle className="h-5 w-5 text-destructive" />
-              </div>
-              <div>
-                <p className="text-2xl font-bold text-destructive">{stats?.failed_jobs ?? 0}</p>
-                <p className="text-xs text-muted-foreground">Need Attention</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-        <Card className="bg-card/50">
-          <CardContent className="pt-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-primary/10">
-                <CalendarClock className="h-5 w-5 text-primary" />
-              </div>
-              <div>
-                <p className="text-2xl font-bold">{stats?.scheduled_jobs ?? 0}</p>
-                <p className="text-xs text-muted-foreground">Scheduled</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-        <Card className="bg-card/50">
-          <CardContent className="pt-4">
-            <div className="flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-primary/10">
-                <Timer className="h-5 w-5 text-primary" />
-              </div>
-              <div>
-                <p className="text-2xl font-bold">
-                  {stats?.avg_duration ? formatDuration(stats.avg_duration) : "—"}
-                </p>
-                <p className="text-xs text-muted-foreground">Avg Duration</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Jobs and Activity Grid */}
-      <div className="grid gap-6 lg:grid-cols-7">
-        <Card className="lg:col-span-4">
-          <CardHeader className="flex flex-row items-center justify-between">
-            <div>
-              <CardTitle>Backup Jobs</CardTitle>
-              <CardDescription>Manage and run your backup jobs</CardDescription>
-            </div>
-            <div className="flex gap-2">
-              <Button size="sm" variant="outline" onClick={fetchData}>
-                <RefreshCw className="h-4 w-4" />
-              </Button>
-              <Button size="sm" onClick={() => setJobModalOpen(true)}>
-                <Plus className="h-4 w-4 mr-1" />
-                New Job
-              </Button>
-            </div>
-          </CardHeader>
-          <CardContent>
-            {jobsList.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-10 text-center">
-                <FolderSync className="h-12 w-12 text-muted-foreground/50 mb-4" />
-                <h3 className="font-medium">No backup jobs yet</h3>
-                <p className="text-sm text-muted-foreground mt-1 mb-4">
-                  Create your first backup job to get started
-                </p>
-                <Button onClick={() => setJobModalOpen(true)}>
-                  <Plus className="h-4 w-4 mr-2" />
-                  Create Job
-                </Button>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {jobsList.map(([jobId, job]) => (
-                  <div
-                    key={jobId}
-                    className="flex items-center justify-between p-3 rounded-lg border bg-card hover:bg-accent/50 transition-colors"
-                  >
-                    <div className="flex items-center gap-3 min-w-0">
-                      {getStatusIcon(job.status)}
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <p className="font-medium truncate">{job.name}</p>
-                          {job.backup_type === 'database' ? (
-                            <Database className="h-3 w-3 text-muted-foreground" />
-                          ) : (
-                            <Server className="h-3 w-3 text-muted-foreground" />
-                          )}
-                        </div>
-                        <p className="text-xs text-muted-foreground truncate">
-                          {job.backup_type === 'database' ? 'Database Backup' : job.remote_host || 'Local'}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2 ml-4">
-                      {job.schedule_enabled && (
-                        <Badge variant="outline" className="hidden sm:flex">
-                          <CalendarClock className="h-3 w-3 mr-1" />
-                          {job.schedule_cron}
-                        </Badge>
-                      )}
-                      <Button
-                        size="icon"
-                        variant="ghost"
-                        onClick={() => runBackup(jobId)}
-                        disabled={runningJobs.has(jobId) || job.status === "running"}
-                      >
-                        {runningJobs.has(jobId) || job.status === "running" ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Play className="h-4 w-4" />
-                        )}
-                      </Button>
-                      <Link to={`/jobs/${jobId}/snapshots`}>
-                        <Button size="icon" variant="ghost">
-                          <Camera className="h-4 w-4" />
-                        </Button>
-                      </Link>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
+      <div className="grid gap-6 lg:grid-cols-5">
         <Card className="lg:col-span-3">
           <CardHeader>
-            <CardTitle>Recent Activity</CardTitle>
-            <CardDescription>Latest backup operations</CardDescription>
+            <CardTitle>Activity</CardTitle>
+            <CardDescription>Last 7 days, newest first</CardDescription>
           </CardHeader>
           <CardContent>
-            {history.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-10 text-center">
-                <Clock className="h-12 w-12 text-muted-foreground/50 mb-4" />
-                <h3 className="font-medium">No activity yet</h3>
-                <p className="text-sm text-muted-foreground mt-1">
-                  Run a backup to see activity here
-                </p>
-              </div>
+            {overview.data ? (
+              <ActivityTimeline events={overview.data.activity} />
             ) : (
-              <div className="space-y-4">
-                {history.map((entry, idx) => (
-                  <div key={idx} className="flex items-start gap-3">
-                    {getStatusIcon(entry.status)}
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium text-sm truncate">
-                          {entry.job_name}
-                        </span>
-                        {getStatusBadge(entry.status)}
-                      </div>
-                      <div className="flex items-center gap-2 text-xs text-muted-foreground mt-0.5">
-                        <span>{formatDuration(entry.duration)}</span>
-                        <span>•</span>
-                        <span>{formatTime(entry.timestamp)}</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
+              <Skeleton className="h-48 w-full" />
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <CardTitle>Storage usage</CardTitle>
+            <CardDescription>
+              Sizes are refreshed daily
+              {overview.data?.storage_usage_checked_at && (
+                <span title={formatDateTime(overview.data.storage_usage_checked_at)}>
+                  {" "}
+                  · checked {formatRelative(overview.data.storage_usage_checked_at)}
+                </span>
+              )}
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            {overview.data ? (
+              <StorageUsageChart usage={overview.data.storage_usage} />
+            ) : (
+              <Skeleton className="h-48 w-full" />
             )}
           </CardContent>
         </Card>
       </div>
 
-      <JobFormModal
-        open={jobModalOpen}
-        onOpenChange={setJobModalOpen}
-        onSuccess={fetchData}
-      />
+      <JobFormModal open={jobModalOpen} onOpenChange={setJobModalOpen} onSuccess={refreshAll} />
     </div>
   );
 }

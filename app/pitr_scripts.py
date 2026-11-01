@@ -279,10 +279,11 @@ _AS_PG = '''as_pg() {
 }'''
 
 
-def ensure_and_scan_script(job_id, db_config, client_image=''):
+def ensure_and_scan_script(job_id, db_config, client_image='', force=False):
     """Install/refresh the streamer, start it if needed, then report the spool.
 
-    Files are only replaced (and the unit restarted) when their content changed.
+    Files are only replaced (and the unit restarted) when their content changed,
+    or always with force=True (the health fix for a stalled streamer).
     """
     docker_mode = bool((db_config.get('docker_container') or '').strip())
     return f'''
@@ -321,6 +322,7 @@ put "$CONF_DIR/my.cnf" 600 "$CNF_CONTENT" || fail "can't write $CONF_DIR/my.cnf"
 put {STREAMER_PATH} 755 "$STREAMER_CONTENT" || fail "can't write the streamer script"
 put {UNIT_PATH} 644 "$UNIT_CONTENT" || fail "can't write the systemd unit"
 unset CNF_CONTENT
+{'CHANGED=1  # forced reinstall' if force else ''}
 
 if [ "$CHANGED" = 1 ]; then
     $SUDO systemctl daemon-reload

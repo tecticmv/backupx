@@ -192,7 +192,8 @@ def check_prereqs(job_id, job=None, overrides=None):
         mode = 'docker' if (db_config.get('docker_container') or '').strip() else 'direct'
         checks = pitr.evaluate_mysql_prereqs(facts, mode=mode, client_image=image)
         extra = {'server_version': facts.get('version', ''),
-                 'suggested_client_image': pitr.suggested_client_image(facts.get('version', ''))}
+                 'suggested_client_image': pitr.suggested_client_image(facts.get('version', '')),
+                 'docker': facts.get('docker') == '1'}
     if res.returncode != 0 and not facts:
         checks.insert(0, {'check': 'SSH', 'status': 'fail',
                           'current': _m().sanitize_error_message(res.stderr.strip() or 'ssh failed'),
@@ -274,7 +275,8 @@ def _record_failure(job_id, message):
         refresh_state(job_id, dict(job, id=job_id))
 
 
-def _tick(job_id):
+def _tick(job_id, force=False):
+    """One tick. force: re-install and restart the streamer even if nothing changed (health fix)."""
     job, server, db_config, kind = _job_context(job_id)
     if not job.get('pitr_enabled'):
         return False, 'PITR is off for this job'
@@ -283,13 +285,14 @@ def _tick(job_id):
         raise PitrError('no active storage')
     if kind == 'postgres':
         return _pg_tick(job_id, job, server, db_config, targets)
-    return _mysql_tick(job_id, job, server, db_config, targets)
+    return _mysql_tick(job_id, job, server, db_config, targets, force=force)
 
 
-def _mysql_tick(job_id, job, server, db_config, targets):
+def _mysql_tick(job_id, job, server, db_config, targets, force=False):
     m = _m()
     cfg = pitr.settings()
-    res = _run(server, scripts.ensure_and_scan_script(job_id, db_config, job.get('pitr_client_image') or ''),
+    res = _run(server, scripts.ensure_and_scan_script(job_id, db_config, job.get('pitr_client_image') or '',
+                                                      force=force),
                timeout=180)
     scan = pitr.parse_scan_output(res.stdout)
     if scan['errors'] or res.returncode != 0:

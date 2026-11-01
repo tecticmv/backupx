@@ -596,7 +596,9 @@ class TaskContext:
         from .scheduler.locks import repo_locks
         with repo_locks(self._connect_lock, urls, exclusive=exclusive) as acquired:
             if not acquired:
-                raise TaskBusy('A repository this task needs is in exclusive use (unlock/prune)')
+                if exclusive:
+                    raise TaskBusy('A repository this task needs to itself is in use by another backupx run')
+                raise TaskBusy('A repository this task needs is in exclusive use (unlock/repair)')
             yield
 
     # -- processes -------------------------------------------------------
