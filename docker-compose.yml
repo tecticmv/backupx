@@ -46,6 +46,13 @@ services:
       - RESTORE_TTL_HOURS=${RESTORE_TTL_HOURS:-24}
       - PRE_RESTORE_KEEP_DAYS=${PRE_RESTORE_KEEP_DAYS:-30}
       - RESTORE_DOCKER_NETWORK=${RESTORE_DOCKER_NETWORK:-}
+      # Weekly restore drills of PITR jobs (read-only on production; scratch copy on this host)
+      - RESTORE_DRILL_ENABLED=${RESTORE_DRILL_ENABLED:-true}
+      - RESTORE_DRILL_CRON=${RESTORE_DRILL_CRON:-30 3 * * 6}
+      # Enable-PITR wizard maintenance flow (docs/UX-OVERHAUL.md P3)
+      - PITR_MAINT_HEALTH_TIMEOUT=${PITR_MAINT_HEALTH_TIMEOUT:-300}
+      - PITR_MAINT_RECOVERY_MAX_WAIT=${PITR_MAINT_RECOVERY_MAX_WAIT:-7200}
+      - PITR_MANAGED_HOSTS=${PITR_MANAGED_HOSTS:-}
     depends_on:
       postgres:
         condition: service_healthy

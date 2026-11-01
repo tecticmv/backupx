@@ -8,9 +8,18 @@ a few minutes ago, instead of only to last night's dump.
 | MySQL / MariaDB | continuous binlog streaming (`mysqlbinlog --read-from-remote-server --raw --stop-never`), shipped with restic | systemd unit on the job's SSH server, installed by backupx |
 | PostgreSQL | WAL-G (`archive_command` → `wal-g wal-push`, nightly `wal-g backup-push`) | on the database host |
 
-Nothing in this document is applied to a server by itself: enabling PITR on a
-job installs the streamer (MySQL) or wal-g (PostgreSQL) over SSH; database
-configuration changes and restarts are always left to you.
+Policy (changed in P3): backupx may change database configuration and restart
+a database, but **only** through the confirmed maintenance flow of the PITR
+setup wizard (*Enable PITR* on the job card, `/jobs/<id>/pitr-setup`): exact
+plan + downtime estimate, typed database name, password re-entry (step-up),
+plan hash; a fresh backup first (unless one is under 1 h old), a config
+backup, validation, the restart (now or in a scheduled window), a health check
+and automatic rollback on failure (never while the server is still in crash
+recovery). Docker databases only when a conf directory is bind-mounted;
+managed databases (DigitalOcean, RDS, ...) never. Nothing else touches database
+configuration: enabling PITR in the job form still only installs the streamer
+(MySQL) or wal-g (PostgreSQL). Details: `docs/UX-OVERHAUL.md` (P3), proof:
+`docs/PITR-VERIFICATION.md`.
 
 ## MySQL / MariaDB
 
@@ -77,6 +86,25 @@ for more than 26 h after enabling), one "recovered" when it's ok again.
   *mysqlbinlog starts* with its error (not as a version mismatch); one that
   only fails with the host's option files is a warning (*mysqlbinlog reads the
   host option files*), since the streamer doesn't read them.
+
+### Automatic client matching
+
+Per job, *Match the client tools to the server automatically* (wizard item, or
+`pitr_client_auto`): MySQL X.Y -> `percona/percona-server:X.Y`, MariaDB X.Y ->
+`mariadb:X.Y` (nearest newer supported line + a warning otherwise), pulled on
+the job's server and pinned by digest (`pitr_client_image_digest`); re-pinned
+only when the server's major.minor changes. Off for existing jobs: they keep
+their host binaries / manual client image until switched. The containers run
+read-only, without capabilities or published ports; credentials go in on stdin
+to a tmpfs.
+
+### Server upgrades
+
+A change of the server's major.minor (e.g. 8.0 -> 8.4, 10.6 -> 10.11) starts a
+new chain: times before the upgrade stay restorable from the old chain, times
+after it need the next anchored dump (state *broken* until then; the dashboard
+offers the anchored-dump fix). With automatic matching the client is re-pinned
+for the new version at the same time.
 
 ### Client versions (important)
 
@@ -151,7 +179,10 @@ Spool: up to a few files per job (E-Petition ~10 MB/day total).
 - **Installed by backupx** when PITR is enabled: `/usr/local/bin/wal-g`,
   `/etc/wal-g/wal-g.env` (postgres:postgres 0600; S3 keys of the job's
   primary storage, prefix `<prefix>-wal`), `/usr/local/bin/wal-g-archive.sh`.
-- **You apply** (restart window, backupx never restarts PostgreSQL):
+- **Configuration**: the PITR setup applies these with `ALTER SYSTEM`
+  (`archive_command`/`archive_timeout` with `pg_reload_conf()`, `wal_level`/
+  `archive_mode` with a confirmed restart, now or in a window, rolled back with
+  `ALTER SYSTEM RESET` if PostgreSQL isn't healthy afterwards). Or by hand:
 
   ```
   wal_level = replica
@@ -191,6 +222,16 @@ Spool: up to a few files per job (E-Petition ~10 MB/day total).
 - TODO: end-to-end test on the DSpace host after the restart window;
   PostgreSQL 12+ restore layout (`recovery.signal`).
 
+## Restore drills
+
+Weekly (`RESTORE_DRILL_CRON`, Saturday 03:30 scheduler time, one job at a time)
+every PITR job is restored into a scratch copy on the backupx server to a
+recent second and compared with production: checksums of every table read
+before and after the restore (read-only), and every table that didn't change
+in between must be identical in the copy. Result on the job card (*Verified
+restore*) and the job page; a failure alerts and shows as a health issue. Run
+one any time from the job page (*Run drill now*).
+
 ## Settings
 
 | Variable | Default | |
@@ -199,6 +240,13 @@ Spool: up to a few files per job (E-Petition ~10 MB/day total).
 | `PITR_LAG_MINUTES` | 0 (auto) | lag before *lagging*; auto = max(3 × interval, 15) (PostgreSQL: max(15 + 2 × interval, 25)) |
 | `PITR_SHIP_TIMEOUT` | 900 | seconds per shipment |
 | `PITR_HEARTBEAT_MAX_AGE` | 300 | streamer heartbeat older than this = stalled |
+| `PITR_MAINT_HEALTH_TIMEOUT` / `PITR_MAINT_RECOVERY_MAX_WAIT` | 300 / 7200 | seconds a restarted database may take to be healthy / to finish crash recovery (never rolled back meanwhile) |
+| `PITR_FRESH_BACKUP_MAX_AGE` | 3600 | a successful backup newer than this counts as the backup before a restart |
+| `PITR_BINLOG_BASENAME` / `PITR_BINLOG_EXPIRE_DAYS` | mysql-bin / 2 | what the wizard writes for log_bin / binlog expiry |
+| `PITR_MANAGED_HOSTS` | (empty) | extra regex of managed database hosts (built in: DigitalOcean, RDS, Azure, Aiven, PlanetScale) |
+| `CREDENTIAL_TTL` | 900 | seconds a one-time admin login waits for its task |
+| `RESTORE_DRILL_ENABLED` / `RESTORE_DRILL_CRON` | true / `30 3 * * 6` | weekly restore drills |
+| `RESTORE_DRILL_MAX_TABLE_ROWS` / `RESTORE_DRILL_SHIP_WAIT` | 5000000 / 20 | larger tables compared by count / minutes to wait for shipping |
 
 Per job: *Point-in-time recovery* toggle, *Ship every (minutes)* (1–60),
 *Keep (days)* (1–365), *Client image*.

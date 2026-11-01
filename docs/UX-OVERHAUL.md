@@ -10,7 +10,7 @@ the *Status* section at the end.
 | P0 | Foundation: task runner, task tray, per-storage results, CSRF, step-up, plan hashes, writable known_hosts, long ops as tasks | **done** |
 | P1 | Health checks + fixes + dashboard | **done** |
 | P2 | Restore wizard (scratch DB first, then gated replace-production) | **done** |
-| P3 | Enable-PITR wizard | next |
+| P3 | Enable-PITR wizard, maintenance flow, auto client matching, restore drills | **done** |
 
 ## Decisions (from the owner, apply to every phase)
 
@@ -40,7 +40,7 @@ the *Status* section at the end.
   bind-mounted conf dir get manual instructions; never recreate containers.
 - DB grants: one-time admin credential prompt, never stored (and never in argv
   or task params).
-- Out of scope: restore drills.
+- Restore drills: originally out of scope; added in P3 (weekly, checksum-verified, read-only on production).
 
 ## P0 architecture (what later phases build on)
 
@@ -544,6 +544,161 @@ RESTORE_REMOVE, RESTORE_EXTEND, RESTORE_VERIFY_CONFIG.
   components: command, calendar, slider, radio-group, checkbox (npm: cmdk,
   react-day-picker, date-fns).
 
+## P3 architecture (enable-PITR wizard, maintenance flow, drills)
+
+Owner decisions for this phase: backupx MAY change database configuration and
+restart databases, but only through the confirmed maintenance flow below
+(exact plan + downtime estimate + typed database name + step-up + plan hash;
+fresh backup first unless one is under 1 h old; config backup; validation;
+restart; health check; automatic rollback, never while the server is still
+recovering). Docker databases only when a conf dir is bind-mounted (never
+recreate containers); managed databases: no config/restart options at all.
+
+### Model
+
+- `app/pitr_enable.py` (pure): the *target* (how the database runs: `host` /
+  `docker` / `managed` / `remote`, systemd unit or container, config method
+  `dropin` / `bind_mount` / `alter_system` / `conf_d` / `manual`, whether
+  backupx may restart it and why not), remediation *items* from the
+  prerequisite checks, the hashed plan, drop-in merging, `my_print_defaults`
+  override detection and the post-restart `health_decision`.
+- `app/maint_scripts.py` (shell text): host probes, SQL runner with a one-time
+  admin option file (or `sudo mysql` over the socket), config backup (tar under
+  `/var/lib/backupx-pitr/config-backups/<tag>/`), atomic file write/restore
+  (previous version or an "absent" marker kept per run), validation, restart,
+  status polls, the `[client]` charset fix, PostgreSQL equivalents.
+- `app/pitr_enable_service.py`: facts (prerequisite check + probe, cached in
+  `health_probes` `pitrplan:<job>` for 15 min), plan/apply/run state, the
+  tasks `pitr_enable` and `pitr_enable_restart` (maintenance tier).
+- `app/credentials.py` + `tasks.pinned_worker`: the one-time credential
+  handoff (generic). The apply request carries the admin login; it is put in
+  this process's memory keyed by the pre-generated task id and the task is
+  pinned to this worker's runner (`claim_one` skips pinned tasks of other
+  workers). The task takes (removes) it at start; it only reaches the database
+  host on ssh stdin as a 0600 option file removed by a trap. Never in params,
+  result, logs, audit or the database. A pinned task whose worker restarted is
+  failed after `CREDENTIAL_TTL` (900 s) with "start again".
+
+### Items (from failing checks)
+
+| Check | Item | Action | Downtime |
+|---|---|---|---|
+| log_bin off | `mysql.log_bin` | drop-in `log_bin` (+ expiry if never purged: `expire_logs_days=2` on MariaDB < 10.6, else `binlog_expire_logs_seconds`) | restart |
+| server_id 0 | `mysql.server_id` | drop-in | restart |
+| binlog_format / row_image / short expiry | `mysql.binlog_*` | MySQL 8: `SET PERSIST`; MariaDB: `SET GLOBAL` + drop-in (folded into the restart drop-in when a restart happens anyway); docker w/o mount / remote: `SET GLOBAL` + manual config | none |
+| privileges | `mysql.grants` | `GRANT REPLICATION SLAVE, REPLICATION CLIENT, RELOAD ... TO <CURRENT_USER()>` with the one-time login, or copy the SQL | none |
+| client mismatch | `mysql.client_image` | automatic client matching (digest-pinned image) | none |
+| mysqlbinlog rejects `[client] default-character-set` | `mysql.client_charset` | comment it out in `[client]` (backed up), set it for mysql/mysqldump/... in `zz-backupx-client-charset.cnf`; verified, restored on failure | none |
+| archive_command / archive_timeout | `pg.archive_*` | `ALTER SYSTEM` + `pg_reload_conf()` | none |
+| wal_level / archive_mode | `pg.wal_level` / `pg.archive_mode` | `ALTER SYSTEM` (conf.d drop-in only if `allow_alter_system=off`) | restart |
+| wal-g not installed | `pg.walg_install` | existing installer | none |
+| sudo / systemd / docker missing, connection, free space | manual | steps | - |
+
+MySQL host installs write `zz-backupx-pitr.cnf` into the *last included*
+conf.d directory (`/etc/mysql/mariadb.conf.d`, `mysql.conf.d`, `conf.d`,
+`/etc/my.cnf.d`, from the `!includedir` chain). Before restarting, the
+effective options (`my_print_defaults`) must show our values: a later file
+that overrides them (e.g. `skip-log-bin`) blocks the restart. PostgreSQL:
+`ALTER SYSTEM` writes `postgresql.auto.conf`, which is read last (a conf.d
+drop-in would be shadowed by it, so conf.d is only the fallback when ALTER
+SYSTEM is disabled).
+
+### Flow
+
+`POST /api/jobs/:id/pitr/plan` -> `POST /api/jobs/:id/pitr/apply` (step-up,
+typed database-config name, plan hash; 400 `admin_required` / `stale_check`,
+409 `plan_changed` / `busy`) -> task `pitr_enable`:
+
+1. **Apply**: re-derive the plan from fresh facts (hash mismatch -> nothing
+   done), the no-downtime items (wal-g, charset, client image, grants, SQL,
+   MariaDB drop-in + validation when no restart follows, ALTER SYSTEM +
+   reload), re-check.
+2. **Restart** (now, or child task `pitr_enable_restart` with
+   `tasks.not_before` = the window; its restart section is hashed on its own
+   and re-derived at the window, so finished no-downtime items don't change
+   it): fresh backup (`automated` + `pre-maintenance` tags) unless the last
+   success is under `PITR_FRESH_BACKUP_MAX_AGE` (3600 s) or forced -> config
+   backup -> write drop-in / ALTER SYSTEM -> validate (MySQL 8.0.16+
+   `mysqld --validate-config`; MariaDB / older `mysqld --help --verbose`
+   (exit 7 on unknown options) + `my_print_defaults`; PostgreSQL
+   `pg_file_settings` errors (except "setting could not be applied" =
+   pending restart) + `postgres -C`) -> on failure undo and stop ->
+   `systemctl restart --no-block` / `docker restart` -> poll: the new instance
+   (ExecMainStartTimestamp / StartedAt after the restart), connect, settings in
+   effect. `crashed` (failed / auto-restart / exited, no recovery in the log)
+   or `unhealthy` -> restore the config (MySQL file; PostgreSQL `ALTER SYSTEM
+   RESET`/old value when it's up, else `postgresql.auto.conf` from the probed
+   copy) -> restart -> healthy -> task `rolled_back` + alert; still bad ->
+   failed + alert "manual attention". Recovery markers in the log (InnoDB crash
+   recovery, "database system is starting up", ...) or `activating` past
+   `PITR_MAINT_HEALTH_TIMEOUT` (300 s): keep waiting up to
+   `PITR_MAINT_RECOVERY_MAX_WAIT` (7200 s), then fail **without** rollback +
+   alert.
+3. **Stream**: `pitr_enabled` on, forced tick (streamer / wal-g), warm-up
+   until the chain has the server's uuid (fixes the P2 observation; chains
+   created before the streamer recorded the server now also get the uuid).
+4. **Anchor**: anchored dump (MySQL) / `wal-g backup-push` (PostgreSQL), then
+   tick until the state is ok (`PITR_ENABLE_OK_WAIT` 600 s).
+
+Steps are prefixed `Apply:` / `Restart:` / `Stream:` / `Anchor:`; `GET
+/api/jobs/:id/pitr/enable` returns the newest run (parent + scheduled child,
+phase, scheduled time) so the wizard resumes after a reload. Audit:
+`PITR_ENABLE` (queued / finished).
+
+### Automatic client-tool matching
+
+`jobs.pitr_client_auto` (off for existing jobs; the wizard's client item turns
+it on), `pitr_client_image_digest`, `pitr_client_server_version`. MySQL X.Y ->
+`percona/percona-server:X.Y` (the official mysql images have no mysqlbinlog),
+MariaDB X.Y -> `mariadb:X.Y`, unsupported lines -> nearest newer supported
+line with a warning. The image is pulled on the job's server and pinned by
+repo digest; the tick re-pins only when the server's major.minor changes. Any
+server version change (auto or not) starts a new chain: earlier times stay
+restorable, later ones need the next anchored dump (state `broken` until
+then, the existing anchored-dump fix). `pitr.effective_client_image(job)` is
+used by the streamer, prerequisite check, nightly dump and the restore
+verify runner. Client containers run `--read-only --tmpfs /tmp --cap-drop
+ALL --security-opt no-new-privileges`, no published ports, credentials on
+stdin into the tmpfs. Inside images, `mysqldump`/`mysql` fall back to
+`mariadb-dump`/`mariadb` (MariaDB 11). Not built: running the tools on the
+backupx host when the job server has no docker (still host binaries or a
+manual image there).
+
+### Restore drills
+
+`app/drill.py` (pure) + `app/drill_service.py`: task `restore_drill` (one
+job, `POST /api/jobs/:id/restore-drill`, also the safe health fix
+`restore_drill`) and `restore_drill_all` (leader cron `RESTORE_DRILL_CRON`,
+default Saturday 03:30 scheduler TZ; one job at a time; `RESTORE_DRILL_ENABLED`
+default true). Checksum production read-only (`CHECKSUM TABLE`; PostgreSQL md5
+of the ordered row md5s; tables over `RESTORE_DRILL_MAX_TABLE_ROWS` 5 M by
+count), wait until that second is shipped (`RESTORE_DRILL_SHIP_WAIT` 20 min),
+scratch restore on the backupx server (P2 machinery), checksum the copy and
+production again; every table that didn't change between the two production
+reads must match exactly. Result: `health_probes` `drill:<job>`, a history
+row, job card "Verified restore", job page drill card; failure -> critical
+alert + issue `restore_drill_failed`.
+
+### Health hooks
+
+Issues carry `wizard: {kind: 'pitr_enable', job_id}`; IssueItem shows "Open
+PITR setup". New kinds: `pitr_log_bin_off` / `pitr_prereq_failing` (from the
+prerequisite probe of enabled jobs), `pitr_reload_missing`,
+`restore_drill_failed`; `wal_archiving_off` and the manual variant of
+`pitr_unanchored` link to the wizard.
+
+### Frontend
+
+`/jobs/:jobId/pitr-setup` (`pages/PitrSetup.tsx`, `components/pitr-setup/*`,
+`lib/pitrSetup.ts`, `types/pitrSetup.ts`): controlled Tabs Check / Plan /
+Apply / Restart / Stream / Anchor / Done (`?step=`), item checkboxes with
+downtime and admin badges and copyable manual commands, admin login (socket /
+password / run the SQL yourself; the password is cleared after submit),
+restart now or in a window (Calendar + time, UTC shown), typed confirmation +
+step-up, live task log, resume. Entry points: job card "Enable PITR" / menu,
+issues, job page Recovery tab. `components/jobs/RestoreDrillCard.tsx`. No new
+shadcn components were needed.
+
 ## Status
 
 ### Done (P0)
@@ -628,22 +783,54 @@ WAL-G layout (`recovery.signal`, code path untested), the health URL check,
 and the wizard UI was type-checked/linted/built, not clicked against the
 real backend.
 
-### Next (P3: enable-PITR wizard)
+### Done (P3)
 
-- P3 enable-PITR wizard on top of `pitr_service.check_prereqs` + fixes; the
-  one-time admin credential handoff (grants) is still to build.
-- Deploying P2 needs `DOCKER_GID` (socket group on 172.19.5.200) and an image
-  rebuild (docker CLI + wal-g); check `docker exec backup-ui docker ps` works
-  as the backupx user before relying on scratch restores.
-- Rig observation (PITR, not P2): right after enabling, the first chain was
-  recorded with an empty `server_uuid`, so the first dump's anchor wasn't
-  usable until a later tick; a warm-up tick before the dump avoided it. Worth
-  a look in P3 (enable flow).
+Everything in "P3 architecture". Tests: `tests/test_pitr_enable.py` (targets:
+host / docker with and without conf mount / managed / remote; items and the
+MariaDB fold-into-restart; MySQL 8 SET PERSIST; PostgreSQL reload vs restart;
+plan and restart-section hashes; restart_at validation; fresh-backup rule;
+drop-in merge and override detection; health decisions incl. never rolling
+back during recovery; credentials taken once / expiring; admin password only
+in the option file; pinned claims and orphan expiry; API gates (step-up,
+typed name, hash, plan_changed, admin_required, busy); apply-now order and no
+secret in params/logs/audit; validation failure and overridden option block
+the restart; crash -> rollback + alert; recovery -> no rollback; scheduled
+window runs only after not_before and refuses a changed restart plan; plan
+changed after confirm -> nothing done; lost credential; PostgreSQL rollback via
+ALTER SYSTEM RESET; every maintenance script passes `bash -n`),
+`tests/test_prod_safety.py` (SQL allow-list for prerequisite / streamer /
+status / probe / verify scripts, consistent dump flags, unique streamer server
+ids, production imports only in replace/rollback, locked-down client
+containers, auto image resolution, version change -> new chain, trusted-sources
+hint), `tests/test_drill.py`.
+
+E2E (rig `C:/Users/ali/claude-work/2026-11-01-backupx-p3/e2e`, label
+`backupx-p3-rig=1`): MariaDB 10.3 host install (plan shows the restart; bogus
+option elsewhere -> validation blocks, drop-in removed, not restarted; charset
+fix; grants via the root socket; `log_bin` to a missing directory -> mysqld
+fails -> rollback, MariaDB back, alert; apply now -> log_bin ON, streamer,
+anchor, state ok); MySQL 8.4 (SET PERSIST + grants with a one-time `dba`
+login; `skip-log-bin` in a later file -> override detected, no restart; after
+fixing the file -> `mysqld --validate-config`, restart, ok); MariaDB 10.11 in
+docker with a bind-mounted conf dir (docker restart, ok); docker without a
+mount and a managed host: manual only; PostgreSQL 10 (reload item, forced
+unhealthy -> rollback via ALTER SYSTEM RESET, scheduled window 2 min later ->
+restart, base backup, ok). No admin password or other secret in tasks,
+task_logs, audit, probes, the app log, any argv in the backupx container or
+files left on the hosts. Version matrix: see `docs/PITR-VERIFICATION.md`.
+
+Not covered end to end: the wizard UI clicked against the real backend
+(type-checked, linted, built); PostgreSQL conf.d fallback (unit only); a
+crash during real InnoDB recovery (decision unit-tested with log fixtures);
+running client tools on the backupx host for servers without docker (not
+built).
+
+### Next
+
+- Deploy: see `docs/DEPLOY-UX-OVERHAUL.md`.
 - Health could raise "scratch restore left over" if the cleanup tick fails
-  repeatedly (detector + safe fix); not built.
-- Task tray history is 60 min: activity links to older tasks open an empty
-  tray.
+  repeatedly; not built. Task tray history is 60 min.
 
 ### Later
 
-- Restore drills stay out of scope.
+- Client tools on the backupx host for job servers without docker.
