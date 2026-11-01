@@ -3,7 +3,7 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import { ArrowLeft, Database, FolderSync, Loader2, Pencil, Play, RotateCcw } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import IssueList from "@/components/health/IssueList";
@@ -11,6 +11,7 @@ import JobCard from "@/components/dashboard/JobCard";
 import JobRuns from "@/components/jobs/JobRuns";
 import JobFormModal from "@/components/JobFormModal";
 import PitrBadge from "@/components/PitrBadge";
+import JobRestoresList from "@/components/restore/JobRestoresList";
 import Snapshots from "@/pages/Snapshots";
 import { useHealth, usePolledJson, useRunJob } from "@/hooks/useHealth";
 import { formatWindow } from "@/lib/pitr";
@@ -204,14 +205,20 @@ export default function JobDetail() {
                 Restore
               </CardTitle>
               <CardDescription>
-                The guided restore wizard arrives in P2: restore into a scratch database first, then optionally
-                replace production with an automatic safety backup and Undo.
+                Restore into a scratch copy first and check it; then download it or replace production with an
+                automatic safety backup and Undo.
               </CardDescription>
+              <CardAction>
+                <Button asChild>
+                  <Link to={`/restore?job=${encodeURIComponent(jobId)}`}>
+                    <RotateCcw />
+                    Start a restore
+                  </Link>
+                </Button>
+              </CardAction>
             </CardHeader>
             <CardContent>
-              <Button variant="outline" onClick={() => setTab("snapshots")}>
-                Browse snapshots
-              </Button>
+              <JobRestoresList jobId={jobId} />
             </CardContent>
           </Card>
           {job.pitr?.enabled && (

@@ -122,6 +122,41 @@ TASK_SCHEMA_SQL = """
         data TEXT,
         checked_at TIMESTAMP NOT NULL
     );
+
+    -- Restore wizard (app/restore*.py): one row per restore (scratch DB / extract,
+    -- download, file restore); replace-production and undo are recorded on it
+    CREATE TABLE IF NOT EXISTS restores (
+        id TEXT PRIMARY KEY,
+        parent_id TEXT,
+        task_id TEXT,
+        job_id TEXT NOT NULL,
+        job_name TEXT,
+        engine TEXT,
+        point_type TEXT,
+        snapshot_id TEXT,
+        target_time TIMESTAMP,
+        storage_id TEXT,
+        target_type TEXT NOT NULL,
+        server TEXT,
+        container TEXT,
+        work_dir TEXT,
+        plan TEXT,
+        info TEXT,
+        pre_restore_snapshot TEXT,
+        pre_restore_at TIMESTAMP,
+        pre_restore_forgotten_at TIMESTAMP,
+        verify TEXT,
+        cleanup_at TIMESTAMP,
+        status TEXT NOT NULL,
+        error TEXT,
+        replace_task_id TEXT,
+        undo_task_id TEXT,
+        created_by TEXT,
+        created_at TIMESTAMP NOT NULL,
+        updated_at TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_restores_job ON restores(job_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_restores_status ON restores(status);
 """
 
 
@@ -779,6 +814,9 @@ class PostgresBackend(DatabaseBackend):
             self.add_column('jobs', 'pitr_retention_days', 'INTEGER', '7')
         if 'pitr_client_image' not in job_columns:
             self.add_column('jobs', 'pitr_client_image', 'TEXT')
+        # Restore wizard verification settings (key tables, check SQL, health URL), JSON
+        if 'restore_verify' not in job_columns:
+            self.add_column('jobs', 'restore_verify', 'TEXT')
 
         # Notification channels remember their last delivery result (health check)
         channel_columns = self.get_table_columns('notification_channels')

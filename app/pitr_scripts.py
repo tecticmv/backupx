@@ -578,17 +578,19 @@ command -v docker >/dev/null || {{ echo "docker is not installed" >&2; exit 1; }
 if docker ps -a --format '{{{{.Names}}}}' | grep -qx "$NAME"; then
     echo "A container named $NAME exists already; remove it or set NAME=..." >&2; exit 1
 fi
+STEP_N=0
+note() {{ STEP_N=$((STEP_N + 1)); if [ -n "${{BACKUPX_STEPS:-}}" ]; then echo "BACKUPX-STEP $STEP_N/8 $*"; fi; echo "== $*"; }}
 seq_of() {{ printf '%s' "$1" | sed -n 's/.*\\.0*\\([0-9][0-9]*\\)$/\\1/p'; }}
 
-echo "== Work directory: $WORK"
+note "Work directory: $WORK"
 mkdir -p "$WORK/dump" "$WORK/binlog-raw" "$WORK/binlogs"
 
-echo "== Fetching the dump"
+note "Fetching the dump"
 restic -r "$MAIN_REPO"{insecure} restore "$DUMP_SNAPSHOT" --target "$WORK/dump"
 DUMP=$(find "$WORK/dump" -type f -name '*.sql.gz' | head -n1)
 [ -n "$DUMP" ] || {{ echo "no .sql.gz in snapshot $DUMP_SNAPSHOT" >&2; exit 1; }}
 
-echo "== Fetching ${{#BINLOG_SNAPSHOTS[@]}} binlog segment(s)"
+note "Fetching ${{#BINLOG_SNAPSHOTS[@]}} binlog segment(s)"
 for s in "${{BINLOG_SNAPSHOTS[@]}}"; do
     restic -r "$BINLOG_REPO"{insecure} restore "$s" --target "$WORK/binlog-raw"
 done
@@ -610,11 +612,11 @@ done
 [ "${{FILES[0]:-}}" = "$START_FILE" ] || {{ echo "binlog $START_FILE (the dump's position) is missing" >&2; exit 1; }}
 echo "   ${{#FILES[@]}} binlog file(s): ${{FILES[0]}} .. ${{FILES[${{#FILES[@]}}-1]}}"
 
-echo "== Decoding binlogs from $START_FILE:$START_POS until $TARGET_TIME UTC ($BINLOG_IMAGE)"
+note "Decoding binlogs from $START_FILE:$START_POS until $TARGET_TIME UTC ($BINLOG_IMAGE)"
 # The open-file copy can end mid-event: the reader then stops with an error after the
 # last complete event, which is expected (an unfinished transaction is rolled back).
 set +e
-tar -C "$WORK/binlogs" -cf - "${{FILES[@]}}" | docker run --rm -i -e TZ=UTC --entrypoint sh "$BINLOG_IMAGE" -c '
+tar -C "$WORK/binlogs" -cf - "${{FILES[@]}}" | docker run --rm -i --network none -e TZ=UTC --entrypoint sh "$BINLOG_IMAGE" -c '
     mkdir -p /tmp/b && tar -C /tmp/b -xf - && cd /tmp/b &&
     exec "$(command -v mariadb-binlog || command -v mysqlbinlog)" "$@"' sh {skip_gtids} \\
     --start-position="$START_POS" --stop-datetime="$TARGET_TIME" "${{FILES[@]}}" > "$WORK/replay.sql" 2> "$WORK/replay.err"
@@ -628,8 +630,8 @@ if [ $RC -ne 0 ]; then
     fi
 fi
 
-echo "== Starting a scratch $SERVER_IMAGE container ($NAME, no published ports)"
-docker run -d --name "$NAME" {root_env} -e TZ=UTC "$SERVER_IMAGE" {server_args} >/dev/null
+note "Starting a scratch $SERVER_IMAGE container ($NAME, no published ports)"
+docker run -d --name "$NAME" ${{DOCKER_ARGS:-}} {root_env} -e TZ=UTC "$SERVER_IMAGE" {server_args} >/dev/null
 ready=0
 for i in $(seq 1 150); do
     # The entrypoint restarts the server once after initialising; wait for the final one
@@ -643,14 +645,14 @@ for i in $(seq 1 150); do
 done
 [ "$ready" = 1 ] || {{ echo "scratch server did not start; see: docker logs $NAME" >&2; exit 1; }}
 
-echo "== Loading the dump"
+note "Loading the dump"
 gunzip -c "$DUMP" | docker exec -i "$NAME" {client} -uroot
 
-echo "== Replaying binlogs"
+note "Replaying binlogs"
 docker exec -i "$NAME" {client} -uroot < "$WORK/replay.sql"
 
 echo
-echo "== Done. The database as of $TARGET_TIME UTC is in container $NAME:"
+note "Done. The database as of $TARGET_TIME UTC is in container $NAME:"
 echo "   docker exec -it $NAME {client} -uroot"
 echo "   docker exec $NAME {dump_tool} -uroot --all-databases --single-transaction | gzip > restored.sql.gz"
 echo "   Remove when finished: docker rm -f $NAME && rm -rf $WORK"

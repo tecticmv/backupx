@@ -40,11 +40,13 @@ import {
   HardDrive,
   Bell,
   Shield,
+  RotateCcw,
 } from "lucide-react";
 
 const mainItems = [
   { path: "/", label: "Dashboard", icon: LayoutDashboard },
   { path: "/jobs", label: "Backup Jobs", icon: FolderSync },
+  { path: "/restore", label: "Restore", icon: RotateCcw },
   { path: "/history", label: "Run History", icon: History },
 ];
 

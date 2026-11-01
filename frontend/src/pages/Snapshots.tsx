@@ -18,21 +18,11 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   Select,
@@ -50,7 +40,6 @@ import {
   HardDrive,
   Camera,
   Loader2,
-  Info,
   RefreshCw,
   FolderOpen,
   MoreHorizontal,
@@ -59,12 +48,10 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import { useTasks } from "@/hooks/useTasks";
-import { useStepUp } from "@/hooks/useStepUp";
 
 /** Snapshot list of a job; `embedded` drops the page header (used in the job detail Snapshots tab). */
 export default function Snapshots({ embedded = false }: { embedded?: boolean }) {
   const { track } = useTasks();
-  const { withStepUp } = useStepUp();
   const { jobId } = useParams<{ jobId: string }>();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -79,12 +66,6 @@ export default function Snapshots({ embedded = false }: { embedded?: boolean }) 
   const [stats, setStats] = useState<RepoStats | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
-
-  // Restore dialog state
-  const [restoreDialogOpen, setRestoreDialogOpen] = useState(false);
-  const [restoreSnapshot, setRestoreSnapshot] = useState<Snapshot | null>(null);
-  const [targetPath, setTargetPath] = useState("/");
-  const [isRestoring, setIsRestoring] = useState(false);
 
   // Download ZIP state
   const [downloadingZip, setDownloadingZip] = useState<string | null>(null);
@@ -154,47 +135,6 @@ export default function Snapshots({ embedded = false }: { embedded?: boolean }) 
       toast.error("Failed to start backup");
     } finally {
       setIsRunning(false);
-    }
-  };
-
-  const openRestoreDialog = (snapshot: Snapshot) => {
-    setRestoreSnapshot(snapshot);
-    setTargetPath("/");
-    setRestoreDialogOpen(true);
-  };
-
-  const handleRestore = async () => {
-    if (!restoreSnapshot || !targetPath) return;
-
-    setIsRestoring(true);
-    try {
-      const response = await withStepUp(
-        () =>
-          fetch(`/api/jobs/${jobId}/snapshots/${restoreSnapshot.id}/restore`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              source_path: "/",
-              target_path: targetPath,
-              storage: storageId || undefined,
-            }),
-          }),
-        "Restoring writes files on the server"
-      );
-
-      const data = await response.json();
-
-      if (response.ok) {
-        track(data.task);
-        toast.success(data.message || "Restore started");
-        setRestoreDialogOpen(false);
-      } else {
-        toast.error(data.error || "Restore failed");
-      }
-    } catch {
-      toast.error("Restore failed");
-    } finally {
-      setIsRestoring(false);
     }
   };
 
@@ -468,13 +408,16 @@ export default function Snapshots({ embedded = false }: { embedded?: boolean }) 
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
-                            {/* Database jobs: no in-place restore until the restore wizard lands; download the dump instead */}
-                            {job?.backup_type !== "database" && (
-                              <DropdownMenuItem onClick={() => openRestoreDialog(snapshot)}>
-                                <RotateCcw className="h-4 w-4 mr-2" />
-                                Restore to server
-                              </DropdownMenuItem>
-                            )}
+                            <DropdownMenuItem
+                              onClick={() => {
+                                const q = new URLSearchParams({ job: jobId ?? "", snapshot: snapshot.id });
+                                if (storageId) q.set("storage", storageId);
+                                navigate(`/restore?${q.toString()}`);
+                              }}
+                            >
+                              <RotateCcw className="h-4 w-4 mr-2" />
+                              Restore...
+                            </DropdownMenuItem>
                             <DropdownMenuItem
                               onClick={() => handleDownloadZip(snapshot)}
                               disabled={downloadingZip === snapshot.id}
@@ -498,67 +441,6 @@ export default function Snapshots({ embedded = false }: { embedded?: boolean }) 
         </CardContent>
       </Card>
 
-      {job?.backup_type !== "database" && (
-        <Alert>
-          <Info className="h-4 w-4" />
-          <AlertTitle>Restoring Files</AlertTitle>
-          <AlertDescription className="mt-2">
-            Click the <RotateCcw className="inline h-3 w-3 mx-1" /> Restore button on any snapshot to restore it back to the remote server via SSH.
-          </AlertDescription>
-        </Alert>
-      )}
-
-      {/* Restore Dialog */}
-      <Dialog open={restoreDialogOpen} onOpenChange={setRestoreDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Restore Snapshot to Server</DialogTitle>
-            <DialogDescription>
-              Restore the entire snapshot "{restoreSnapshot?.id.slice(0, 8)}" to the original server.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <Label>Snapshot</Label>
-              <Input value={restoreSnapshot?.id || ""} disabled />
-            </div>
-            <div className="space-y-2">
-              <Label>Paths in Snapshot</Label>
-              <Input value={restoreSnapshot?.paths.join(", ") || ""} disabled />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="target-path">Target Path</Label>
-              <Input
-                id="target-path"
-                value={targetPath}
-                onChange={(e) => setTargetPath(e.target.value)}
-                placeholder="/path/to/restore"
-              />
-              <p className="text-xs text-muted-foreground">
-                The base path on the server where files will be restored. The original directory structure will be preserved.
-              </p>
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setRestoreDialogOpen(false)}>
-              Cancel
-            </Button>
-            <Button onClick={handleRestore} disabled={isRestoring || !targetPath}>
-              {isRestoring ? (
-                <>
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  Restoring...
-                </>
-              ) : (
-                <>
-                  <RotateCcw className="h-4 w-4 mr-2" />
-                  Restore
-                </>
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }

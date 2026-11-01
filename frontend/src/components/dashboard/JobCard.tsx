@@ -191,17 +191,12 @@ export default function JobCard({ job, onRun, onDetailPage = false }: JobCardPro
           {running ? <Loader2 className="animate-spin" /> : <Play />}
           Run now
         </Button>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span tabIndex={0}>
-              <Button size="sm" variant="ghost" disabled>
-                <RotateCcw />
-                Restore
-              </Button>
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>The restore wizard is coming in P2</TooltipContent>
-        </Tooltip>
+        <Button size="sm" variant="ghost" asChild>
+          <Link to={`/restore?job=${encodeURIComponent(job.id)}`}>
+            <RotateCcw />
+            Restore
+          </Link>
+        </Button>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button

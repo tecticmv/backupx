@@ -610,6 +610,21 @@ def restore_script(job_id, target_time, storage_id=None):
     if kind == 'postgres':
         text = scripts.pg_restore_script(job, target_time, storage, job.get('backup_prefix') or job_id)
         return f'restore-{job_id}-{stamp}.sh', text
+    inputs = mysql_restore_inputs(job, target_time, storage)
+    text = scripts.mysql_restore_script(job, inputs['plan'], target_time, storage, inputs['main_repo'],
+                                        inputs['binlog_repo'], inputs['server_image'], inputs['binlog_image'],
+                                        inputs['flavor'])
+    return f'restore-{job_id}-{stamp}.sh', text
+
+
+def mysql_restore_inputs(job, target_time, storage):
+    """What a MySQL/MariaDB point-in-time restore of `job` to target_time needs (raises RestorePlanError).
+
+    {'plan' (pitr.plan_restore), 'server_image', 'binlog_image', 'flavor', 'server_version',
+     'main_repo', 'binlog_repo'}; also used by the restore wizard (app/restore_service.py).
+    """
+    m = _m()
+    job_id = job['id']
     state = load_state(job_id)
     chains = load_chains(job_id)
     segments = load_segments(job_id, kind='closed')
@@ -617,15 +632,19 @@ def restore_script(job_id, target_time, storage_id=None):
     if partials and state.get('partial_until'):
         newest = max(partials, key=lambda p: p['id'])
         newest['until'] = state['partial_until']
-    plan = pitr.plan_restore(target_time, chains, segments, load_anchors(job_id), _storage_key(storage), partials)
+    plan = pitr.plan_restore(pitr._utc(target_time), chains, segments, load_anchors(job_id),
+                             _storage_key(storage), partials)
     version = state.get('server_version') or ''
-    server_image = pitr.scratch_server_image(version)
-    binlog_image = pitr.suggested_client_image(version) or 'percona/percona-server:8.4'
-    main_repo = m.job_repo_url(job, storage)
-    binlog_repo = m.job_repo_url(binlog_job(job), storage)
-    text = scripts.mysql_restore_script(job, plan, target_time, storage, main_repo, binlog_repo, server_image,
-                                        binlog_image, pitr.server_flavor(version))
-    return f'restore-{job_id}-{stamp}.sh', text
+    return {
+        'plan': plan,
+        'server_version': version,
+        'server_image': pitr.scratch_server_image(version),
+        'binlog_image': pitr.suggested_client_image(version) or 'percona/percona-server:8.4',
+        'flavor': pitr.server_flavor(version),
+        'main_repo': m.job_repo_url(job, storage),
+        'binlog_repo': m.job_repo_url(binlog_job(job), storage),
+        'partial_size': state.get('partial_size'),
+    }
 
 
 # ---------------------------------------------------------------------------

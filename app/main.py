@@ -41,6 +41,7 @@ from .security import requires_step_up
 from . import pitr
 from . import pitr_service
 from . import health_service
+from . import restore_service
 from .cron import cron_fields, cron_trigger
 
 # =============================================================================
@@ -603,7 +604,7 @@ def _on_scheduler_event(event):
     if event.job_id.endswith((pitr.PITR_SCHEDULE_SUFFIX, pitr.WALG_BASE_SCHEDULE_SUFFIX)):
         # PITR ticks report through their own state/alerts; a missed tick is just late
         return
-    if event.job_id in (HEALTH_SWEEP_ID, HEALTH_ALERT_ID):
+    if event.job_id in (HEALTH_SWEEP_ID, HEALTH_ALERT_ID, RESTORE_CLEANUP_ID):
         return
     if event.job_id == retention.PRUNE_SCHEDULE_ID:
         # Not a backup job: don't mark any job failed, just alert
@@ -650,6 +651,7 @@ _scheduled_pitr = {}  # APScheduler id (<job>__pitr / <job>__walg_base) -> (kind
 _scheduled_health = {'on': False}  # health sweep + alert tick entries are in the running scheduler
 HEALTH_SWEEP_ID = '__health_sweep__'
 HEALTH_ALERT_ID = '__health_alerts__'
+RESTORE_CLEANUP_ID = '__restore_cleanup__'
 _scheduler_leader = None
 SCHEDULER_LOCK_INTERVAL = int(os.environ.get('SCHEDULER_LOCK_INTERVAL', 15))
 
@@ -735,6 +737,11 @@ def _sync_health_schedule():
         scheduler.add_job(health_service.alert_tick, 'interval', seconds=cfg['alert_seconds'],
                           id=HEALTH_ALERT_ID, executor='health', replace_existing=True,
                           next_run_time=datetime.now(timezone.utc) + timedelta(seconds=60))
+        # Restore wizard: expire scratch DBs, clean up after dead tasks (queued as a task)
+        scheduler.add_job(restore_service.schedule_cleanup, 'interval',
+                          minutes=restore_service.r.settings()['cleanup_minutes'],
+                          id=RESTORE_CLEANUP_ID, executor='health', replace_existing=True,
+                          next_run_time=datetime.now(timezone.utc) + timedelta(minutes=3))
     except Exception as e:
         logger.error(f"Could not schedule the health checks: {e}")
         return
@@ -7194,6 +7201,205 @@ def _task_snapshot_zip(ctx):
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+
+
+# =============================================================================
+# Restore wizard (app/restore*.py, docs/UX-OVERHAUL.md P2)
+# =============================================================================
+
+def _restore_error_response(e):
+    body = {'error': str(e), 'code': e.code}
+    body.update(e.extra or {})
+    return jsonify(body), e.status
+
+
+@app.route('/api/jobs/<job_id>/restore-points')
+@login_required
+def api_restore_points(job_id):
+    try:
+        return jsonify(restore_service.restore_points(job_id, request.args.get('storage') or None))
+    except restore_service.RestoreError as e:
+        return _restore_error_response(e)
+
+
+@app.route('/api/jobs/<job_id>/restore-verify', methods=['GET', 'PUT'])
+@login_required
+def api_restore_verify_config(job_id):
+    try:
+        if request.method == 'GET':
+            job, _db_config, _server, engine, _state = restore_service.job_context(job_id)
+            return jsonify(restore_service.verify_config(job, engine))
+        config = restore_service.set_verify_config(job_id, request.get_json(silent=True) or {})
+        _audit('RESTORE_VERIFY_CONFIG', 'job', job_id, None, config)
+        return jsonify(config)
+    except restore_service.RestoreError as e:
+        return _restore_error_response(e)
+
+
+@app.route('/api/restores/plan', methods=['POST'])
+@login_required
+def api_restore_plan():
+    try:
+        plan, error = restore_service.derive_plan(request.get_json(silent=True) or {})
+    except restore_service.RestoreError as e:
+        return _restore_error_response(e)
+    body = restore_service.present(plan)
+    body['ok'] = error is None
+    if error:
+        body['error'] = error
+    return jsonify(body)
+
+
+@app.route('/api/restores', methods=['GET'])
+@login_required
+@limiter.exempt
+def api_restores():
+    rows = restore_service.list_rows(job_id=request.args.get('job_id') or None,
+                                     active=request.args.get('active') in ('1', 'true'),
+                                     limit=request.args.get('limit', 50))
+    return jsonify({'restores': [restore_service.serialize(row) for row in rows]})
+
+
+@app.route('/api/restores', methods=['POST'])
+@login_required
+def api_restore_start():
+    user, ip = _actor()
+    data = request.get_json(silent=True) or {}
+    try:
+        row, task = restore_service.start_restore(data, user=user, ip=ip)
+    except restore_service.RestoreError as e:
+        return _restore_error_response(e)
+    _audit('RESTORE_START', 'job', row['job_id'], row.get('job_name'),
+           {'restore_id': row['id'], 'target': row['target_type'], 'point_type': row['point_type'],
+            'snapshot_id': row.get('snapshot_id'), 'target_time': restore_service.r.iso(row.get('target_time'))})
+    return jsonify({'success': True, 'task': tasks.serialize(task), 'restore': restore_service.serialize(row),
+                    'message': 'Restore started'}), 202
+
+
+def _restore_or_404(restore_id):
+    row = restore_service.get_row(restore_id)
+    if not row:
+        return None, (jsonify({'error': 'Restore not found', 'code': 'not_found'}), 404)
+    return row, None
+
+
+@app.route('/api/restores/<restore_id>', methods=['GET'])
+@login_required
+@limiter.exempt
+def api_restore(restore_id):
+    row, err = _restore_or_404(restore_id)
+    if err:
+        return err
+    return jsonify(restore_service.serialize(row))
+
+
+@app.route('/api/restores/<restore_id>/extend', methods=['POST'])
+@login_required
+def api_restore_extend(restore_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        hours = int(data.get('hours') or 24)
+        row = restore_service.extend(restore_id, hours)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'hours must be a number'}), 400
+    except restore_service.RestoreError as e:
+        return _restore_error_response(e)
+    _audit('RESTORE_EXTEND', 'job', row['job_id'], row.get('job_name'),
+           {'restore_id': restore_id, 'cleanup_at': restore_service.r.iso(row.get('cleanup_at'))})
+    return jsonify(restore_service.serialize(row))
+
+
+def _restore_task(restore_id, kind, title, message, live_only=True):
+    row, err = _restore_or_404(restore_id)
+    if err:
+        return err
+    if live_only and row['status'] not in restore_service.r.LIVE_STATUSES:
+        return jsonify({'error': 'This restore has no scratch copy any more', 'code': 'not_ready'}), 409
+    return _enqueue_task_response(kind, {'restore_id': restore_id, 'job_id': row['job_id']},
+                                  title=f"{title}: {row.get('job_name') or row['job_id']}",
+                                  resource_type='job', resource_id=row['job_id'],
+                                  idempotency_key=f'{kind}:{restore_id}', message=message)
+
+
+@app.route('/api/restores/<restore_id>', methods=['DELETE'])
+@login_required
+def api_restore_remove(restore_id):
+    return _restore_task(restore_id, 'restore_remove', 'Remove scratch restore', 'Removing', live_only=False)
+
+
+@app.route('/api/restores/<restore_id>/verify', methods=['POST'])
+@login_required
+def api_restore_reverify(restore_id):
+    return _restore_task(restore_id, 'restore_verify', 'Re-check restore', 'Checking')
+
+
+@app.route('/api/restores/<restore_id>/dump', methods=['POST'])
+@login_required
+def api_restore_dump(restore_id):
+    return _restore_task(restore_id, 'restore_dump', 'Dump scratch restore', 'Preparing the dump')
+
+
+def _replace_route(restore_id, action):
+    data = request.get_json(silent=True) or {}
+    if not data.get('preview') and not security.has_step_up():
+        return security.step_up_required_response()
+    user, ip = _actor()
+    try:
+        out = restore_service.start_replace(restore_id, data, action, user=user, ip=ip)
+    except restore_service.RestoreError as e:
+        return _restore_error_response(e)
+    if 'preview' in out:
+        return jsonify(out['preview'])
+    return jsonify({'success': True, 'task': tasks.serialize(out['task']), 'message': 'Started'}), 202
+
+
+@app.route('/api/restores/<restore_id>/replace-production', methods=['POST'])
+@login_required
+def api_restore_replace(restore_id):
+    return _replace_route(restore_id, 'replace')
+
+
+@app.route('/api/restores/<restore_id>/undo', methods=['POST'])
+@login_required
+def api_restore_undo(restore_id):
+    return _replace_route(restore_id, 'undo')
+
+
+@app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/find')
+@login_required
+def api_snapshot_find(job_id, snapshot_id):
+    try:
+        return jsonify(restore_service.find_in_snapshot(job_id, snapshot_id, request.args.get('q', ''),
+                                                        request.args.get('storage') or None))
+    except restore_service.RestoreError as e:
+        return _restore_error_response(e)
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Search timed out', 'code': 'timeout'}), 504
+
+
+@app.route('/api/restores/files/plan', methods=['POST'])
+@login_required
+def api_restore_files_plan():
+    try:
+        plan, phrase = restore_service.files_plan(request.get_json(silent=True) or {})
+    except restore_service.RestoreError as e:
+        return _restore_error_response(e)
+    return jsonify(security.present_plan(plan, phrase))
+
+
+@app.route('/api/restores/files', methods=['POST'])
+@login_required
+def api_restore_files():
+    data = request.get_json(silent=True) or {}
+    if data.get('target') in ('original', 'alternate') and not security.has_step_up():
+        return security.step_up_required_response()
+    user, ip = _actor()
+    try:
+        row, task = restore_service.start_files(data, user=user, ip=ip)
+    except restore_service.RestoreError as e:
+        return _restore_error_response(e)
+    return jsonify({'success': True, 'task': tasks.serialize(task), 'restore': restore_service.serialize(row),
+                    'message': 'Restore started'}), 202
 
 
 @app.route('/assets/<path:filename>')

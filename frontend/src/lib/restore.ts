@@ -13,7 +13,7 @@ import type {
   VerifyConfig,
 } from "@/types/restore";
 import type { SnapshotFile } from "@/types/job";
-import type { TaskStartResponse } from "@/types/task";
+import type { Task, TaskStartResponse } from "@/types/task";
 
 const enc = encodeURIComponent;
 
@@ -225,4 +225,11 @@ export function slugify(text: string): string {
 export function compactTimestamp(date = new Date()): string {
   const p = (n: number) => String(n).padStart(2, "0");
   return `${date.getFullYear()}${p(date.getMonth() + 1)}${p(date.getDate())}-${p(date.getHours())}${p(date.getMinutes())}${p(date.getSeconds())}`;
+}
+
+/** The task that matters right now: replace/undo while they run (or after), else the restore task. */
+export function currentTask(restore: Restore): Task | null {
+  if ((restore.status === "undoing" || restore.status === "undone") && restore.undo_task) return restore.undo_task;
+  if ((restore.status === "replacing" || restore.status === "replaced") && restore.replace_task) return restore.replace_task;
+  return restore.task;
 }
