@@ -231,7 +231,13 @@ export default function Restore() {
       }
       const plan = planCurrent?.data;
       if (!planRequest || !plan) return;
-      const response = await startRestore({ ...planRequest, plan_hash: plan.plan_hash });
+      // "Latest" resolves to a second when planned; echo it so a binlog shipped since
+      // the review doesn't change the plan (the server checks it is still restorable)
+      const echo =
+        planRequest.point_type === "latest" && plan.plan.target_time
+          ? { target_time: plan.plan.target_time }
+          : {};
+      const response = await startRestore({ ...planRequest, ...echo, plan_hash: plan.plan_hash });
       const data = (await response.json().catch(() => ({}))) as RestoreStartResponse;
       if (response.ok && data.task) {
         track(data.task, { autoDownload: target === "download" });

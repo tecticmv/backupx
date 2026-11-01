@@ -83,6 +83,22 @@ backupx/
 └── ...
 ```
 
+## Restore wizard (scratch restores on this host)
+
+Scratch restores run as containers on the BackupX host through the mounted
+`/var/run/docker.sock`. The image ships the docker CLI and wal-g; the non-root
+`backupx` user needs the socket's group:
+
+```bash
+echo "DOCKER_GID=$(stat -c %g /var/run/docker.sock)" >> .env
+docker compose up -d --build
+docker exec backup-ui docker ps   # must work as the backupx user
+```
+
+Scratch containers are labelled `backupx.restore=<id>`, publish no ports and
+are removed after 24 h (`RESTORE_TTL_HOURS`). Work space: `/app/data/restores`
+(the backup-data volume) - a restore needs about 2.5x the restored database size free.
+
 ## Production Deployment
 
 ### 1. Secure the Server

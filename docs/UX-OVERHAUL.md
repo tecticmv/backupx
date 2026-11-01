@@ -9,8 +9,8 @@ the *Status* section at the end.
 |---|---|---|
 | P0 | Foundation: task runner, task tray, per-storage results, CSRF, step-up, plan hashes, writable known_hosts, long ops as tasks | **done** |
 | P1 | Health checks + fixes + dashboard | **done** |
-| P2 | Restore wizard (scratch DB first, then gated replace-production) | next |
-| P3 | Enable-PITR wizard | later |
+| P2 | Restore wizard (scratch DB first, then gated replace-production) | **done** |
+| P3 | Enable-PITR wizard | next |
 
 ## Decisions (from the owner, apply to every phase)
 
@@ -355,6 +355,195 @@ notifications 90).
   `lib/format.ts`, `types/health.ts`. Added shadcn components: accordion,
   alert-dialog, hover-card, popover, tabs, toggle, toggle-group.
 
+## P2 architecture (restore wizard)
+
+### Model
+
+- `app/restore.py` (pure): settings, container names/labels, engine and
+  scratch-image picking (from PITR's server version or the dump header:
+  `-- Server version`, `-- Dumped from database version`), size estimates,
+  the disk check, PITR windows/gaps and "latest restorable", key-table
+  validation, the verify comparison, marker parsing, file-path validation.
+- `app/restore_scripts.py` (shell text only): scratch MySQL/MariaDB/PostgreSQL
+  start + load, the WAL-G scratch start, SQL runners (`bxsql` / `bximport` /
+  `bxdump`) for the scratch container and for production over the job's own
+  path (docker exec, direct, PITR client image), verification queries, the
+  scratch dump for replace, the replace/rollback scripts run on the job's
+  server, file restore (with pre-restore backup), helper-container extracts.
+- `app/restore_service.py`: `restores` rows, plans, the task handlers, the
+  cleanup tick. `pitr_service.mysql_restore_inputs()` is shared with the PITR
+  restore script.
+- Table `restores` (`TASK_SCHEMA_SQL`): id, parent_id (undo -> the restore it
+  undoes), task_id, job, engine, point_type (`latest`/`snapshot`/`time`),
+  snapshot_id, target_time, storage_id, target_type (`scratch`/`download`/
+  `original`/`alternate`), server, container, work_dir (file extract dir),
+  plan JSON, info JSON (server version, image, superuser, databases, host dir),
+  pre_restore_snapshot JSON (`[{storage_id, storage_name, snapshot_id}]`),
+  pre_restore_at, pre_restore_forgotten_at, verify JSON, cleanup_at, status,
+  error, replace_task_id, undo_task_id. Statuses: running, ready, failed,
+  cancelled, removed, expired, replacing, replaced, undoing, undone, done.
+- `jobs.restore_verify` (JSON): `key_tables` (`db.table`, PG `db.schema.table`),
+  `check_sql` (one read-only statement, run on prod and on the copy, output
+  compared), `health_url` (GET after replace production).
+
+### Where restores run
+
+- Scratch restores run **in the backupx container** against the host's docker
+  (the mounted socket): restic and wal-g run here, the scratch server is
+  container `backupx-restore-<id>` with labels `backupx.restore=<id>`,
+  `backupx.job=<job>`, **no published ports** (`--network none`; WAL-G
+  scratch servers need the storage, so they join `RESTORE_DOCKER_NETWORK` or
+  the default bridge). Files reach containers by `docker exec -i` / `docker
+  cp` (tar streams), never bind mounts of container paths, so it works with
+  any daemon. Work files: `RESTORE_WORK_DIR` (`/app/data/restores/<id>`),
+  removed when the task ends.
+- The image has the docker CLI (27.5.1, static, sha256 pinned) and wal-g
+  v2.0.1 (ubuntu-18.04 build, also copied into the `postgres:<major>-bullseye`
+  scratch server as `restore_command`). The backupx user needs the socket's
+  group: `group_add: ${DOCKER_GID}` in docker-compose.yml (set `DOCKER_GID` to
+  `stat -c %g /var/run/docker.sock` on the host).
+- Secrets: restic password and S3 keys only in the subprocess env of the local
+  `bash -s` / restic / wal-g; the WAL-G scratch server gets its S3 env as a
+  0600 file inside its data directory (not in the container config); the
+  production DB password only in the stdin script (0600 option file /
+  exported PGPASSWORD; client-image mode passes the option file on stdin ahead
+  of the data, up to a marker line). No secret in any argv, task param,
+  result, log, restore row or audit entry (asserted end to end).
+
+### Plans
+
+`POST /api/restores/plan` derives from current state: the method (`dump` =
+snapshot of a DB job, `binlog` = MySQL/MariaDB PITR, `walg` = PostgreSQL
+PITR, `files`), the dump/base backup and binlog segments (via
+`pitr.plan_restore`), sizes (snapshot `summary.total_bytes_processed`,
+segment sizes, wal-g `uncompressed_size`), the scratch image, the steps, a
+summary ("dump of ... + N binlog files, ~size to download") and a free-disk
+check of `RESTORE_WORK_DIR`: needed = estimated restored size x
+`RESTORE_DISK_FACTOR` (2.5; a gzipped dump counts x `RESTORE_DUMP_EXPANSION`
+5). The plan hash covers everything except the free-space numbers.
+`POST /api/restores` re-derives and refuses `plan_hash_missing` (400),
+`plan_changed` (409 + new plan), `insufficient_disk` (400), `busy` (409, one
+restore task per job). For `latest` the client echoes the planned
+`target_time`; it is used while still restorable, so a binlog shipped in the
+meantime doesn't change the plan. Exact-time downloads are the existing PITR
+restore script; snapshot downloads are a `restore_download` task (restic dump
+of the .sql.gz into task-files).
+
+### Tasks
+
+| Kind | Tier | Cancellable | What |
+|---|---|---|---|
+| `restore_scratch` | safe | yes | fetch + scratch container + load/replay (+ WAL replay and promote) + verify; failure/cancel removes container and work dir |
+| `restore_download` | safe | yes | dump file of a snapshot -> download |
+| `restore_dump` | safe | yes | dump the restored DB(s) from the scratch container -> download |
+| `restore_verify` | safe | no | re-run the comparison |
+| `restore_remove` | safe | no | docker rm -f by label, remove the extract dir |
+| `restore_replace` | maintenance | no | see below |
+| `restore_undo` | maintenance | no | scratch restore of the pre-restore snapshot + the replace flow |
+| `restore_files_paths` | confirm | yes | file restore to original / alternate / extract on the backupx server |
+| `restore_cleanup` | safe | no | leader every `RESTORE_CLEANUP_MINUTES` (10) |
+
+Verification (`run_verify`): row estimates (`information_schema.tables` with
+`information_schema_stats_expiry=0` on MySQL 8; PostgreSQL `pg_class.reltuples`
+after `ANALYZE` on the copy), exact `COUNT(*)` of the key tables, the check
+SQL; production is queried over the job's normal path (a failure there is
+`prod_error`, the restore stays usable). The databases compared are the
+configured ones, else all non-system ones.
+
+### Replace production and Undo
+
+`POST /api/restores/:id/replace-production {preview}` -> plan (production
+target and path, source point, steps, downtime estimate, pre-restore and
+rollback text, warnings) + `confirm_text` (the database name, or the DB
+config's name for `*`); then `{plan_hash, confirm}` with step-up (403
+`step_up_required`, 400 `confirmation_mismatch` / `plan_hash_missing`, 409
+`plan_changed` / `not_ready`). Only a `ready` scratch DB restore that hasn't
+expired qualifies. The task re-derives the plan and compares the stored hash
+(changed -> nothing done), holds `<job>:restore`, then:
+
+1. pre-restore backup: a real `run_backup(trigger='pre-restore', tags=
+   ['pre-restore', 'restore:<id>'])`; it must succeed or nothing is touched.
+   These snapshots don't get the `automated` tag, and retention forgets only
+   `--tag automated`, so retention never removes them. The cleanup tick
+   forgets exactly the recorded IDs after `PRE_RESTORE_KEEP_DAYS` (30), and
+   only when `RETENTION_ENABLED` is on and not a dry run.
+2. under the job's run lock: dump the restored databases from the scratch
+   container (MySQL: `--databases ... --add-drop-database --routines
+   --triggers --events --hex-blob --set-gtid-purged=OFF`, DEFINER clauses
+   stripped unless the path is docker exec; MariaDB: no GTID flag; PostgreSQL:
+   `pg_dump --clean --if-exists --create` per database);
+3. copy it to the job's server (ssh with a fixed remote command, mktemp dir);
+4. there: a rollback copy of production with the same flags, then the import
+   (PostgreSQL: sessions on those databases terminated first; MySQL: `SET
+   SESSION lock_wait_timeout=120` so a held lock fails instead of hanging);
+   an import failure imports the rollback copy back -> task `rolled_back`;
+5. verify again (prod vs scratch); a key-table mismatch (or production not
+   queryable) imports the rollback copy -> `rolled_back`; the health URL
+   result is logged;
+6. status `replaced`, pre-restore snapshot recorded (shown with its expiry).
+
+Undo (`/undo`, same two-phase gate, only for `replaced` with a kept
+pre-restore snapshot) creates a child restore (`parent_id`) of the
+pre-restore snapshot, runs the scratch restore and then the same replace flow
+(including its own pre-restore backup, so an Undo can be undone).
+
+### Files
+
+- Browse: the existing lazy `GET .../snapshots/:sid/files?path=`; search:
+  `GET /api/jobs/:id/snapshots/:sid/find?q=&storage=` (`restic find --json -i`,
+  in the container, max `RESTORE_FIND_LIMIT` 500).
+- `POST /api/restores/files/plan` / `POST /api/restores/files {job_id,
+  snapshot_id, storage_id, paths, target, target_path?, plan_hash, confirm?}`:
+  paths must be inside the snapshot's paths (not `/`). Targets: `original`
+  (typed "overwrite" + step-up; first `restic backup <existing paths> --tag
+  pre-restore --tag restore:<id>` on the host, its snapshot recorded, then
+  `restic restore --target /` with `--include` per path), `alternate` (step-up;
+  default `/var/tmp/backupx-restore/<job>-<ts>` on the job's server),
+  `scratch` (restic restore here, then a `RESTORE_HELPER_IMAGE` container
+  copies it to `RESTORE_HOST_FILES_DIR/<job>-<ts>` on the backupx server; 24 h
+  TTL like DB scratch copies). ZIP download stays the `snapshot_zip` task.
+
+### Cleanup
+
+Leader job `__restore_cleanup__` (executor `health`) queues `restore_cleanup`:
+rows `running` whose task is finished/missing (worker died -> task
+`interrupted`) are cleaned and failed; `ready`/`replaced`/`undone` rows past
+`cleanup_at` lose their scratch copy (`expired` for ready ones); containers
+labelled `backupx.restore` without a live row are removed; orphan work dirs
+are deleted; pre-restore snapshots past 30 days are forgotten (see above).
+
+### API
+
+`GET /api/jobs/:id/restore-points?storage=`, `GET/PUT
+/api/jobs/:id/restore-verify`, `POST /api/restores/plan`, `POST
+/api/restores`, `GET /api/restores?job_id=&active=1&limit=`, `GET
+/api/restores/:id`, `POST /api/restores/:id/extend {hours}` (max 7 days from
+now), `DELETE /api/restores/:id`, `POST /api/restores/:id/verify`, `POST
+/api/restores/:id/dump`, `POST /api/restores/:id/replace-production`, `POST
+/api/restores/:id/undo`, `GET /api/jobs/:id/snapshots/:sid/find`, `POST
+/api/restores/files/plan`, `POST /api/restores/files`. Audit: RESTORE_START,
+RESTORE_SCRATCH, RESTORE_REPLACE, RESTORE_UNDO, RESTORE_FILES,
+RESTORE_REMOVE, RESTORE_EXTEND, RESTORE_VERIFY_CONFIG.
+
+### Frontend
+
+- `/restore` (`pages/Restore.tsx`), state in the URL (`?job=&snapshot=&storage=
+  &restore=&step=`); opened from the job card's Restore button, the job page's
+  Recovery tab (Start a restore + this job's restores), snapshot rows
+  ("Restore..."; the old "Restore to server" dialog is gone) and the sidebar.
+- Steps in a controlled shadcn `Tabs`: What (`Command` job search), When
+  (storage `Select`, latest / snapshot table / exact time with `Calendar` +
+  time input + `Slider` over the PITR windows, gaps shown, plan summary with
+  the disk check), Where (scratch / download / replace production gated; file
+  jobs: sidebar-11-style snapshot tree + `restic find` search, targets
+  original / alternate / extract / ZIP), Run (progress, step, live log via
+  `TaskLog`, Cancel), Verify (table, connect hint, Download dump, Re-run
+  checks, Keep 24 h longer, Remove now, Replace production / Undo dialog,
+  key-table settings).
+- `components/restore/*`, `lib/restore.ts`, `types/restore.ts`. Added shadcn
+  components: command, calendar, slider, radio-group, checkbox (npm: cmdk,
+  react-day-picker, date-fns).
+
 ## Status
 
 ### Done (P0)
@@ -393,24 +582,68 @@ Not covered end to end: the PostgreSQL/WAL-G fixes, repair index, key
 removal and client image change (plan/exec unit level only); the fix dialogs
 were checked against a mock API, not clicked against the real backend.
 
-### Next (P2: restore wizard)
+### Done (P2)
 
-- Scratch-DB restore on 172.19.5.200 as a parent task with child tasks
-  (download -> scratch container -> verify), TTL 24 h; then
-  replace-production as `TIER_MAINTENANCE` with an automatic pre-restore
-  backup (kept 30 days) and Undo. Reuse `security.present_plan` /
-  `check_confirmed`, `useStepUp`, the `FixReviewDialog` pattern
-  (`components/health/FixReviewDialog.tsx`), the job page's Recovery tab
-  (placeholder now) and the job card's Restore button (placeholder now).
-- Health can raise "scratch DB left over" style issues the same way (a
-  detector + a safe cleanup fix in `health_service.FIXES`).
-- The one-time admin credential handoff (grants) is still to build (P3).
+Everything in "P2 architecture". Tests: `tests/test_restore.py` (disk check
+and refusal, size estimates, PITR gaps / latest point, dump-header versions
+and images, verify comparison and config validation, marker parsing, path
+validation, extend cap, confirm text, no published ports, scratch dump flags,
+prod runner keeps the password out of argv, file pre-restore ordering,
+pre-restore runs not tagged `automated` + retention forgets only `automated`,
+plan/start hash checks, busy, restore points, verify config API, replace
+refused without ready scratch / step-up / typed text / hash, plan re-derived
+in the task, pre-restore backup must succeed, key-table mismatch -> rolled
+back with the rollback copy, success -> Undo plan, scratch failure and cancel
+remove the container, TTL, cleanup of interrupted/expired/orphans,
+pre-restore expiry only after 30 days with retention on, file restore gates,
+local scripts get secrets only via env).
+
+E2E with throwaway containers (rig in the P2 work dir: `bxp2-target` systemd +
+sshd + docker CLI, MySQL 8.4 with GTID and the binlog streamer with the
+percona client image, MariaDB 10.11 in docker-exec mode, Ubuntu 18.04 +
+PostgreSQL 10 + WAL-G, MinIO, the backupx code in a container with the host
+docker socket), 48 checks, all pass: MySQL PITR scratch restore to the exact
+second (row at T-30 s present, row at T+10 s absent, row count = production
+at T, trigger restored, no published ports), latest (newest row present),
+snapshot (exactly the dump), verify (prod vs restored, key tables), dump
+download, keep 24 h, remove now; disk pre-check refusal; cancel mid-restore
+removes the container; replace refused without step-up (403) / typed text
+(400) / ready scratch (409); replace production (production = restored point,
+trigger kept, pre-restore snapshot tagged `pre-restore` without `automated`,
+survives a retention forget with keep-daily 1); Undo (production back to the
+pre-replace state); MariaDB docker-exec snapshot restore + replace (engine
+corrected from the dump header); a worker killed mid-restore -> task
+`interrupted` -> cleanup removes the container; PostgreSQL pg_dumpall
+snapshot restore; **PostgreSQL WAL-G PITR to an exact time** (first end-to-end
+run: row at T-30 s present, T+10 s absent); files: `restic find`, restore to
+original (pre-restore snapshot holds the overwritten version), alternate path,
+extract on the backupx host + remove; no secret in task params/results/logs,
+restore rows or audit, and none in any process argv in the backupx container
+(sampled every 100 ms).
+
+Not covered end to end: replace production into PostgreSQL (unit level only),
+DigitalOcean managed MySQL (GTID handling covered by the MySQL 8.4 GTID rig
+via `--set-gtid-purged=OFF`; DEFINER stripping unit level), PostgreSQL 12+
+WAL-G layout (`recovery.signal`, code path untested), the health URL check,
+and the wizard UI was type-checked/linted/built, not clicked against the
+real backend.
+
+### Next (P3: enable-PITR wizard)
+
+- P3 enable-PITR wizard on top of `pitr_service.check_prereqs` + fixes; the
+  one-time admin credential handoff (grants) is still to build.
+- Deploying P2 needs `DOCKER_GID` (socket group on 172.19.5.200) and an image
+  rebuild (docker CLI + wal-g); check `docker exec backup-ui docker ps` works
+  as the backupx user before relying on scratch restores.
+- Rig observation (PITR, not P2): right after enabling, the first chain was
+  recorded with an empty `server_uuid`, so the first dump's anchor wasn't
+  usable until a later tick; a warm-up tick before the dump avoided it. Worth
+  a look in P3 (enable flow).
+- Health could raise "scratch restore left over" if the cleanup tick fails
+  repeatedly (detector + safe fix); not built.
 - Task tray history is 60 min: activity links to older tasks open an empty
   tray.
 
 ### Later
 
-- P2 restore wizard: scratch DB container on 172.19.5.200 (TTL 24 h), then
-  replace-production (maintenance tier, pre-restore backup kept 30 days, Undo).
-  Parent/child tasks.
-- P3 enable-PITR wizard on top of `pitr_service.check_prereqs` + fixes.
+- Restore drills stay out of scope.
