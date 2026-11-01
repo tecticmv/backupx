@@ -486,6 +486,17 @@ def detect_pitr(state) -> List[Issue]:
                 res, key=(job_id,), evidence={},
                 manual={'steps': ['Open the PITR setup, or run as an admin: GRANT RELOAD ON *.* TO <the job user>;'],
                         'commands': []}, wizard=_wizard(job_id)))
+        drill_data = ((state.get('probes') or {}).get(f'drill:{job_id}') or {}).get('data') or {}
+        if drill_data and drill_data.get('ok') is False and drill_data.get('error') != 'cancelled':
+            out.append(Issue(
+                'restore_drill', 'restore_drill_failed', SEV_CRITICAL,
+                f"{job.get('name')}: the last restore drill failed",
+                "The weekly drill restores this job into a scratch copy to a recent second and compares every "
+                "quiet table with production. It failed, so a restore may not give back what production had. "
+                "Check the drill's log, fix the cause and run the drill again.",
+                res, key=(job_id,), evidence={'summary': _short(drill_data.get('summary')),
+                                              'at': drill_data.get('finished_at')},
+                fix='restore_drill', alert=False))
         mismatch = prereq_data.get('image_mismatch')
         if mismatch and mismatch.get('suggested'):
             out.append(Issue(

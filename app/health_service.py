@@ -873,7 +873,7 @@ def sweep(ctx=None, resource_type=None, resource_id=None, force_expensive=False)
     # Probes of deleted jobs/servers
     if resource_type is None:
         valid = {f'ssh:{s}' for s in state['servers']} | {f'prereq:{j}' for j in state['jobs']} \
-            | {f'pitrplan:{j}' for j in state['jobs']}
+            | {f'pitrplan:{j}' for j in state['jobs']} | {f'drill:{j}' for j in state['jobs']}
         for jid, storages in state['job_storages'].items():
             for s in storages:
                 for p in ('repo', 'check', 'stats'):
@@ -1494,6 +1494,30 @@ def _exec_unlock_lock(ctx, plan, issue):
     return _do_unlock(ctx, issue, plan, 'confirm')
 
 
+@fix('restore_drill', health.TIER_SAFE, 'Run the drill again',
+     'Restores the job into a scratch copy on the backupx server and compares it with production.', order=85)
+def _plan_restore_drill(issue):
+    job = _job_of(issue)
+    if not job.get('pitr_enabled'):
+        raise NotApplicable('PITR is off for this job')
+    return _plan('restore_drill', f"Restore drill of {job.get('name')}",
+                 ['Checksum production (read-only)', 'Scratch restore to a recent second on the backupx server',
+                  'Checksum the copy and production again, compare quiet tables', 'Remove the copy'],
+                 downtime='None (reads production; the copy runs on the backupx server)',
+                 details={'job': job.get('name')})
+
+
+@executes('restore_drill')
+def _exec_restore_drill(ctx, plan, issue):
+    from . import drill_service
+    job_id = issue.resource['job_id']
+    with ctx.lock(f'{job_id}:drill', wait=60, what='Another drill of this job'):
+        result = drill_service.run_drill(ctx, job_id)
+    if not result['ok']:
+        raise tasks.TaskError(result['summary'])
+    return {'message': result['summary']}
+
+
 @fix('anchored_dump', health.TIER_CONFIRM, 'Review anchored backup',
      'Takes a full database backup now that anchors point-in-time recovery.', order=90)
 def _plan_anchored(issue):
@@ -1980,6 +2004,7 @@ def dashboard_overview(job_id=None):
                       'window_end': p['window_end'], 'lag_minutes': p['lag_minutes'],
                       'last_error': p.get('last_error')} if p else None),
             'retention': rstate,
+            'last_verified_restore': _drill_card(state['probes'].get(f'drill:{jid}')),
         })
     cards.sort(key=lambda c: (-(c['issues']['critical'] * 100 + c['issues']['warning']), (c['name'] or '').lower()))
     usage, checked = [], None
@@ -2001,6 +2026,11 @@ def dashboard_overview(job_id=None):
         events = [e for e in events if e.get('job_id') == job_id]
     return {'jobs': cards, 'activity': events, 'storage_usage': usage,
             'storage_usage_checked_at': _iso(checked)}
+
+
+def _drill_card(probe):
+    from . import drill_service
+    return drill_service.serialize((probe or {}).get('data')) if probe else None
 
 
 def activity(state=None, days=7, limit=100):

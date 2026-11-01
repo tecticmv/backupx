@@ -12,6 +12,7 @@ import JobRuns from "@/components/jobs/JobRuns";
 import JobFormModal from "@/components/JobFormModal";
 import PitrBadge from "@/components/PitrBadge";
 import JobRestoresList from "@/components/restore/JobRestoresList";
+import RestoreDrillCard from "@/components/jobs/RestoreDrillCard";
 import Snapshots from "@/pages/Snapshots";
 import { useHealth, usePolledJson, useRunJob } from "@/hooks/useHealth";
 import { formatWindow } from "@/lib/pitr";
@@ -269,6 +270,7 @@ export default function JobDetail() {
               </Card>
             )
           )}
+          {job.pitr?.enabled && <RestoreDrillCard jobId={jobId} />}
         </TabsContent>
 
         <TabsContent value="settings" className="mt-4">

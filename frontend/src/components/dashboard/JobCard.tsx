@@ -28,6 +28,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import PitrBadge from "@/components/PitrBadge";
+import { DrillBadge } from "@/components/jobs/RestoreDrillCard";
 import { formatWindow } from "@/lib/pitr";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { SEVERITY_META } from "@/lib/health";
@@ -183,6 +184,16 @@ export default function JobCard({ job, onRun, onDetailPage = false }: JobCardPro
                   {pitr.lag_minutes !== null && ` · lag ${Math.round(pitr.lag_minutes)}m`}
                 </span>
                 <PitrBadge pitr={pitr} />
+              </span>
+            </Row>
+          )}
+          {pitr && (
+            <Row label="Verified restore">
+              <span className="inline-flex items-center gap-1.5" title={job.last_verified_restore?.summary ?? undefined}>
+                {job.last_verified_restore?.finished_at && (
+                  <span className="text-muted-foreground">{formatRelative(job.last_verified_restore.finished_at)}</span>
+                )}
+                <DrillBadge result={job.last_verified_restore} />
               </span>
             </Row>
           )}

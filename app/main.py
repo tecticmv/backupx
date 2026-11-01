@@ -43,6 +43,7 @@ from . import pitr_service
 from . import health_service
 from . import restore_service
 from . import pitr_enable_service
+from . import drill_service
 from .cron import cron_fields, cron_trigger
 
 # =============================================================================
@@ -743,6 +744,14 @@ def _sync_health_schedule():
                           minutes=restore_service.r.settings()['cleanup_minutes'],
                           id=RESTORE_CLEANUP_ID, executor='health', replace_existing=True,
                           next_run_time=datetime.now(timezone.utc) + timedelta(minutes=3))
+        # Weekly restore drills of PITR jobs (queued as one task: one job at a time)
+        drill_cfg = drill_service.d.settings()
+        if drill_cfg['enabled']:
+            try:
+                scheduler.add_job(drill_service.schedule_all, 'cron', id=drill_service.SCHEDULE_ID,
+                                  executor='health', replace_existing=True, **cron_fields(drill_cfg['cron']))
+            except Exception as e:
+                logger.error(f"Invalid RESTORE_DRILL_CRON {drill_cfg['cron']!r}: {e}")
     except Exception as e:
         logger.error(f"Could not schedule the health checks: {e}")
         return
@@ -3998,6 +4007,23 @@ def api_job_pitr_enable_run(job_id):
     except Exception:
         status = None
     return jsonify({'run': pitr_enable_service.current_run(job_id), 'pitr': status})
+
+
+@app.route('/api/jobs/<job_id>/restore-drill', methods=['GET', 'POST'])
+@login_required
+def api_job_restore_drill(job_id):
+    """GET: the last drill result; POST: run a drill now (scratch restore on the backupx server)."""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    if request.method == 'GET':
+        return jsonify({'last': drill_service.serialize(drill_service.last_result(job_id)),
+                        'enabled': drill_service.d.settings()['enabled'], 'cron': drill_service.d.settings()['cron']})
+    if not job.get('pitr_enabled'):
+        return jsonify({'error': 'Restore drills are for jobs with point-in-time recovery', 'code': 'not_pitr'}), 400
+    return _enqueue_task_response('restore_drill', {'job_id': job_id}, title=f"Restore drill: {job.get('name')}",
+                                  resource_type='job', resource_id=job_id, idempotency_key=f'restore_drill:{job_id}',
+                                  message='Restore drill started')
 
 
 @app.route('/api/jobs/<job_id>/pitr/restore-script', methods=['POST'])

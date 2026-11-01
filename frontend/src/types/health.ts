@@ -1,3 +1,4 @@
+import type { DrillResult } from "@/components/jobs/RestoreDrillCard";
 import type { Task } from "@/types/task";
 
 // Health checks, fixes and the dashboard overview (P1 API contract).
@@ -150,6 +151,7 @@ export interface JobCardData {
   last_run_id: string | null;
   failed_storage_ids: string[];
   pitr: JobCardPitr | null;
+  last_verified_restore?: DrillResult | null;
   retention: {
     state: "ok" | "failed" | "skipped" | "off" | "never";
     last_at: string | null;
