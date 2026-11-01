@@ -101,6 +101,22 @@ def _checksums_scratch(row, engine, tables, big):
     return d.parse_checksums(r.parse_marked_output(res.stdout))
 
 
+class DrillSkipped(Exception):
+    """The drill can't run here right now (not enough scratch disk): a warning, not a failed drill."""
+
+
+def _disk_precheck(svc, job_id):
+    """Refuse early (before reading production) when the backupx host lacks scratch disk."""
+    try:
+        plan, error = svc.derive_plan({'job_id': job_id, 'point_type': r.POINT_LATEST, 'target': 'scratch'})
+    except Exception as e:  # the real plan below reports restorability problems
+        logger.info(f'Drill disk pre-check for {job_id} could not plan: {e}')
+        return
+    reason = d.disk_skip_reason(plan, error)
+    if reason:
+        raise DrillSkipped(reason)
+
+
 def _wait_shipped(ctx, job_id, target, minutes):
     from . import pitr_service
     deadline = time.monotonic() + minutes * 60
@@ -137,10 +153,15 @@ def run_drill(ctx, job_id):
         ctx.add_secret(*_m()._job_secret_values(job, _m().get_job_storage_targets(job)),
                        db_config.get('password') or '')
         databases = r.configured_databases(db_config)
+        ctx.progress(3, 'Drill: checking free disk for the scratch copy')
+        _disk_precheck(svc, job_id)
         ctx.progress(5, 'Drill: listing production tables')
         tables = _list_tables(job, db_config, server, engine, databases)[:cfg['max_tables']]
-        big = {f'{db}.{name}' for db, name, rows in tables if rows > cfg['max_table_rows']}
-        ctx.log(f'{len(tables)} tables ({len(big)} compared by row count only)', stream='system')
+        configured = svc.verify_config(job).get('drill_count_only_tables') or []
+        big = d.count_only_keys(engine, tables, configured, cfg['max_table_rows'])
+        per_job = sorted(set(configured) & big)
+        ctx.log(f'{len(tables)} tables ({len(big)} compared by row count only'
+                + (f"; per job setting: {', '.join(per_job)}" if per_job else '') + ')', stream='system')
         ctx.progress(10, 'Drill: checksumming production (read-only)')
         before = _checksums_prod(job, db_config, server, engine, tables, big)
         target = (_now() + timedelta(seconds=1)).replace(microsecond=0) + timedelta(seconds=1)
@@ -151,6 +172,9 @@ def run_drill(ctx, job_id):
         _wait_shipped(ctx, job_id, target, cfg['ship_wait_minutes'])
         plan, error = svc.derive_plan({'job_id': job_id, 'point_type': 'time', 'target_time': target.isoformat(),
                                        'target': 'scratch'})
+        reason = d.disk_skip_reason(plan, error)
+        if reason:
+            raise DrillSkipped(reason)
         if error:
             raise tasks.TaskError(error)
         restore_id = tasks.new_id()
@@ -175,6 +199,9 @@ def run_drill(ctx, job_id):
     except tasks.TaskCancelled:
         result['error'] = 'cancelled'
         raise
+    except DrillSkipped as e:
+        result.update(ok=None, skipped=True, warning=_m().sanitize_error_message(str(e), 500))
+        ctx.log(f"Drill skipped: {result['warning']}", stream='system')
     except Exception as e:
         result['error'] = _m().sanitize_error_message(str(e) or type(e).__name__, 500)
     finally:
@@ -192,12 +219,18 @@ def run_drill(ctx, job_id):
 def _report(job_id, result):
     m = _m()
     name = result.get('job_name') or job_id
+    if result.get('skipped'):
+        status, verdict = 'skipped', 'skipped'
+    else:
+        status, verdict = ('success', 'passed') if result['ok'] else ('failed', 'FAILED')
     try:
-        m.add_history(job_id, name, 'success' if result['ok'] else 'failed',
-                      f"Restore drill {'passed' if result['ok'] else 'FAILED'}: {result['summary']}",
+        m.add_history(job_id, name, status, f"Restore drill {verdict}: {result['summary']}",
                       result.get('duration_s') or 0)
     except Exception as e:
         logger.warning(f'Drill history for {job_id} failed: {e}')
+    if result.get('skipped'):
+        logger.warning(f"Restore drill of {name} skipped: {result.get('warning')}")
+        return
     if not result['ok'] and result.get('error') != 'cancelled':
         try:
             m.send_notification(job_id, f'{name} (restore drill)', 'failed',
@@ -212,7 +245,7 @@ def _task_drill(ctx):
     with ctx.lock(f'{job_id}:drill', wait=60, what='Another drill of this job'):
         result = run_drill(ctx, job_id)
     ctx.result = result
-    if not result['ok']:
+    if not result['ok'] and not result.get('skipped'):
         raise tasks.TaskError(result['summary'])
     return dict(result, message=result['summary'])
 
@@ -229,7 +262,7 @@ def drill_jobs():
 @tasks.register('restore_drill_all', title='Weekly restore drills', tier=tasks.TIER_SAFE, cancellable=True)
 def _task_drill_all(ctx):
     ids = ctx.params.get('job_ids') or drill_jobs()
-    passed, failed = [], []
+    passed, failed, skipped = [], [], []
     for n, job_id in enumerate(ids, 1):
         ctx.check_cancelled()
         ctx.log(f'--- Drill {n}/{len(ids)}: {job_id}', stream='system')
@@ -240,10 +273,11 @@ def _task_drill_all(ctx):
             ctx.log(str(e), stream='system')
             failed.append(job_id)
             continue
-        (passed if res['ok'] else failed).append(job_id)
+        (skipped if res.get('skipped') else passed if res['ok'] else failed).append(job_id)
         ctx.log(res['summary'], stream='system')
-    result = {'passed': passed, 'failed': failed,
-              'message': f'{len(passed)} drill(s) passed, {len(failed)} failed'}
+    result = {'passed': passed, 'failed': failed, 'skipped': skipped,
+              'message': f'{len(passed)} drill(s) passed, {len(failed)} failed'
+                         + (f', {len(skipped)} skipped (see warnings)' if skipped else '')}
     ctx.result = result
     if failed:
         raise tasks.TaskError(result['message'] + ': ' + ', '.join(failed))
@@ -272,7 +306,7 @@ def serialize(result):
     if not result:
         return None
     keys = ('ok', 'started_at', 'finished_at', 'target_time', 'summary', 'method', 'storage', 'duration_s',
-            'task_id', 'error')
+            'task_id', 'error', 'skipped', 'warning')
     out = {k: result.get(k) for k in keys}
     c = result.get('comparison') or {}
     out['tables_compared'] = c.get('compared')

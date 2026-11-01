@@ -130,8 +130,9 @@ credentials reach them on stdin into the tmpfs, never in argv or env.
   (alerted), never failing the backup.
 - `CHECKSUM TABLE` values are compared between the same server version (the
   scratch image matches production); tables written to during a drill are
-  reported, not judged; tables above `RESTORE_DRILL_MAX_TABLE_ROWS` are
-  compared by row count only.
+  reported, not judged; tables above `RESTORE_DRILL_MAX_TABLE_ROWS` or in the
+  job's `drill_count_only_tables` are compared by row count only. A drill
+  without enough scratch disk on the backupx host is skipped with a warning.
 - PostgreSQL (WAL-G) is covered by the P2/P3 rigs (PostgreSQL 10, exact-time
   restore, maintenance flow); PostgreSQL 12+ restore layout (`recovery.signal`)
   is not tested end to end.

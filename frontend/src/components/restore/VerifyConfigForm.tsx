@@ -13,10 +13,23 @@ interface Draft {
   keyTables: string;
   checkSql: string;
   healthUrl: string;
+  drillCountOnly: string;
 }
 
 function toDraft(c: VerifyConfig): Draft {
-  return { keyTables: c.key_tables.join("\n"), checkSql: c.check_sql ?? "", healthUrl: c.health_url ?? "" };
+  return {
+    keyTables: c.key_tables.join("\n"),
+    checkSql: c.check_sql ?? "",
+    healthUrl: c.health_url ?? "",
+    drillCountOnly: (c.drill_count_only_tables ?? []).join("\n"),
+  };
+}
+
+function tableList(text: string): string[] {
+  return text
+    .split(/[\n,]+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
 }
 
 /** Collapsible editor for a job's restore checks (key tables, check SQL, health URL). */
@@ -42,12 +55,10 @@ export default function VerifyConfigForm({ jobId, onSaved }: { jobId: string; on
     setError(null);
     try {
       const saved = await putVerifyConfig(jobId, {
-        key_tables: draft.keyTables
-          .split(/[\n,]+/)
-          .map((t) => t.trim())
-          .filter(Boolean),
+        key_tables: tableList(draft.keyTables),
         check_sql: draft.checkSql.trim(),
         health_url: draft.healthUrl.trim(),
+        drill_count_only_tables: tableList(draft.drillCountOnly),
       });
       setDraft(toDraft(saved));
       toast.success("Restore checks saved");
@@ -114,6 +125,21 @@ export default function VerifyConfigForm({ jobId, onSaved }: { jobId: string; on
                 onChange={(e) => setDraft({ ...draft, healthUrl: e.target.value })}
               />
               <p className="text-xs text-muted-foreground">Fetched after production is replaced; 2xx counts as healthy.</p>
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="verify-drill-count-only">Restore drill: compare by row count only (optional)</Label>
+              <Textarea
+                id="verify-drill-count-only"
+                rows={2}
+                className="font-mono text-xs"
+                placeholder="app.activity_log"
+                value={draft.drillCountOnly}
+                onChange={(e) => setDraft({ ...draft, drillCountOnly: e.target.value })}
+              />
+              <p className="text-xs text-muted-foreground">
+                Big tables the weekly drill should not checksum (a checksum reads every row on production); same table
+                name format as key tables.
+              </p>
             </div>
             {error && <p className="text-sm text-destructive">{error}</p>}
             <div className="flex justify-end">

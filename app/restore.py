@@ -388,8 +388,10 @@ def normalize_verify_config(data, engine):
     health_url = (data.get('health_url') or '').strip()
     if health_url and not re.match(r'^https?://[^\s]+$', health_url):
         errors.append('health URL must start with http:// or https://')
+    count_only, bad_co = normalize_key_tables(data.get('drill_count_only_tables') or [], engine)
+    errors += [f'not a table name (drill count-only): {b}' for b in bad_co]
     return {'key_tables': tables[:50], 'check_sql': check_sql.rstrip().rstrip(';'),
-            'health_url': health_url}, errors
+            'health_url': health_url, 'drill_count_only_tables': count_only[:200]}, errors
 
 
 def parse_marked_output(text):

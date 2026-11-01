@@ -227,11 +227,15 @@ def _pitr_method(engine):
 def verify_config(job, engine=None):
     data = _json(job.get('restore_verify'), {}) or {}
     return {'key_tables': list(data.get('key_tables') or []), 'check_sql': data.get('check_sql') or '',
-            'health_url': data.get('health_url') or ''}
+            'health_url': data.get('health_url') or '',
+            'drill_count_only_tables': list(data.get('drill_count_only_tables') or [])}
 
 
 def set_verify_config(job_id, data):
     job, db_config, server, engine, state = job_context(job_id)
+    data = dict(data or {})
+    if 'drill_count_only_tables' not in data:  # older clients don't send it: keep the stored list
+        data['drill_count_only_tables'] = verify_config(job).get('drill_count_only_tables') or []
     config, errors = r.normalize_verify_config(data, engine)
     if errors:
         raise RestoreError('; '.join(errors), 'invalid', 400)

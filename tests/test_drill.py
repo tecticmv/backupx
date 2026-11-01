@@ -146,3 +146,75 @@ def test_schedule_all_queues_one_task(world, monkeypatch):
     assert len(rows) == 1
     db.execute("DELETE FROM tasks WHERE kind = 'restore_drill_all'")
     db.commit()
+
+
+def test_count_only_keys_by_size_and_per_job_setting():
+    tables = [('app', 'small', 10), ('app', 'activity_log', 100), ('app', 'huge', 10 ** 9)]
+    keys = d.count_only_keys(r.ENGINE_MYSQL, tables, ['app.activity_log', 'app.not_there'], 5_000_000)
+    assert keys == {'app.activity_log', 'app.huge'}
+    assert d.count_only_keys(r.ENGINE_MYSQL, tables, [], 5_000_000) == {'app.huge'}
+
+
+def test_verify_config_normalizes_drill_count_only_tables():
+    cfg, errors = r.normalize_verify_config({'drill_count_only_tables': 'epetition.activity_log, bad name;'},
+                                            r.ENGINE_MYSQL)
+    assert cfg['drill_count_only_tables'] == ['epetition.activity_log'] and errors
+    pg, errors = r.normalize_verify_config({'drill_count_only_tables': ['dspace.big']}, r.ENGINE_POSTGRES)
+    assert pg['drill_count_only_tables'] == ['dspace.public.big'] and not errors
+
+
+def test_set_verify_config_keeps_count_only_list_when_absent(monkeypatch):
+    from app import restore_service as svc
+    stored = {'restore_verify': '{"key_tables": [], "drill_count_only_tables": ["app.activity_log"]}'}
+    monkeypatch.setattr(svc, 'job_context', lambda jid: (dict(stored, id=jid), {}, {}, r.ENGINE_MYSQL, {}))
+    saved = []
+
+    class FakeDb:
+        def execute(self, sql, params):
+            saved.append(params)
+
+        def commit(self):
+            pass
+    monkeypatch.setattr(svc, '_db', lambda: FakeDb())
+    cfg = svc.set_verify_config('j', {'key_tables': ['app.t'], 'check_sql': '', 'health_url': ''})
+    assert cfg['drill_count_only_tables'] == ['app.activity_log'] and cfg['key_tables'] == ['app.t']
+    cfg = svc.set_verify_config('j', {'key_tables': [], 'drill_count_only_tables': []})
+    assert cfg['drill_count_only_tables'] == []
+
+
+def test_drill_per_job_count_only_table_uses_row_count(world, monkeypatch):
+    from app import restore_service as svc
+    bodies = []
+    real = svc.prod_sql
+    monkeypatch.setattr(svc, 'prod_sql', lambda job, c, s, body, timeout=600: (bodies.append(body),
+                                                                               real(job, c, s, body, timeout))[1])
+    monkeypatch.setattr(svc, 'verify_config', lambda job, engine=None: {'drill_count_only_tables': ['app.t']})
+    res = world['ds'].run_drill(Ctx(), 'drj')
+    assert res['ok'], res
+    checksums = [b for b in bodies if "run_sql ck:" in b]
+    assert len(checksums) == 2  # production before and after
+    for b in checksums:
+        assert 'count:' in b and 'COUNT(*)) FROM `app`.`t`' in b
+        assert 'CHECKSUM TABLE `app`.`t`' not in b
+        assert 'CHECKSUM TABLE `app`.`u`' in b
+
+
+def test_drill_skips_without_scratch_disk(world, monkeypatch):
+    from app import health, restore_service as svc
+    calls = []
+    monkeypatch.setattr(svc, 'prod_sql', lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(svc, 'derive_plan', lambda data: (
+        {'engine': 'mysql', 'method': 'binlog', 'storage': {'id': 's1', 'name': 'minio'},
+         'disk': {'ok': False, 'free_bytes': 1, 'needed_bytes': 10}},
+        'Not enough free disk on the backupx server: this restore needs about 10 GB'))
+    ctx = Ctx()
+    res = world['ds'].run_drill(ctx, 'drj')
+    assert res['skipped'] and res['ok'] is None and 'Not enough free disk' in res['summary']
+    assert not calls, 'production must not be read when the drill is skipped'
+    assert not world['alerts'] and world['history'][-1][2] == 'skipped' and not world['removed']
+    last = world['ds'].serialize(world['ds'].last_result('drj'))
+    assert last['skipped'] and 'free disk' in last['warning']
+    now = datetime.now(timezone.utc)
+    issues = health.detect_pitr({'now': now, 'jobs': {'drj': {'name': 'Drill job', 'pitr_enabled': True}},
+                                 'pitr': {}, 'probes': {'drill:drj': {'data': res}}})
+    assert not any(i.kind == 'restore_drill_failed' for i in issues)

@@ -125,6 +125,30 @@ def parse_checksums(marked):
     return out
 
 
+def count_only_keys(engine, tables, configured, max_table_rows):
+    """Table keys compared by row count instead of a checksum.
+
+    Estimated larger than max_table_rows, or listed in the job's drill_count_only_tables
+    ("db.table"; PostgreSQL "db.schema.table") - for big append-only tables (activity logs)
+    whose full checksum would read gigabytes from production every week.
+    """
+    wanted = set(configured or [])
+    out = set()
+    for db, name, rows in tables:
+        key = f'{db}.{name}'
+        if rows > max_table_rows or key in wanted:
+            out.add(key)
+    return out
+
+
+def disk_skip_reason(plan, error):
+    """The warning when a drill can't run for lack of scratch disk (a skip, not a failed drill)."""
+    disk = (plan or {}).get('disk') or {}
+    if error and disk and not disk.get('ok'):
+        return error
+    return None
+
+
 def compare(before, after, restored):
     """Judge a drill. before/after: production checksums around the restore; restored: the copy.
 
@@ -153,6 +177,8 @@ def compare(before, after, restored):
 
 
 def summary(result):
+    if result.get('skipped'):
+        return f"skipped: {result.get('warning') or 'not run'}"
     if result.get('error'):
         return f"failed: {result['error']}"
     c = result.get('comparison') or {}

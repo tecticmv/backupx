@@ -679,6 +679,16 @@ reads must match exactly. Result: `health_probes` `drill:<job>`, a history
 row, job card "Verified restore", job page drill card; failure -> critical
 alert + issue `restore_drill_failed`.
 
+Per job, `jobs.restore_verify.drill_count_only_tables` (job page "Key tables
+and checks", or `PUT /api/jobs/:id/restore-verify`) lists big tables compared by
+row count instead of a checksum (E-Petition `activity_log`, ~4 GB, so the weekly
+drill doesn't read it all twice on production). A PUT without the key keeps the
+stored list. Before reading production the drill plans a scratch restore of the
+latest point and checks free disk (estimated size x `RESTORE_DISK_FACTOR`); not
+enough disk (there or at the real plan) = drill *skipped* (history `skipped`,
+`warning` in the result, badge "skipped"), not a failed drill: no alert, no
+issue.
+
 ### Health hooks
 
 Issues carry `wizard: {kind: 'pitr_enable', job_id}`; IssueItem shows "Open

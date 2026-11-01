@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { CheckCircle2, FlaskConical, Loader2, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, FlaskConical, Loader2, XCircle } from "lucide-react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -10,7 +10,9 @@ import { formatDateTime, formatRelative } from "@/lib/format";
 import type { Task } from "@/types/task";
 
 export interface DrillResult {
-  ok: boolean;
+  ok: boolean | null;
+  skipped?: boolean | null;
+  warning?: string | null;
   started_at: string | null;
   finished_at: string | null;
   target_time: string | null;
@@ -33,6 +35,12 @@ interface DrillInfo {
 
 export function DrillBadge({ result }: { result: DrillResult | null | undefined }) {
   if (!result) return <Badge variant="outline">never</Badge>;
+  if (result.skipped)
+    return (
+      <Badge variant="outline" className="gap-1">
+        <AlertTriangle className="h-3 w-3" /> skipped
+      </Badge>
+    );
   return result.ok ? (
     <Badge variant="secondary" className="gap-1">
       <CheckCircle2 className="h-3 w-3" /> verified
@@ -100,9 +108,10 @@ export default function RestoreDrillCard({ jobId }: { jobId: string }) {
         {last ? (
           <>
             <p>
-              Last verified restore: {formatDateTime(last.finished_at)} ({formatRelative(last.finished_at)})
+              {last.skipped ? "Last drill (skipped)" : "Last verified restore"}: {formatDateTime(last.finished_at)} (
+              {formatRelative(last.finished_at)})
             </p>
-            <p className={last.ok ? "text-muted-foreground" : "text-destructive"}>{last.summary}</p>
+            <p className={last.ok || last.skipped ? "text-muted-foreground" : "text-destructive"}>{last.summary}</p>
             {last.mismatches.length > 0 && (
               <ul className="list-disc pl-5 text-destructive">
                 {last.mismatches.map((m) => (

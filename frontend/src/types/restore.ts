@@ -35,6 +35,7 @@ export interface VerifyConfig {
   key_tables: string[];
   check_sql: string;
   health_url: string;
+  drill_count_only_tables?: string[];
 }
 
 export interface PitrWindow {
