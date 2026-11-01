@@ -10,6 +10,7 @@ dedicated connection (never a pooled one): if the process holding it dies,
 Postgres drops the connection and the lock is released.
 """
 
+import hashlib
 import logging
 import threading
 from contextlib import contextmanager
@@ -21,6 +22,8 @@ logger = logging.getLogger(__name__)
 # any other advisory locks on the same database.
 SCHEDULER_LOCK_NAMESPACE = 0x42585301
 JOB_LOCK_NAMESPACE = 0x42585302
+# 0x42585303 is the schema lock (app/db/postgres.py)
+REPO_LOCK_NAMESPACE = 0x42585304
 
 
 @contextmanager
@@ -45,6 +48,47 @@ def job_run_lock(connect: Callable, job_id: str):
 def job_is_running(connect: Callable, job_id: str) -> bool:
     """True if some worker currently holds the run lock for this job."""
     with job_run_lock(connect, job_id) as acquired:
+        return not acquired
+
+
+def repo_lock_key(repo_url: str) -> str:
+    """Advisory-lock key of a restic repository: "repo:<sha256 prefix>" of its URL."""
+    return 'repo:' + hashlib.sha256((repo_url or '').strip().rstrip('/').encode()).hexdigest()[:16]
+
+
+@contextmanager
+def repo_locks(connect: Callable, repo_urls, exclusive: bool = False):
+    """Mark restic repositories as in use by backupx while the block runs.
+
+    Shared (default): backups, restores, retention - anything that may hold a
+    restic lock in the repository. Exclusive: operations that must be alone,
+    such as removing a stale restic lock (`restic unlock`). Taking the
+    exclusive form without waiting therefore answers "is backupx using this
+    repository right now?" across all workers and containers.
+
+    All locks sit on one dedicated connection. Yields True if every lock was
+    taken; on False none are held.
+    """
+    keys = sorted({repo_lock_key(u) for u in repo_urls if u})
+    conn = connect()
+    fn = 'pg_try_advisory_lock' if exclusive else 'pg_try_advisory_lock_shared'
+    try:
+        acquired = True
+        with conn.cursor() as cur:
+            for key in keys:
+                cur.execute(f'SELECT {fn}(%s, hashtext(%s)) AS acquired', (REPO_LOCK_NAMESPACE, key))
+                row = cur.fetchone()
+                if not bool(row['acquired'] if isinstance(row, dict) else row[0]):
+                    acquired = False
+                    break
+        yield acquired
+    finally:
+        conn.close()
+
+
+def repo_in_use(connect: Callable, repo_url: str) -> bool:
+    """True if any backupx run holds a (shared or exclusive) lock on the repository."""
+    with repo_locks(connect, [repo_url], exclusive=True) as acquired:
         return not acquired
 
 

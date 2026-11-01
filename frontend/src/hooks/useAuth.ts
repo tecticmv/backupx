@@ -1,4 +1,5 @@
 import { useState, useEffect, createContext, useContext } from "react";
+import { setCsrfToken } from "@/lib/api";
 
 interface User {
   id: string;
@@ -56,6 +57,7 @@ export function useAuthState() {
 
       if (response.ok) {
         const data = await response.json();
+        setCsrfToken(data.csrf_token);
         setUser(data.user);
         return true;
       }
@@ -69,6 +71,7 @@ export function useAuthState() {
     try {
       await fetch("/api/auth/logout", { method: "POST" });
     } finally {
+      setCsrfToken(null);
       setUser(null);
     }
   };

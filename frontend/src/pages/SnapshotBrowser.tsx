@@ -57,8 +57,12 @@ import {
   RotateCcw,
   Archive,
 } from "lucide-react";
+import { useTasks } from "@/hooks/useTasks";
+import { useStepUp } from "@/hooks/useStepUp";
 
 export default function SnapshotBrowser() {
+  const { track } = useTasks();
+  const { withStepUp } = useStepUp();
   const { jobId, snapshotId } = useParams<{ jobId: string; snapshotId: string }>();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -155,25 +159,18 @@ export default function SnapshotBrowser() {
     setDownloadingZip((prev) => new Set(prev).add(item.path));
 
     try {
-      const url = `/api/jobs/${jobId}/snapshots/${snapshotId}/download-zip?path=${encodeURIComponent(item.path)}${storageQuery}`;
-      const response = await fetch(url);
-
+      // ZIP in the background; the download starts when it's ready
+      const response = await fetch(`/api/jobs/${jobId}/snapshots/${snapshotId}/zip`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: item.path, storage: storageId || undefined }),
+      });
+      const data = await response.json();
       if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || "Download failed");
+        throw new Error(data.error || "Download failed");
       }
-
-      const blob = await response.blob();
-      const downloadUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = downloadUrl;
-      link.download = `${item.name}.zip`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      window.URL.revokeObjectURL(downloadUrl);
-
-      toast.success(`Downloaded ${item.name}.zip`);
+      track(data.task, { autoDownload: true });
+      toast.success(`Preparing ${item.name}.zip - the download starts when it's ready`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Download failed");
     } finally {
@@ -198,20 +195,25 @@ export default function SnapshotBrowser() {
 
     setIsRestoring(true);
     try {
-      const response = await fetch(`/api/jobs/${jobId}/snapshots/${snapshotId}/restore`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source_path: restoreItem.path,
-          target_path: targetPath,
-          storage: storageId || undefined,
-        }),
-      });
+      const response = await withStepUp(
+        () =>
+          fetch(`/api/jobs/${jobId}/snapshots/${snapshotId}/restore`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              source_path: restoreItem.path,
+              target_path: targetPath,
+              storage: storageId || undefined,
+            }),
+          }),
+        "Restoring writes files on the server"
+      );
 
       const data = await response.json();
 
       if (response.ok) {
-        toast.success(data.message || "Restore completed successfully");
+        track(data.task);
+        toast.success(data.message || "Restore started");
         setRestoreDialogOpen(false);
       } else {
         toast.error(data.error || "Restore failed");

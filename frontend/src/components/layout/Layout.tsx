@@ -10,6 +10,7 @@ import {
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb";
 import { AppSidebar } from "./AppSidebar";
+import { TaskTray } from "@/components/TaskTray";
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -67,6 +68,9 @@ export default function Layout({ children }: LayoutProps) {
               ))}
             </BreadcrumbList>
           </Breadcrumb>
+          <div className="ml-auto">
+            <TaskTray />
+          </div>
         </header>
         <main className="flex-1 p-6">
           {children}

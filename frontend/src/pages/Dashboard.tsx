@@ -11,7 +11,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Progress } from "@/components/ui/progress";
-import { ContributionGraph } from "@/components/ContributionGraph";
+import { BackupActivityChart } from "@/components/BackupActivityChart";
 import { toast } from "sonner";
 import type { Jobs, HistoryEntry, PitrSummary } from "@/types/job";
 import PitrBadge from "@/components/PitrBadge";
@@ -37,6 +37,7 @@ import {
   Server,
   AlertTriangle,
 } from "lucide-react";
+import { useTasks } from "@/hooks/useTasks";
 
 interface ContributionDay {
   date: string;
@@ -76,6 +77,7 @@ interface DashboardStats {
 }
 
 export default function Dashboard() {
+  const { track } = useTasks();
   const [jobs, setJobs] = useState<Jobs>({});
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [stats, setStats] = useState<DashboardStats | null>(null);
@@ -122,7 +124,8 @@ export default function Dashboard() {
       });
       const data = await response.json();
       if (data.success) {
-        toast.success("Backup started");
+        track(data.task);
+        toast.success(data.deduplicated ? "A backup of this job is already queued" : "Backup started");
         fetchData();
       } else {
         toast.error(data.error || "Failed to start backup");
@@ -329,40 +332,22 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      {/* GitHub-style Contribution Graph */}
+      {/* Weekly backup activity (official shadcn chart) */}
       <Card>
         <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div>
-              <CardTitle className="text-base">Backup Activity</CardTitle>
-              <CardDescription>
-                {totalBackupsYear} backups in the last year
-                {successBackupsYear > 0 && (
-                  <span className="ml-2 text-emerald-500">
-                    ({successBackupsYear} successful)
-                  </span>
-                )}
-              </CardDescription>
-            </div>
-            <div className="flex items-center gap-4 text-xs text-muted-foreground">
-              <div className="flex items-center gap-1.5">
-                <div className="w-3 h-3 rounded-sm bg-emerald-500" />
-                <span>Success</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <div className="w-3 h-3 rounded-sm bg-amber-500" />
-                <span>Mixed</span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <div className="w-3 h-3 rounded-sm bg-destructive" />
-                <span>Failed</span>
-              </div>
-            </div>
-          </div>
+          <CardTitle className="text-base">Backup Activity</CardTitle>
+          <CardDescription>
+            {totalBackupsYear} backups in the last year
+            {successBackupsYear > 0 && (
+              <span className="ml-2 text-emerald-500">
+                ({successBackupsYear} successful)
+              </span>
+            )}
+          </CardDescription>
         </CardHeader>
         <CardContent>
           {stats?.contribution_data && (
-            <ContributionGraph data={stats.contribution_data} />
+            <BackupActivityChart data={stats.contribution_data} />
           )}
         </CardContent>
       </Card>

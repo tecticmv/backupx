@@ -22,6 +22,7 @@ import type { JobStorage, PitrDetails } from "@/types/job";
 import PitrBadge from "@/components/PitrBadge";
 import { formatWindow } from "@/lib/pitr";
 import { Download, Loader2, Send } from "lucide-react";
+import { useTasks } from "@/hooks/useTasks";
 
 interface Props {
   jobId: string | null;
@@ -39,6 +40,7 @@ function toLocalInput(date: Date) {
 }
 
 export default function PitrRestoreDialog({ jobId, jobName, onOpenChange }: Props) {
+  const { track } = useTasks();
   const [details, setDetails] = useState<PitrDetails | null>(null);
   const [storages, setStorages] = useState<JobStorage[]>([]);
   const [storageId, setStorageId] = useState<string>("");
@@ -68,7 +70,10 @@ export default function PitrRestoreDialog({ jobId, jobName, onOpenChange }: Prop
   const shipNow = async () => {
     const res = await fetch(`/api/jobs/${jobId}/pitr/ship`, { method: "POST" });
     const data = await res.json();
-    if (res.ok) toast.success(data.message);
+    if (res.ok) {
+      track(data.task);
+      toast.success(data.message);
+    }
     else toast.error(data.error || "Failed to start");
   };
 

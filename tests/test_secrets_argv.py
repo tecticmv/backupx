@@ -265,11 +265,10 @@ def test_restore_routes_keep_secrets_out_of_argv(logged_in, transport, monkeypat
         'id': 'db1', 'type': 'mysql', 'host': 'db.local', 'port': 3306, 'username': 'u',
         'password': DB_PASSWORD, 'docker_container': ''})
 
+    logged_in.post('/api/auth/step-up', json={'password': 'testpassword123'})
     logged_in.post('/api/jobs/job1/snapshots/abc123/restore-db', json={'target_database': 'app'})
-    logged_in.post('/api/jobs/job1/snapshots/abc123/restore',
-                              json={'source_path': '/data', 'target_path': '/restore'})
 
-    assert len(transport.calls) == 2
+    assert len(transport.calls) == 1
     for call in transport.calls:
         _assert_no_secret_in_argv(call['args'])
         assert RESTIC_PASSWORD in transport.stdin_of(call)
@@ -308,6 +307,11 @@ def test_direct_db_restore_runs_when_enabled(logged_in, transport, monkeypatch, 
     monkeypatch.setenv('ALLOW_DIRECT_DB_RESTORE', value)
 
     resp = logged_in.post('/api/jobs/job1/snapshots/abc123/restore-db', json={'target_database': 'app'})
+    assert resp.status_code == 403 and resp.get_json()['code'] == 'step_up_required'
+    assert transport.calls == []
+
+    logged_in.post('/api/auth/step-up', json={'password': 'testpassword123'})
+    resp = logged_in.post('/api/jobs/job1/snapshots/abc123/restore-db', json={'target_database': 'app'})
 
     assert resp.status_code != 403
     assert len(transport.calls) == 1
@@ -317,8 +321,47 @@ def test_file_restore_unaffected_by_db_restore_gate(logged_in, transport, monkey
     _db_restore_setup(monkeypatch)
     monkeypatch.delenv('ALLOW_DIRECT_DB_RESTORE', raising=False)
 
+    logged_in.post('/api/auth/step-up', json={'password': 'testpassword123'})
     resp = logged_in.post('/api/jobs/job1/snapshots/abc123/restore',
                           json={'source_path': '/data', 'target_path': '/restore'})
 
-    assert resp.status_code == 200
+    # File restores are queued as a task (it runs later, in the task runner)
+    assert resp.status_code == 202
+    assert resp.get_json()['task']['kind'] == 'restore_files'
+
+
+def test_file_restore_task_keeps_secrets_out_of_argv_and_task_log(logged_in, transport, monkeypatch):
+    """File restore runs as a task: secrets go over stdin, and never into task_logs or params."""
+    import app.main as main
+    from app import tasks
+    from app.db.factory import get_database
+    monkeypatch.setattr(main, 'get_job', lambda jid: dict(JOB))
+    monkeypatch.setattr(main, '_job_storage_from_request', lambda j: dict(TARGET))
+    monkeypatch.setattr(main, 'resolve_job_storage', lambda j, sid=None: dict(TARGET))
+    monkeypatch.setattr(main, 'get_db_config', lambda cid: {'id': 'db1', 'password': DB_PASSWORD})
+    # The remote side echoes every secret back; the task log must not keep any of them
+    transport.stdout_lines = ['restoring...'] + [f'echo {s}' for s in SECRETS] + [f'password={SSH_PASSWORD}']
+
+    assert logged_in.post('/api/auth/step-up', json={'password': 'testpassword123'}).status_code == 200
+    response = logged_in.post('/api/jobs/job1/snapshots/abc123/restore',
+                              json={'source_path': '/data', 'target_path': '/restore'})
+    assert response.status_code == 202, response.get_json()
+    task_id = response.get_json()['task']['id']
+
+    runner = tasks.TaskRunner(main._lock_connection, max_workers=1, worker_id='test-restore')
+    for _ in range(20):  # other tests' leftovers may be queued ahead of ours
+        if runner.run_once() is None or tasks.get_task(task_id)['status'] not in tasks.ACTIVE_STATUSES:
+            break
+    row = tasks.get_task(task_id)
+    assert row['status'] == 'succeeded', row
+
     assert len(transport.calls) == 1
+    call = transport.calls[0]
+    _assert_no_secret_in_argv(call['args'])
+    assert RESTIC_PASSWORD in transport.stdin_of(call)
+    stored = ' '.join(str(v) for v in row.values())
+    lines = [r['line'] for r in get_database().fetchall('SELECT line FROM task_logs WHERE task_id = %s', (task_id,))]
+    assert any('restoring' in l for l in lines)
+    for secret in SECRETS:
+        assert secret not in stored
+        assert all(secret not in l for l in lines), lines

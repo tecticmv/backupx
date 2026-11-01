@@ -27,6 +27,79 @@ except ImportError:
     logger.warning("psycopg2 not installed. PostgreSQL support unavailable.")
 
 
+# Background tasks (app/tasks.py) and per-storage backup run results. Shared by
+# init_schema and migrate_schema; every statement is idempotent.
+TASK_SCHEMA_SQL = """
+    CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        title TEXT,
+        parent_id TEXT,
+        resource_type TEXT,
+        resource_id TEXT,
+        params TEXT,
+        tier TEXT NOT NULL DEFAULT 'safe',
+        status TEXT NOT NULL DEFAULT 'queued',
+        progress INTEGER DEFAULT 0,
+        step TEXT,
+        idempotency_key TEXT,
+        cancel_requested BOOLEAN DEFAULT FALSE,
+        created_by TEXT,
+        ip TEXT,
+        worker TEXT,
+        created_at TIMESTAMP NOT NULL,
+        started_at TIMESTAMP,
+        finished_at TIMESTAMP,
+        heartbeat_at TIMESTAMP,
+        not_before TIMESTAMP,
+        log_seq INTEGER DEFAULT 0,
+        result TEXT,
+        error TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_active_idempotency
+        ON tasks(idempotency_key)
+        WHERE status IN ('queued', 'running') AND idempotency_key IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_tasks_resource ON tasks(resource_type, resource_id, created_at DESC);
+    CREATE TABLE IF NOT EXISTS task_logs (
+        task_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        ts TIMESTAMP NOT NULL,
+        stream TEXT,
+        line TEXT,
+        PRIMARY KEY (task_id, seq)
+    );
+
+    CREATE TABLE IF NOT EXISTS run_results (
+        id SERIAL PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        storage_id TEXT NOT NULL DEFAULT '',
+        storage_name TEXT,
+        status TEXT NOT NULL,
+        exit_code INTEGER,
+        snapshot_id TEXT,
+        error TEXT,
+        log_id INTEGER,
+        task_id TEXT,
+        trigger TEXT,
+        started_at TIMESTAMP,
+        finished_at TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_run_results_run ON run_results(run_id);
+    CREATE INDEX IF NOT EXISTS idx_run_results_job ON run_results(job_id, finished_at DESC);
+    CREATE TABLE IF NOT EXISTS run_logs (
+        id SERIAL PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        storage_id TEXT NOT NULL DEFAULT '',
+        content TEXT,
+        truncated BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_run_logs_run ON run_logs(run_id);
+"""
+
+
 if PSYCOPG2_AVAILABLE:
     class BlockingThreadedConnectionPool(pool.ThreadedConnectionPool):
         """ThreadedConnectionPool that waits for a free connection instead of failing.
@@ -472,7 +545,8 @@ class PostgresBackend(DatabaseBackend):
                 job_name TEXT NOT NULL,
                 status TEXT NOT NULL,
                 message TEXT,
-                duration DOUBLE PRECISION DEFAULT 0
+                duration DOUBLE PRECISION DEFAULT 0,
+                run_id TEXT
             );
 
             -- Notification channels table
@@ -623,6 +697,7 @@ class PostgresBackend(DatabaseBackend):
             CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_next_run ON scheduled_jobs(next_run);
         '''
         self.executescript(schema)
+        self.executescript(TASK_SCHEMA_SQL)
         self.commit()
         logger.info("PostgreSQL schema initialized")
 
@@ -679,6 +754,13 @@ class PostgresBackend(DatabaseBackend):
             self.add_column('jobs', 'pitr_retention_days', 'INTEGER', '7')
         if 'pitr_client_image' not in job_columns:
             self.add_column('jobs', 'pitr_client_image', 'TEXT')
+
+        # History rows link to their per-storage run results
+        if 'run_id' not in self.get_table_columns('history'):
+            self.add_column('history', 'run_id', 'TEXT')
+        # Tasks / run results (columns added after the first release of these tables go here)
+        self.executescript(TASK_SCHEMA_SQL)
+        self.commit()
 
         # Create app_settings table if it doesn't exist
         self.executescript('''

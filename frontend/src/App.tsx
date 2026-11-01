@@ -17,6 +17,8 @@ import Notifications from "@/pages/Notifications";
 import AuditLog from "@/pages/AuditLog";
 import Settings from "@/pages/Settings";
 import { Loader2 } from "lucide-react";
+import { TasksProvider } from "@/hooks/useTasks";
+import { StepUpProvider } from "@/hooks/useStepUp";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, isLoading } = useAuthState();
@@ -41,111 +43,115 @@ function AppRoutes() {
 
   return (
     <AuthContext.Provider value={authState}>
-      <Routes>
-        <Route
-          path="/login"
-          element={
-            authState.user ? <Navigate to="/" replace /> : <Login />
-          }
-        />
-        <Route
-          path="/"
-          element={
-            <ProtectedRoute>
-              <Dashboard />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/jobs"
-          element={
-            <ProtectedRoute>
-              <Jobs />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/jobs/:jobId/snapshots"
-          element={
-            <ProtectedRoute>
-              <Snapshots />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/jobs/:jobId/snapshots/:snapshotId/files"
-          element={
-            <ProtectedRoute>
-              <SnapshotBrowser />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/history"
-          element={
-            <ProtectedRoute>
-              <History />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/servers"
-          element={
-            <ProtectedRoute>
-              <Servers />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/databases"
-          element={
-            <ProtectedRoute>
-              <Databases />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/storage"
-          element={
-            <ProtectedRoute>
-              <Storage />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/storage/:configId/browse"
-          element={
-            <ProtectedRoute>
-              <S3Explorer />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/notifications"
-          element={
-            <ProtectedRoute>
-              <Notifications />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/audit"
-          element={
-            <ProtectedRoute>
-              <AuditLog />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/settings"
-          element={
-            <ProtectedRoute>
-              <Settings />
-            </ProtectedRoute>
-          }
-        />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
+      <StepUpProvider>
+        <TasksProvider enabled={!!authState.user}>
+          <Routes>
+            <Route
+              path="/login"
+              element={
+                authState.user ? <Navigate to="/" replace /> : <Login />
+              }
+            />
+            <Route
+              path="/"
+              element={
+                <ProtectedRoute>
+                  <Dashboard />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/jobs"
+              element={
+                <ProtectedRoute>
+                  <Jobs />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/jobs/:jobId/snapshots"
+              element={
+                <ProtectedRoute>
+                  <Snapshots />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/jobs/:jobId/snapshots/:snapshotId/files"
+              element={
+                <ProtectedRoute>
+                  <SnapshotBrowser />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/history"
+              element={
+                <ProtectedRoute>
+                  <History />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/servers"
+              element={
+                <ProtectedRoute>
+                  <Servers />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/databases"
+              element={
+                <ProtectedRoute>
+                  <Databases />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/storage"
+              element={
+                <ProtectedRoute>
+                  <Storage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/storage/:configId/browse"
+              element={
+                <ProtectedRoute>
+                  <S3Explorer />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/notifications"
+              element={
+                <ProtectedRoute>
+                  <Notifications />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/audit"
+              element={
+                <ProtectedRoute>
+                  <AuditLog />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/settings"
+              element={
+                <ProtectedRoute>
+                  <Settings />
+                </ProtectedRoute>
+              }
+            />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </TasksProvider>
+      </StepUpProvider>
     </AuthContext.Provider>
   );
 }

@@ -56,8 +56,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Progress } from "@/components/ui/progress";
+import { useTasks } from "@/hooks/useTasks";
 
 export default function Jobs() {
+  const { track } = useTasks();
   const [jobs, setJobs] = useState<JobsType>({});
   const [isLoading, setIsLoading] = useState(true);
   const [deleteJobId, setDeleteJobId] = useState<string | null>(null);
@@ -131,7 +133,8 @@ export default function Jobs() {
       });
       const data = await response.json();
       if (data.success) {
-        toast.success("Backup started");
+        track(data.task);
+        toast.success(data.deduplicated ? "A backup of this job is already queued" : "Backup started");
         fetchJobs();
       } else {
         toast.error(data.error || "Failed to start backup");
@@ -155,7 +158,8 @@ export default function Jobs() {
       });
       const data = await response.json();
       if (data.success) {
-        toast.success(data.message || "Repository initialized");
+        track(data.task);
+        toast.success(data.message || "Repository initialization started");
       } else {
         toast.error(data.error || "Failed to initialize repository");
       }

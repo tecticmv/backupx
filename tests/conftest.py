@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 os.environ['SECRET_KEY'] = 'test-secret-key-for-testing-only-32chars!'
 os.environ['ADMIN_USERNAME'] = 'testadmin'
 os.environ['ADMIN_PASSWORD'] = 'testpassword123'
+# Tests drive the task runner themselves (TaskRunner.run_once)
+os.environ.setdefault('TASK_RUNNER_ENABLED', 'false')
 
 
 @pytest.fixture

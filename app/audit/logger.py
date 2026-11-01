@@ -114,6 +114,9 @@ class AuditLogger:
             changes = json.dumps(self._redact_sensitive(new_value))
         elif action == self.ACTION_DELETE and old_value:
             changes = json.dumps({'deleted': self._redact_sensitive(old_value)})
+        elif new_value:
+            # Other actions (RESTORE_FILES, STEP_UP, ...): record their details
+            changes = json.dumps(self._redact_sensitive(new_value), default=str)
 
         timestamp = datetime.now().isoformat()
 

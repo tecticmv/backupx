@@ -25,7 +25,7 @@ from pathlib import Path
 
 from flask import Flask, request, redirect, url_for, jsonify, send_from_directory, g
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from flask_wtf.csrf import CSRFProtect
+from flask_wtf.csrf import CSRFProtect, CSRFError, generate_csrf
 from werkzeug.security import generate_password_hash, check_password_hash
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.executors.pool import ThreadPoolExecutor as SchedulerThreadPool
@@ -33,8 +33,11 @@ from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 import yaml
 import humanize
 
-from .scheduler.locks import SchedulerLeader, job_run_lock, job_is_running
+from .scheduler.locks import SchedulerLeader, job_run_lock, job_is_running, repo_locks
 from . import retention
+from . import tasks
+from . import security
+from .security import requires_step_up
 from . import pitr
 from . import pitr_service
 from .cron import cron_fields, cron_trigger
@@ -241,8 +244,19 @@ FRONTEND_DIST = Path(__file__).parent.parent / 'frontend' / 'dist'
 app = Flask(__name__, static_folder='../static')
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'change-this-secret-key')
 
-# CSRF Protection
+# CSRF Protection: on for every mutating route except login. The SPA fetches
+# the token from /api/auth/csrf and sends it as the X-CSRFToken header (see
+# frontend/src/lib/api.ts). The token is bound to the session, not to a time
+# window, so a long-open tab keeps working.
+app.config['WTF_CSRF_TIME_LIMIT'] = None
+app.config.setdefault('WTF_CSRF_HEADERS', ['X-CSRFToken', 'X-CSRF-Token'])
 csrf = CSRFProtect(app)
+
+
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    return jsonify({'error': 'Security token missing or expired; reload and try again',
+                    'code': 'csrf', 'detail': e.description}), 400
 
 # Rate Limiting
 from flask_limiter import Limiter
@@ -264,7 +278,14 @@ limiter = Limiter(
 # Login Manager
 login_manager = LoginManager()
 login_manager.init_app(app)
-login_manager.login_view = 'login'
+
+
+@login_manager.unauthorized_handler
+def _unauthorized():
+    # JSON 401 for the API (the SPA's pollers handle it); the SPA's login page otherwise
+    if request.path.startswith('/api/'):
+        return jsonify({'error': 'Not authenticated', 'code': 'unauthenticated'}), 401
+    return redirect('/login')
 
 
 # =============================================================================
@@ -1081,7 +1102,10 @@ def update_job_status(job_id, status, last_run=None, last_success=None):
 
 
 def update_job_progress(job_id, progress, message):
-    """Update job progress during backup execution"""
+    """Update job progress during backup execution (and the task's, for runs started as a task)"""
+    run = _current_run()
+    if run is not None and run.task is not None and run.job_id == job_id:
+        run.task.progress(progress, message)
     conn = get_db_connection()
     conn.execute('UPDATE jobs SET progress=?, progress_message=?, updated_at=? WHERE id=?',
                  (progress, message, utc_isoformat(), job_id))
@@ -1100,12 +1124,14 @@ def load_history():
 
 
 def add_history(job_id, job_name, status, message, duration=0):
-    """Add entry to backup history"""
+    """Add entry to backup history (linked to the current run's per-storage results)"""
+    run = _current_run()
     conn = get_db_connection()
     conn.execute('''
-        INSERT INTO history (timestamp, job_id, job_name, status, message, duration)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (utc_isoformat(), job_id, job_name, status, message, duration))
+        INSERT INTO history (timestamp, job_id, job_name, status, message, duration, run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (utc_isoformat(), job_id, job_name, status, message, duration,
+          run.run_id if run is not None and run.job_id == job_id else None))
 
     # Keep only last 100 entries
     conn.execute('''
@@ -1804,15 +1830,164 @@ def send_notification(job_id, job_name, status, message, duration):
             logger.error(f"Failed to send {channel['type']} notification to {channel['name']}: {e}")
 
 
-def run_backup(job_id):
+class BackupRun:
+    """What the code below run_backup needs to know about the run in progress.
+
+    Kept in a thread-local (one run per thread) so the many helpers keep their
+    signatures: run_id links history and run_results, storage_ids limits a
+    re-run to some storages, task (a tasks.TaskContext) gets progress/log lines.
+    """
+
+    def __init__(self, job_id, run_id=None, trigger='scheduled', storage_ids=None, task=None):
+        self.job_id = job_id
+        self.run_id = run_id or tasks.new_id()
+        self.trigger = trigger
+        self.storage_ids = list(storage_ids) if storage_ids else None
+        self.task = task
+        self.started_at = tasks.utcnow()
+        self.recorded = False
+
+
+_run_context = threading.local()
+
+
+def _current_run():
+    return getattr(_run_context, 'run', None)
+
+
+@contextmanager
+def _backup_run_context(run):
+    previous = getattr(_run_context, 'run', None)
+    _run_context.run = run
+    try:
+        yield run
+    finally:
+        _run_context.run = previous
+
+
+RUN_LOG_MAX_BYTES = int(os.environ.get('RUN_LOG_MAX_BYTES', 256 * 1024))
+RUN_RESULTS_KEEP_DAYS = int(os.environ.get('RUN_RESULTS_KEEP_DAYS', 90))
+
+
+def _job_secret_values(job, targets=None):
+    """Secret values a job's output could echo (for log redaction)."""
+    values = [job.get('restic_password'), job.get('s3_access_key'), job.get('s3_secret_key')]
+    for t in targets or []:
+        values += [t.get('access_key'), t.get('secret_key')]
+    try:
+        server = get_server(job['server_id']) if job.get('server_id') else None
+        if server:
+            pw = server.get('ssh_password') or ''
+            values.append(decrypt_credential(pw) if pw and is_encrypted(pw) else pw)
+        db_config = get_db_config(job['database_config_id']) if job.get('database_config_id') else None
+        if db_config:
+            values.append(db_config.get('password'))
+    except Exception:
+        pass
+    return [v for v in values if v and isinstance(v, str)]
+
+
+def _cap_log(text, limit=None):
+    """Keep head and tail of a log over `limit` bytes. Returns (text, truncated)."""
+    limit = limit or RUN_LOG_MAX_BYTES
+    data = text.encode('utf-8', 'replace')
+    if len(data) <= limit:
+        return text, False
+    half = limit // 2
+    head = data[:half].decode('utf-8', 'ignore')
+    tail = data[-half:].decode('utf-8', 'ignore')
+    return f"{head}\n[... {len(data) - limit} bytes omitted ...]\n{tail}", True
+
+
+def record_run_results(job_id, job, targets, results, preamble=None, stderr_text='', overall_error=None,
+                       status_override=None):
+    """Write one run_results row (+ full redacted log) per storage of this run. Never raises.
+
+    Returns the run_id.
+    """
+    run = _current_run()
+    if run is None or run.job_id != job_id:
+        run = BackupRun(job_id, trigger='unknown')
+    if run.recorded:
+        return run.run_id
+    run.recorded = True
+    try:
+        secrets_ = _job_secret_values(job, targets)
+        db = get_db()
+        now = tasks.utcnow()
+        head = [l for l in (preamble or []) if l]
+        if stderr_text and stderr_text.strip():
+            head.append(stderr_text.strip())
+        for index, target in enumerate(targets):
+            r = results[index] if results and index < len(results) else {'exit_code': None, 'output': []}
+            exit_code = r.get('exit_code')
+            if status_override:
+                status = status_override
+            elif exit_code == 0:
+                status = 'success'
+            elif exit_code is None:
+                status = 'not_run'
+            else:
+                status = 'failed'
+            error = None
+            if status != 'success':
+                if exit_code is None:
+                    error = overall_error or (' '.join(head[-3:]) if head else 'did not run')
+                else:
+                    error = _target_error(r)
+                error = sanitize_error_message(tasks.redact_text(error or '', secrets_))
+            log_text = '\n'.join(head + list(r.get('output') or []))
+            log_text, truncated = _cap_log(tasks.redact_text(log_text, secrets_))
+            cur = db.execute('INSERT INTO run_logs (run_id, storage_id, content, truncated, created_at) '
+                             'VALUES (%s, %s, %s, %s, %s) RETURNING id',
+                             (run.run_id, target.get('id') or '', log_text, truncated, now))
+            log_id = cur.fetchone()['id']
+            db.execute('INSERT INTO run_results (run_id, job_id, storage_id, storage_name, status, exit_code, '
+                       'snapshot_id, error, log_id, task_id, trigger, started_at, finished_at) '
+                       'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
+                       (run.run_id, job_id, target.get('id') or '', target.get('name'), status, exit_code,
+                        r.get('snapshot_id'), error, log_id, run.task.id if run.task else None,
+                        run.trigger, run.started_at, now))
+        db.commit()
+        _purge_old_run_results()
+    except Exception as e:
+        logger.error(f"Could not record per-storage results for job {job_id}: {e}")
+        try:
+            get_db().rollback()
+        except Exception:
+            pass
+    return run.run_id
+
+
+_last_run_results_purge = {'at': None}
+
+
+def _purge_old_run_results():
+    import time as _time
+    last = _last_run_results_purge['at']
+    if last is not None and _time.monotonic() - last < 3600:
+        return
+    _last_run_results_purge['at'] = _time.monotonic()
+    cutoff = tasks.utcnow() - timedelta(days=RUN_RESULTS_KEEP_DAYS)
+    db = get_db()
+    db.execute('DELETE FROM run_logs WHERE created_at < %s', (cutoff,))
+    db.execute('DELETE FROM run_results WHERE finished_at < %s', (cutoff,))
+    db.commit()
+
+
+def run_backup(job_id, storage_ids=None, trigger='scheduled', task=None, run_id=None):
     """Execute a backup job, unless a run of the same job is already in progress.
+
+    storage_ids: only these of the job's storages (re-run the failed ones).
+    task: the tasks.TaskContext when started from the API (gets progress and log).
 
     Never raises: any error is logged and reported (job status, history row,
     notification), so a run can't fail without a trace.
     """
+    run = BackupRun(job_id, run_id=run_id, trigger=trigger, storage_ids=storage_ids, task=task)
     # The run lock lives on its own dedicated connection; pooled connections are
     # only borrowed per query, so a long run doesn't tie one up.
-    with _short_lived_db():
+    with _short_lived_db(), _backup_run_context(run):
         try:
             with job_run_lock(_lock_connection, job_id) as acquired:
                 if not acquired:
@@ -1879,6 +2054,13 @@ def _run_backup_inner(job_id):
         return False, "Job not found"
 
     targets = get_job_storage_targets(job)
+    run = _current_run()
+    if run is not None and run.storage_ids and targets:
+        targets = [t for t in targets if t['id'] in run.storage_ids]
+        if not targets:
+            return False, "None of the requested storages is an active storage of this job"
+    if run is not None and run.task is not None:
+        run.task.add_secret(*_job_secret_values(job, targets))
     if not targets:
         error_msg = "No active S3 storage is configured for this job"
         update_job_status(job_id, 'error')
@@ -1906,15 +2088,17 @@ def _run_backup_inner(job_id):
         )
         if not success:
             error_msg = f"Restic not available on remote server: {msg}"
+            record_run_results(job_id, job, targets, [], overall_error=error_msg, status_override='error')
             update_job_status(job_id, 'error')
             add_history(job_id, job['name'], 'error', error_msg, 0)
             send_notification(job_id, job['name'], 'error', error_msg, 0)
             logger.error(f"Backup aborted - {error_msg}")
             return False, error_msg
 
-    if backup_type == 'database':
-        return run_database_backup(job_id, job, targets)
-    else:
+    # Mark the repositories in use (shared lock) so a stale-lock cleanup never runs under us
+    with repo_locks(_lock_connection, [job_repo_url(job, t) for t in targets]):
+        if backup_type == 'database':
+            return run_database_backup(job_id, job, targets)
         return run_filesystem_backup(job_id, job, targets)
 
 
@@ -1941,6 +2125,78 @@ def _write_server_key_file(server_id, key_content):
             f.write('\n')
     os.chmod(key_path, 0o600)
     return key_path
+
+
+# ssh host keys live in a file backupx can write (/app/data/known_hosts), so a
+# new host's key is recorded on first contact (accept-new) and host-key trust
+# can be managed in the app. ~/.ssh is mounted read-only; its known_hosts is
+# merged in at start-up (seed_known_hosts), never written.
+_known_hosts_ready = {'path': None}
+
+
+def known_hosts_path():
+    return os.environ.get('SSH_KNOWN_HOSTS_FILE') or os.path.join(
+        os.environ.get('APP_DATA_DIR', '/app/data'), 'known_hosts')
+
+
+def _mounted_known_hosts_files():
+    candidates = ['/home/backupx/.ssh/known_hosts', os.path.expanduser('~/.ssh/known_hosts')]
+    seen, out = set(), []
+    for c in candidates:
+        real = os.path.realpath(c)
+        if real not in seen and os.path.isfile(c) and real != os.path.realpath(known_hosts_path()):
+            seen.add(real)
+            out.append(c)
+    return out
+
+
+def seed_known_hosts():
+    """Create the writable known_hosts and merge in lines from the mounted ~/.ssh one.
+
+    Only adds lines that aren't there yet; never removes. Returns the path, or
+    None if it can't be written (ssh then uses its defaults).
+    """
+    path = known_hosts_path()
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        existing = set()
+        if os.path.exists(path):
+            with open(path, encoding='utf-8', errors='replace') as f:
+                existing = {line.strip() for line in f if line.strip()}
+        new_lines = []
+        for src in _mounted_known_hosts_files():
+            try:
+                with open(src, encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#') and line not in existing:
+                            existing.add(line)
+                            new_lines.append(line)
+            except OSError as e:
+                logger.debug(f"Can't read {src}: {e}")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, 'a', encoding='utf-8') as f:
+            for line in new_lines:
+                f.write(line + '\n')
+        if new_lines:
+            logger.info(f"known_hosts: merged {len(new_lines)} host key line(s) into {path}")
+        _known_hosts_ready['path'] = path
+        return path
+    except OSError as e:
+        logger.warning(f"Writable known_hosts unavailable ({path}): {e}")
+        _known_hosts_ready['path'] = None
+        return None
+
+
+def _known_hosts_opts():
+    path = _known_hosts_ready['path']
+    if path is None:
+        path = known_hosts_path()
+        if not os.path.exists(path):
+            path = seed_known_hosts()
+        else:
+            _known_hosts_ready['path'] = path
+    return ['-o', f'UserKnownHostsFile={path}'] if path else []
 
 
 def _get_ssh_key_path(server):
@@ -2050,6 +2306,7 @@ def _build_ssh_cmd(host, ssh_user, ssh_port=22, ssh_key='/home/backupx/.ssh/id_r
     base_opts = [
         '-p', str(ssh_port),
         '-o', 'StrictHostKeyChecking=accept-new',
+        *_known_hosts_opts(),
         '-o', f'ConnectTimeout={timeout}',
         '-o', 'ServerAliveInterval=60',
         '-o', 'ServerAliveCountMax=5',
@@ -2354,6 +2611,8 @@ def _stream_restic_progress(proc, job_id, timeout, target_names):
     import time
 
     count = max(len(target_names), 1)
+    run = _current_run()
+    task = run.task if run is not None else None
     results = [{'exit_code': None, 'output': []} for _ in target_names]
     preamble = []
     current = None
@@ -2379,6 +2638,8 @@ def _stream_restic_progress(proc, job_id, timeout, target_names):
         except ValueError:
             # Plain text (e.g. "Initializing new restic repository..." or an error)
             (results[current]['output'] if current is not None else preamble).append(line)
+            if task is not None:
+                task.log(label(line))
             continue
 
         msg_type = msg.get('message_type')
@@ -2390,6 +2651,10 @@ def _stream_restic_progress(proc, job_id, timeout, target_names):
 
         elif msg_type == 'backupx_target_done':
             results[msg['index']]['exit_code'] = msg.get('exit_code')
+            if task is not None:
+                code = msg.get('exit_code')
+                task.log(f"{target_names[msg['index']]}: " + ('stored' if code == 0 else f'failed (exit {code})'),
+                         stream='system')
 
         elif msg_type == 'status':
             pct = msg.get('percent_done', 0)
@@ -2423,6 +2688,8 @@ def _stream_restic_progress(proc, job_id, timeout, target_names):
             if msg.get('item'):
                 error = f"{msg['item']}: {error}"
             (results[current]['output'] if current is not None else preamble).append(str(error))
+            if task is not None:
+                task.log(label(str(error)), stream='stderr')
 
     stderr_text = proc.stderr.read() if proc.stderr else ''
     proc.wait()
@@ -2480,6 +2747,16 @@ def _target_error(result):
 def _finish_backup(job_id, job, targets, start_time, returncode, stderr_text, preamble, results, label):
     """Record the outcome of a (possibly multi-storage) backup run."""
     duration = (utc_now() - start_time).total_seconds()
+    pre_storage_error = None
+    if not any(r['exit_code'] is not None for r in results):
+        pre_storage_error = sanitize_error_message(
+            '\n'.join(filter(None, [stderr_text.strip(), '\n'.join(preamble)])) or f'{label} failed')
+    run_id = record_run_results(job_id, job, targets, results, preamble, stderr_text, pre_storage_error)
+    run = _current_run()
+    if run is not None and run.task is not None:
+        run.task.result = {'run_id': run_id, 'job_id': job_id, 'storages': [
+            {'id': t.get('id'), 'name': t.get('name'), 'exit_code': r.get('exit_code'),
+             'snapshot_id': r.get('snapshot_id')} for t, r in zip(targets, results)]}
     succeeded = [t['name'] for t, r in zip(targets, results) if r['exit_code'] == 0]
     failed = [(t['name'], _target_error(r)) for t, r in zip(targets, results) if r['exit_code'] != 0]
 
@@ -2576,6 +2853,7 @@ exit $BACKUPX_FAILED
                               preamble, results, 'Backup')
 
     except subprocess.TimeoutExpired:
+        record_run_results(job_id, job, targets, [], overall_error='Backup timed out', status_override='timeout')
         update_job_status(job_id, 'timeout')
         add_history(job_id, job['name'], 'timeout', 'Backup timed out', 0)
         send_notification(job_id, job['name'], 'timeout', 'Backup timed out', 0)
@@ -2583,6 +2861,7 @@ exit $BACKUPX_FAILED
         return False, "Backup timed out"
     except Exception as e:
         error_msg = sanitize_error_message(str(e))
+        record_run_results(job_id, job, targets, [], overall_error=error_msg, status_override='error')
         update_job_status(job_id, 'error')
         add_history(job_id, job['name'], 'error', error_msg, 0)
         send_notification(job_id, job['name'], 'error', error_msg, 0)
@@ -2870,6 +3149,7 @@ exit $BACKUPX_FAILED
         return outcome
 
     except subprocess.TimeoutExpired:
+        record_run_results(job_id, job, targets, [], overall_error='Database backup timed out', status_override='timeout')
         update_job_status(job_id, 'timeout')
         add_history(job_id, job['name'], 'timeout', 'Database backup timed out', 0)
         send_notification(job_id, job['name'], 'timeout', 'Database backup timed out', 0)
@@ -2877,6 +3157,7 @@ exit $BACKUPX_FAILED
         return False, "Database backup timed out"
     except Exception as e:
         error_msg = sanitize_error_message(str(e))
+        record_run_results(job_id, job, targets, [], overall_error=error_msg, status_override='error')
         update_job_status(job_id, 'error')
         add_history(job_id, job['name'], 'error', error_msg, 0)
         send_notification(job_id, job['name'], 'error', error_msg, 0)
@@ -3254,6 +3535,7 @@ def api_login():
     if username == admin_user and check_password_hash(get_admin_password_hash(), password):
         user = User(username)
         login_user(user)
+        security.clear_step_up()
         logger.info(f"Successful login for user: {username}")
         # Log successful login
         try:
@@ -3261,7 +3543,7 @@ def api_login():
             audit_login(username, username, True, ip_address, user_agent)
         except Exception as e:
             logger.debug(f"Audit logging failed: {e}")
-        return jsonify({'user': {'id': username, 'username': username}})
+        return jsonify({'user': {'id': username, 'username': username}, 'csrf_token': generate_csrf()})
 
     logger.warning(f"Failed login attempt for user: {username} from {request.remote_addr}")
     # Log failed login
@@ -3274,7 +3556,6 @@ def api_login():
 
 
 @app.route('/api/auth/logout', methods=['POST'])
-@csrf.exempt
 def api_logout():
     # Log logout before actually logging out
     if current_user.is_authenticated:
@@ -3288,6 +3569,7 @@ def api_logout():
             )
         except Exception as e:
             logger.debug(f"Audit logging failed: {e}")
+    security.clear_step_up()
     logout_user()
     return jsonify({'success': True})
 
@@ -3299,9 +3581,58 @@ def api_me():
     return jsonify({'error': 'Not authenticated'}), 401
 
 
+@app.route('/api/auth/csrf')
+@limiter.exempt
+def api_csrf_token():
+    """CSRF token for the X-CSRFToken header of mutating requests (bound to this session)."""
+    return jsonify({'csrf_token': generate_csrf()})
+
+
+def _step_up_status():
+    until = security.step_up_valid_until()
+    return {
+        'valid': until is not None,
+        'valid_until': datetime.fromtimestamp(until, timezone.utc).isoformat() if until else None,
+        'ttl': security.step_up_ttl(),
+    }
+
+
+@app.route('/api/auth/step-up', methods=['GET'])
+@login_required
+@limiter.exempt
+def api_step_up_status():
+    """Whether the admin re-entered the password recently enough for confirm/maintenance actions."""
+    return jsonify(_step_up_status())
+
+
+@app.route('/api/auth/step-up', methods=['POST'])
+@login_required
+@limiter.limit("5 per minute")
+def api_step_up():
+    """Re-enter the password; confirm/maintenance actions are allowed for STEP_UP_TTL seconds."""
+    data = request.get_json(silent=True) or {}
+    password = data.get('password') or ''
+    ok = bool(password) and check_password_hash(get_admin_password_hash(), password)
+    try:
+        from .audit.logger import get_audit_logger
+        audit = get_audit_logger()
+        if audit:
+            audit.log(action='STEP_UP' if ok else 'STEP_UP_FAILED', resource_type='session',
+                      resource_id=current_user.id, resource_name=current_user.id,
+                      user_id=current_user.id, user_name=current_user.id,
+                      ip_address=request.remote_addr, user_agent=request.headers.get('User-Agent', ''),
+                      status='success' if ok else 'failure')
+    except Exception as e:
+        logger.debug(f"Audit logging failed: {e}")
+    if not ok:
+        logger.warning(f"Failed step-up for user {current_user.id} from {request.remote_addr}")
+        return jsonify({'error': 'Incorrect password', 'code': 'step_up_failed'}), 401
+    security.grant_step_up()
+    return jsonify(_step_up_status())
+
+
 @app.route('/api/auth/change-password', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_change_password():
     """Change the admin password"""
     global _admin_password_hash, _admin_password_hash_loaded
@@ -3475,7 +3806,6 @@ def api_job_pitr(job_id):
 
 @app.route('/api/jobs/<job_id>/pitr/check', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_job_pitr_check(job_id):
     """Prerequisite table for PITR on this job (runs read-only queries over SSH)."""
     job = get_job(job_id)
@@ -3497,20 +3827,20 @@ def api_job_pitr_check(job_id):
 
 @app.route('/api/jobs/<job_id>/pitr/ship', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_job_pitr_ship(job_id):
     job = get_job(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
     if not job.get('pitr_enabled'):
         return jsonify({'error': 'Point-in-time recovery is off for this job'}), 400
-    pitr_service.kick(job_id)
-    return jsonify({'success': True, 'message': 'PITR check/ship started'})
+    return _enqueue_task_response('pitr_ship', {'job_id': job_id},
+                                  title=f"PITR check/ship: {job.get('name', job_id)}",
+                                  resource_type='job', resource_id=job_id,
+                                  idempotency_key=f'pitr_ship:{job_id}', message='PITR check/ship started')
 
 
 @app.route('/api/jobs/<job_id>/pitr/restore-script', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_job_pitr_restore_script(job_id):
     """Download a script that restores this job to a point in time in a scratch container."""
     job = get_job(job_id)
@@ -3562,7 +3892,6 @@ def api_retention_settings():
 
 @app.route('/api/jobs/<job_id>/reveal-password', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_reveal_restic_password(job_id):
     """Reveal the restic password for a job. Audited."""
     job = get_job(job_id)
@@ -3634,7 +3963,6 @@ def _resolve_job_s3_configs(data):
 
 @app.route('/api/jobs', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_create_job():
     """Create a new backup job"""
     data = request.get_json()
@@ -3748,7 +4076,6 @@ def api_create_job():
 
 @app.route('/api/jobs/<job_id>', methods=['PUT'])
 @login_required
-@csrf.exempt
 def api_update_job(job_id):
     """Update an existing backup job"""
     data = request.get_json()
@@ -3855,7 +4182,6 @@ def api_update_job(job_id):
 
 @app.route('/api/jobs/<job_id>', methods=['DELETE'])
 @login_required
-@csrf.exempt
 def api_delete_job(job_id):
     """Delete a backup job"""
     job = get_job(job_id)
@@ -3892,12 +4218,26 @@ def api_delete_job(job_id):
 
 @app.route('/api/jobs/<job_id>/run', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_run_job(job_id):
-    """Run a backup job"""
+    """Run a backup job now, as a background task.
+
+    Body (optional): {"storage_ids": [...]} to back up to only those of the
+    job's storages, e.g. to re-run the ones that failed last time.
+    """
     job = get_job(job_id)
     if not job:
         return jsonify({'success': False, 'error': 'Job not found'}), 404
+
+    data = request.get_json(silent=True) or {}
+    storage_ids = data.get('storage_ids') or None
+    if storage_ids is not None:
+        if not isinstance(storage_ids, list) or not all(isinstance(x, str) for x in storage_ids):
+            return jsonify({'success': False, 'error': 'storage_ids must be a list of storage IDs'}), 400
+        active = {t['id'] for t in get_job_storage_targets(job)}
+        unknown = [x for x in storage_ids if x not in active]
+        if unknown:
+            return jsonify({'success': False,
+                            'error': f"Not an active storage of this job: {', '.join(unknown)}"}), 400
 
     if job_is_running(_lock_connection, job_id):
         return jsonify({'success': False, 'error': 'A backup of this job is already running'}), 409
@@ -3916,16 +4256,16 @@ def api_run_job(job_id):
     except Exception as e:
         logger.debug(f"Audit logging failed: {e}")
 
-    # Run in background (non-daemon so it survives worker shutdowns if possible)
-    thread = threading.Thread(target=run_backup, args=[job_id], daemon=False)
-    thread.start()
-
-    return jsonify({'success': True, 'message': 'Backup started'})
+    params = {'job_id': job_id, 'trigger': 'rerun' if storage_ids else 'manual'}
+    if storage_ids:
+        params['storage_ids'] = storage_ids
+    title = f"Back up {job.get('name', job_id)}" + (f" ({len(storage_ids)} storage(s))" if storage_ids else '')
+    return _enqueue_task_response('backup_run', params, title=title, resource_type='job', resource_id=job_id,
+                                  idempotency_key=f'backup:{job_id}', message='Backup started')
 
 
 @app.route('/api/jobs/<job_id>/init', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_init_job_repo(job_id):
     """Initialize the restic repository on each of a job's storages"""
     job = get_job(job_id)
@@ -3935,18 +4275,23 @@ def api_init_job_repo(job_id):
     targets = get_job_storage_targets(job)
     if not targets:
         return jsonify({'success': False, 'error': 'No active S3 storage is configured for this job'}), 400
+    if job_is_running(_lock_connection, job_id):
+        return jsonify({'success': False, 'error': 'A backup of this job is running; try again when it finishes'}), 409
+    return _enqueue_task_response('init_repo', {'job_id': job_id},
+                                  title=f"Initialize repositories of {job.get('name', job_id)}",
+                                  resource_type='job', resource_id=job_id,
+                                  idempotency_key=f'init:{job_id}', message='Repository initialization started')
 
-    # Don't race a backup run, which may be initializing the same repository
-    with job_run_lock(_lock_connection, job_id) as acquired:
-        if not acquired:
-            return jsonify({'success': False, 'error': 'A backup of this job is running; try again when it finishes'}), 409
-        return _init_job_repos(job, targets)
 
+def _init_job_repos(job, targets, log=None):
+    """Run restic init on each storage; 'already initialized' counts as success.
 
-def _init_job_repos(job, targets):
-    """Run restic init on each storage; 'already initialized' counts as success"""
+    Returns {'success': bool, 'message': str, 'error': str or None}.
+    """
     messages, errors = [], []
     for target in targets:
+        if log:
+            log(f"{target['name']}: restic init")
         cmd = ['restic', 'init']
         if target.get('skip_ssl_verify'):
             cmd.append('--insecure-tls')
@@ -3969,9 +4314,12 @@ def _init_job_repos(job, targets):
 
     if len(targets) == 1:
         messages = [m.split(': ', 1)[1].capitalize() for m in messages]
+    if log:
+        for line in messages + errors:
+            log(line)
     if errors:
-        return jsonify({'success': False, 'error': '; '.join(errors), 'message': '; '.join(messages)}), 400
-    return jsonify({'success': True, 'message': '; '.join(messages)})
+        return {'success': False, 'error': '; '.join(errors), 'message': '; '.join(messages)}
+    return {'success': True, 'message': '; '.join(messages), 'error': None}
 
 
 def _job_storage_from_request(job):
@@ -4222,7 +4570,7 @@ def api_snapshot_download(job_id, snapshot_id):
 
 @app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/restore', methods=['POST'])
 @login_required
-@csrf.exempt
+@requires_step_up
 def api_snapshot_restore(job_id, snapshot_id):
     """Restore files from a snapshot to the server"""
     job = get_job(job_id)
@@ -4257,52 +4605,34 @@ def api_snapshot_restore(job_id, snapshot_id):
     target = _job_storage_from_request(job)
     if not target:
         return jsonify({'error': 'Storage not found for this job'}), 404
-    skip_ssl_verify = target.get('skip_ssl_verify', False)
+    if not server.get('host'):
+        return jsonify({'error': 'Server SSH configuration incomplete'}), 400
 
-    try:
-        # Build restic restore command
-        repo = job_repo_url(job, target)
+    params = {'job_id': job_id, 'snapshot_id': snapshot_id, 'storage_id': target['id'],
+              'source_path': source_path, 'target_path': target_path}
+    _audit('RESTORE_FILES', 'job', job_id, job.get('name'), dict(params, phase='queued'))
+    return _enqueue_task_response(
+        'restore_files', params,
+        title=f"Restore {source_path} -> {server.get('name') or server.get('host')}:{target_path}",
+        resource_type='job', resource_id=job_id,
+        idempotency_key=f'restore_files:{job_id}:{snapshot_id}:{target_path}', message='Restore started')
 
-        # Escape values for shell
-        safe_snapshot = shlex.quote(snapshot_id)
-        safe_target = shlex.quote(target_path)
-        safe_source = shlex.quote(source_path)
 
-        # Create the restic restore command - restore specific path to target
-        insecure_flag = ' --insecure-tls' if skip_ssl_verify else ''
-        restic_cmd = f"restic restore {safe_snapshot} --target {safe_target} --include {safe_source}{insecure_flag}"
-
-        # Environment variables for restic
-        full_cmd = f"""
+def _restore_files_script(job, target, snapshot_id, source_path, target_path):
+    """Shell for a file restore on the job's server (secrets as exported env, sent over stdin)."""
+    repo = job_repo_url(job, target)
+    insecure_flag = ' --insecure-tls' if target.get('skip_ssl_verify') else ''
+    return f"""
 export PATH="$HOME/.local/bin:$PATH"
 export AWS_ACCESS_KEY_ID={shlex.quote(target['access_key'] or '')}
 export AWS_SECRET_ACCESS_KEY={shlex.quote(target['secret_key'] or '')}
 export RESTIC_PASSWORD={shlex.quote(job['restic_password'])}
 export RESTIC_REPOSITORY={shlex.quote(repo)}
-mkdir -p {safe_target}
-{restic_cmd}
+echo "BACKUPX-STEP 1/2 Preparing {target_path}"
+mkdir -p {shlex.quote(target_path)} || exit 1
+echo "BACKUPX-STEP 2/2 Restoring {source_path}"
+restic restore {shlex.quote(snapshot_id)} --target {shlex.quote(target_path)} --include {shlex.quote(source_path)}{insecure_flag} 2>&1
 """
-
-        if not server.get('host'):
-            return jsonify({'error': 'Server SSH configuration incomplete'}), 400
-
-        ssh_cmd = _build_ssh_cmd_for_server(server, timeout=30)
-
-        result = _ssh_run(ssh_cmd, full_cmd, timeout=1800)
-
-        if result.returncode != 0:
-            return jsonify({'error': result.stderr or 'Restore failed'}), 400
-
-        return jsonify({
-            'success': True,
-            'message': f"Restored {source_path} to {target_path}",
-            'output': result.stdout
-        })
-
-    except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Restore timed out'}), 400
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 
 def direct_db_restore_allowed():
@@ -4313,7 +4643,6 @@ def direct_db_restore_allowed():
 
 @app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/restore-db', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_snapshot_restore_db(job_id, snapshot_id):
     """Restore a database dump from a snapshot back into a database.
 
@@ -4334,6 +4663,9 @@ def api_snapshot_restore_db(job_id, snapshot_id):
                      'or use the PITR restore script instead (set '
                      'ALLOW_DIRECT_DB_RESTORE=true to re-enable).'
         }), 403
+    if not security.has_step_up():
+        # Replaces a live database: confirm tier, password re-entered recently
+        return security.step_up_required_response()
 
     job = get_job(job_id)
     if not job:
@@ -4504,99 +4836,34 @@ echo "Database restore completed successfully"
         return jsonify({'error': sanitize_error_message(str(e))}), 500
 
 
-@app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/download-zip')
+@app.route('/api/jobs/<job_id>/snapshots/<snapshot_id>/zip', methods=['POST'])
 @login_required
-def api_snapshot_download_zip(job_id, snapshot_id):
-    """Download files/folders from a snapshot as a ZIP archive"""
+def api_snapshot_zip(job_id, snapshot_id):
+    """Start building a ZIP of a snapshot path; download it from the finished task.
+
+    Body: {"path": "/some/dir", "storage": "<storage id>"}. Returns the task;
+    when it succeeds, its result has download_url (/api/tasks/<id>/download).
+    """
     job = get_job(job_id)
     if not job:
         return jsonify({'error': 'Job not found'}), 404
-
-    file_path = request.args.get('path', '')
+    data = request.get_json(silent=True) or {}
+    file_path = data.get('path') or ''
     if not file_path:
         return jsonify({'error': 'Path is required'}), 400
-
-    # Sanitize path - prevent path traversal attacks
     normalized_path = os.path.normpath(file_path)
     if '..' in normalized_path or normalized_path.startswith('/etc') or normalized_path.startswith('/root'):
         return jsonify({'error': 'Invalid path'}), 400
-
-    target = _job_storage_from_request(job)
+    target = resolve_job_storage(job, data.get('storage') or None)
     if not target:
         return jsonify({'error': 'Storage not found for this job'}), 404
-    skip_ssl_verify = target.get('skip_ssl_verify', False)
-
-    try:
-        import tempfile
-        import zipfile
-        import shutil
-
-        env = job_restic_env(job, target)
-
-        # Create a temporary directory for restore
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Use restic restore to extract files to temp directory
-            cmd = ['restic', 'restore', snapshot_id, '--target', temp_dir, '--include', file_path]
-            if skip_ssl_verify:
-                cmd.append('--insecure-tls')
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=600  # 10 minute timeout
-            )
-
-            if result.returncode != 0:
-                error_msg = result.stderr or 'Failed to extract files'
-                return jsonify({'error': error_msg}), 400
-
-            # Create ZIP file
-            zip_path = tempfile.mktemp(suffix='.zip')
-            archive_name = os.path.basename(file_path.rstrip('/')) or 'snapshot'
-
-            # Find the extracted content
-            extracted_path = os.path.join(temp_dir, file_path.lstrip('/'))
-
-            if not os.path.exists(extracted_path):
-                # Try without leading slash
-                extracted_path = os.path.join(temp_dir, file_path.strip('/'))
-
-            if not os.path.exists(extracted_path):
-                return jsonify({'error': 'Failed to locate extracted files'}), 400
-
-            # Create ZIP archive
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                if os.path.isfile(extracted_path):
-                    zipf.write(extracted_path, os.path.basename(extracted_path))
-                else:
-                    for root, dirs, files in os.walk(extracted_path):
-                        for file in files:
-                            file_full_path = os.path.join(root, file)
-                            arcname = os.path.relpath(file_full_path, extracted_path)
-                            zipf.write(file_full_path, os.path.join(archive_name, arcname))
-
-            # Read ZIP file and return as response
-            with open(zip_path, 'rb') as f:
-                zip_data = f.read()
-
-            os.unlink(zip_path)
-
-            from flask import Response
-            return Response(
-                zip_data,
-                mimetype='application/zip',
-                headers={
-                    'Content-Disposition': f'attachment; filename="{archive_name}.zip"',
-                    'Content-Length': len(zip_data)
-                }
-            )
-
-    except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Download timed out'}), 400
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    params = {'job_id': job_id, 'snapshot_id': snapshot_id, 'storage_id': target['id'], 'path': file_path}
+    _audit('DOWNLOAD_ZIP', 'job', job_id, job.get('name'), params)
+    archive = os.path.basename(file_path.rstrip('/')) or f'snapshot-{snapshot_id[:8]}'
+    return _enqueue_task_response('snapshot_zip', params, title=f'ZIP {archive} from snapshot {snapshot_id[:8]}',
+                                  resource_type='job', resource_id=job_id,
+                                  idempotency_key=f'zip:{job_id}:{snapshot_id}:{target["id"]}:{file_path}',
+                                  message='Preparing ZIP')
 
 
 @app.route('/api/history')
@@ -4778,7 +5045,6 @@ def api_get_s3_configs():
 
 @app.route('/api/s3-configs', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_create_s3_config_route():
     """Create a new S3 configuration"""
     data = request.get_json()
@@ -4832,7 +5098,6 @@ def api_create_s3_config_route():
 
 @app.route('/api/s3-configs/<config_id>', methods=['PUT'])
 @login_required
-@csrf.exempt
 def api_update_s3_config_route(config_id):
     """Update an S3 configuration"""
     data = request.get_json()
@@ -4878,7 +5143,6 @@ def api_update_s3_config_route(config_id):
 
 @app.route('/api/s3-configs/<config_id>', methods=['DELETE'])
 @login_required
-@csrf.exempt
 def api_delete_s3_config_route(config_id):
     """Delete an S3 configuration"""
     config = get_s3_config(config_id)
@@ -4897,7 +5161,6 @@ def api_delete_s3_config_route(config_id):
 
 @app.route('/api/s3-configs/test', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_test_s3_connection():
     """Test S3 connection"""
     data = request.get_json()
@@ -5148,7 +5411,6 @@ def api_get_servers():
 
 @app.route('/api/servers', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_create_server_route():
     """Create a new server"""
     data = request.get_json()
@@ -5245,7 +5507,6 @@ def api_create_server_route():
 
 @app.route('/api/servers/<server_id>', methods=['PUT'])
 @login_required
-@csrf.exempt
 def api_update_server_route(server_id):
     """Update a server"""
     data = request.get_json()
@@ -5305,7 +5566,6 @@ def api_update_server_route(server_id):
 
 @app.route('/api/servers/<server_id>', methods=['DELETE'])
 @login_required
-@csrf.exempt
 def api_delete_server_route(server_id):
     """Delete a server"""
     server = get_server(server_id)
@@ -5319,7 +5579,6 @@ def api_delete_server_route(server_id):
 
 @app.route('/api/servers/test', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_test_server_connection():
     """Test SSH connection to server"""
     data = request.get_json()
@@ -5434,7 +5693,6 @@ def api_ping_server(server_id):
 
 @app.route('/api/servers/<server_id>/test', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_test_server_connection_by_id(server_id):
     """Test connection to a saved server by ID"""
     server = get_server(server_id)
@@ -5473,7 +5731,6 @@ def api_test_server_connection_by_id(server_id):
 
 @app.route('/api/servers/<server_id>/install-restic', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_install_restic(server_id):
     """Install restic on a remote server via SSH"""
     server = get_server(server_id)
@@ -5482,26 +5739,13 @@ def api_install_restic(server_id):
 
     host = server.get('host', '')
     ssh_user = server.get('ssh_user', '')
-    ssh_port = int(server.get('ssh_port') or 22)
 
     if not host or not ssh_user:
         return jsonify({'error': 'Server SSH configuration incomplete'}), 400
-
-    # Clear cache for this server so it re-checks
-    cache_key = f"{ssh_user}@{host}:{ssh_port}"
-    _restic_confirmed.discard(cache_key)
-
-    auth_type = server.get('ssh_auth_type', 'key_path')
-    ssh_password = server.get('ssh_password', '')
-    if ssh_password and is_encrypted(ssh_password):
-        ssh_password = decrypt_credential(ssh_password)
-    success, message = ensure_restic_installed(host, ssh_user, ssh_port,
-        _get_ssh_key_path(server),
-        ssh_auth_type=auth_type, ssh_password=ssh_password)
-    if success:
-        return jsonify({'success': True, 'message': message})
-    else:
-        return jsonify({'error': message}), 400
+    return _enqueue_task_response('install_restic', {'server_id': server_id},
+                                  title=f"Install restic on {server.get('name') or host}",
+                                  resource_type='server', resource_id=server_id,
+                                  idempotency_key=f'install_restic:{server_id}', message='Restic installation started')
 
 
 @app.route('/api/servers/<server_id>/db-containers', methods=['GET'])
@@ -5697,7 +5941,6 @@ def api_get_db_configs():
 
 @app.route('/api/databases', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_create_db_config_route():
     """Create a new database configuration"""
     data = request.get_json()
@@ -5740,7 +5983,6 @@ def api_create_db_config_route():
 
 @app.route('/api/databases/<config_id>', methods=['PUT'])
 @login_required
-@csrf.exempt
 def api_update_db_config_route(config_id):
     """Update a database configuration"""
     data = request.get_json()
@@ -5776,7 +6018,6 @@ def api_update_db_config_route(config_id):
 
 @app.route('/api/databases/<config_id>', methods=['DELETE'])
 @login_required
-@csrf.exempt
 def api_delete_db_config_route(config_id):
     """Delete a database configuration"""
     config = get_db_config(config_id)
@@ -5790,7 +6031,6 @@ def api_delete_db_config_route(config_id):
 
 @app.route('/api/databases/test', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_test_db_connection():
     """Test database connection via SSH (MySQL or PostgreSQL)"""
     data = request.get_json()
@@ -5896,7 +6136,6 @@ def api_get_notifications():
 
 @app.route('/api/notifications', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_create_notification():
     """Create a new notification channel"""
     data = request.get_json()
@@ -5932,7 +6171,6 @@ def api_create_notification():
 
 @app.route('/api/notifications/<channel_id>', methods=['PUT'])
 @login_required
-@csrf.exempt
 def api_update_notification(channel_id):
     """Update a notification channel"""
     data = request.get_json()
@@ -5963,7 +6201,6 @@ def api_update_notification(channel_id):
 
 @app.route('/api/notifications/<channel_id>', methods=['DELETE'])
 @login_required
-@csrf.exempt
 def api_delete_notification(channel_id):
     """Delete a notification channel"""
     existing = get_notification_channel(channel_id)
@@ -5976,7 +6213,6 @@ def api_delete_notification(channel_id):
 
 @app.route('/api/notifications/test', methods=['POST'])
 @login_required
-@csrf.exempt
 def api_test_notification():
     """Send a test notification"""
     data = request.get_json()
@@ -6286,7 +6522,6 @@ def api_get_timezone():
 
 @app.route('/api/settings/timezone', methods=['PUT'])
 @login_required
-@csrf.exempt
 def api_set_timezone():
     """Set timezone for scheduler"""
     data = request.get_json()
@@ -6314,6 +6549,386 @@ def api_set_timezone():
 
 
 # Serve React frontend
+# =============================================================================
+# Background tasks (app/tasks.py): API, handlers
+# =============================================================================
+
+def _actor():
+    """(user, ip) of the current request, or (None, None) outside one."""
+    try:
+        user = current_user.id if current_user.is_authenticated else None
+        return user, request.remote_addr
+    except Exception:
+        return None, None
+
+
+def _audit(action, resource_type, resource_id=None, resource_name=None, details=None,
+           status='success', error=None, user=None, ip=None):
+    """Best-effort audit entry; details are redacted by the audit logger."""
+    try:
+        from .audit.logger import get_audit_logger
+        audit_logger = get_audit_logger()
+        if not audit_logger:
+            return
+        if user is None and ip is None:
+            user, ip = _actor()
+        try:
+            user_agent = request.headers.get('User-Agent', '')
+        except Exception:
+            user_agent = None
+        audit_logger.log(action=action, resource_type=resource_type, resource_id=resource_id,
+                         resource_name=resource_name, new_value=details, user_id=user, user_name=user,
+                         ip_address=ip, user_agent=user_agent, status=status, error_message=error)
+    except Exception as e:
+        logger.debug(f"Audit logging failed: {e}")
+
+
+def _enqueue_task_response(kind, params, title=None, resource_type=None, resource_id=None,
+                           idempotency_key=None, message=None, tier=None, parent_id=None):
+    """Queue a task for the current user and return the API response (202)."""
+    user, ip = _actor()
+    try:
+        row, created = tasks.enqueue(kind, params, title=title, resource_type=resource_type,
+                                     resource_id=resource_id, idempotency_key=idempotency_key,
+                                     created_by=user, ip=ip, tier=tier, parent_id=parent_id)
+    except Exception as e:
+        logger.exception(f"Could not queue task {kind}")
+        return jsonify({'success': False, 'error': f'Could not start the task: {sanitize_error_message(str(e))}'}), 500
+    body = {'success': True, 'task': tasks.serialize(row), 'deduplicated': not created,
+            'message': message if created else 'Already running'}
+    return jsonify(body), 202
+
+
+def _task_or_404(task_id):
+    row = tasks.get_task(task_id)
+    if not row:
+        return None, (jsonify({'error': 'Task not found'}), 404)
+    return row, None
+
+
+@app.route('/api/tasks')
+@login_required
+@limiter.exempt
+def api_tasks():
+    """Tasks, newest first. ?active=1 only queued/running; ?recent=<minutes> also those finished since."""
+    active = request.args.get('active') in ('1', 'true', 'yes')
+    since = None
+    recent = request.args.get('recent')
+    if recent:
+        try:
+            since = tasks.utcnow() - timedelta(minutes=max(1, min(int(recent), 7 * 24 * 60)))
+        except ValueError:
+            return jsonify({'error': 'recent must be a number of minutes'}), 400
+    try:
+        limit = int(request.args.get('limit', 50))
+    except ValueError:
+        limit = 50
+    rows = tasks.list_tasks(active=active, limit=limit, since=since,
+                            resource_type=request.args.get('resource_type') or None,
+                            resource_id=request.args.get('resource_id') or None)
+    return jsonify({'tasks': [tasks.serialize(r) for r in rows]})
+
+
+@app.route('/api/tasks/<task_id>')
+@login_required
+@limiter.exempt
+def api_task(task_id):
+    row, error = _task_or_404(task_id)
+    if error:
+        return error
+    return jsonify(tasks.serialize(row))
+
+
+@app.route('/api/tasks/<task_id>/logs')
+@login_required
+@limiter.exempt
+def api_task_logs(task_id):
+    """Log lines after ?after=<seq> (default 0), up to ?limit= (default 1000)."""
+    row, error = _task_or_404(task_id)
+    if error:
+        return error
+    try:
+        after = int(request.args.get('after', 0))
+        limit = int(request.args.get('limit', 1000))
+    except ValueError:
+        return jsonify({'error': 'after and limit must be numbers'}), 400
+    lines = tasks.get_logs(task_id, after=after, limit=limit)
+    return jsonify({'task_id': task_id, 'status': row['status'], 'progress': row.get('progress') or 0,
+                    'step': row.get('step'), 'logs': lines,
+                    'last_seq': lines[-1]['seq'] if lines else after})
+
+
+@app.route('/api/tasks/<task_id>/cancel', methods=['POST'])
+@login_required
+def api_task_cancel(task_id):
+    row, error = tasks.request_cancel(task_id)
+    if error == 'not_found':
+        return jsonify({'error': 'Task not found'}), 404
+    if error:
+        return jsonify({'error': error, 'task': tasks.serialize(row)}), 409
+    user, ip = _actor()
+    _audit('CANCEL_TASK', 'task', task_id, row.get('title'), {'kind': row.get('kind')})
+    return jsonify({'success': True, 'task': tasks.serialize(row)})
+
+
+@app.route('/api/tasks/<task_id>/download')
+@login_required
+def api_task_download(task_id):
+    """The file a finished task produced (e.g. a snapshot ZIP)."""
+    from flask import send_file
+    row, error = _task_or_404(task_id)
+    if error:
+        return error
+    result = tasks._loads(row.get('result'), {}) or {}
+    if row['status'] != tasks.SUCCEEDED or not result.get('file'):
+        return jsonify({'error': 'This task has no file to download'}), 404
+    path = os.path.join(tasks.files_dir(), os.path.basename(result['file']))
+    if not os.path.isfile(path):
+        return jsonify({'error': 'The file has expired; run the task again'}), 410
+    return send_file(path, as_attachment=True, download_name=result.get('filename') or os.path.basename(path),
+                     mimetype=result.get('mimetype') or 'application/octet-stream')
+
+
+# --- Per-storage run results -------------------------------------------------
+
+def _serialize_runs(rows):
+    runs, order = {}, []
+    for r in rows:
+        run = runs.get(r['run_id'])
+        if run is None:
+            run = runs[r['run_id']] = {'run_id': r['run_id'], 'job_id': r['job_id'], 'trigger': r.get('trigger'),
+                                       'task_id': r.get('task_id'), 'started_at': _iso_utc(r.get('started_at')),
+                                       'finished_at': _iso_utc(r.get('finished_at')), 'storages': []}
+            order.append(r['run_id'])
+        run['storages'].append({'storage_id': r['storage_id'], 'storage_name': r.get('storage_name'),
+                                'status': r['status'], 'exit_code': r.get('exit_code'),
+                                'snapshot_id': r.get('snapshot_id'), 'error': r.get('error'),
+                                'has_log': r.get('log_id') is not None})
+    out = [runs[i] for i in order]
+    for run in out:
+        statuses = {st['status'] for st in run['storages']}
+        run['status'] = 'success' if statuses == {'success'} else (
+            'partial' if 'success' in statuses else 'failed')
+        run['failed_storage_ids'] = [st['storage_id'] for st in run['storages']
+                                     if st['status'] != 'success' and st['storage_id']]
+    return out
+
+
+@app.route('/api/jobs/<job_id>/runs')
+@login_required
+@limiter.exempt
+def api_job_runs(job_id):
+    """Recent backup runs of a job with their per-storage results (newest first)."""
+    try:
+        limit = max(1, min(int(request.args.get('limit', 20)), 200))
+    except ValueError:
+        limit = 20
+    db = get_db()
+    run_ids = [r['run_id'] for r in db.fetchall(
+        'SELECT run_id, MAX(finished_at) AS f FROM run_results WHERE job_id = %s '
+        'GROUP BY run_id ORDER BY f DESC NULLS LAST LIMIT %s', (job_id, limit))]
+    if not run_ids:
+        return jsonify({'runs': []})
+    rows = db.fetchall('SELECT * FROM run_results WHERE run_id = ANY(%s) ORDER BY finished_at DESC, id',
+                       (run_ids,))
+    runs = {r['run_id']: r for r in _serialize_runs(rows)}
+    return jsonify({'runs': [runs[i] for i in run_ids if i in runs]})
+
+
+@app.route('/api/runs/<run_id>')
+@login_required
+def api_run(run_id):
+    rows = get_db().fetchall('SELECT * FROM run_results WHERE run_id = %s ORDER BY id', (run_id,))
+    if not rows:
+        return jsonify({'error': 'Run not found'}), 404
+    return jsonify(_serialize_runs(rows)[0])
+
+
+@app.route('/api/runs/<run_id>/log')
+@login_required
+def api_run_log(run_id):
+    """Full (redacted, size-capped) output of one storage of a run: ?storage_id=<id>."""
+    storage_id = request.args.get('storage_id', '')
+    row = get_db().fetchone(
+        'SELECT l.content, l.truncated FROM run_results r JOIN run_logs l ON l.id = r.log_id '
+        'WHERE r.run_id = %s AND r.storage_id = %s ORDER BY r.id DESC LIMIT 1', (run_id, storage_id))
+    if not row:
+        return jsonify({'error': 'Log not found'}), 404
+    return jsonify({'run_id': run_id, 'storage_id': storage_id, 'content': row['content'] or '',
+                    'truncated': bool(row['truncated'])})
+
+
+# --- Handlers ------------------------------------------------------------------
+
+def _task_job(ctx):
+    job = get_job(ctx.params.get('job_id'))
+    if not job:
+        raise tasks.TaskError('Job not found')
+    return job
+
+
+@tasks.register('backup_run', title='Run backup', cancellable=False)
+def _task_backup_run(ctx):
+    # Not cancellable: killing restic mid-backup leaves a stale repository lock.
+    job_id = ctx.params['job_id']
+    ok, message = run_backup(job_id, storage_ids=ctx.params.get('storage_ids') or None,
+                             trigger=ctx.params.get('trigger') or 'manual', task=ctx)
+    ctx.log(message, stream='system')
+    if not ok:
+        raise tasks.TaskError(message)
+    return dict(ctx.result or {}, message=message)
+
+
+@tasks.register('init_repo', title='Initialize repositories', cancellable=False)
+def _task_init_repo(ctx):
+    job = _task_job(ctx)
+    job_id = ctx.params['job_id']
+    targets = get_job_storage_targets(job)
+    if not targets:
+        raise tasks.TaskError('No active S3 storage is configured for this job')
+    ctx.add_secret(*_job_secret_values(job, targets))
+    # Don't race a backup run, which may be initializing the same repository
+    with ctx.lock(job_id, what='This job (a backup is running)'):
+        with ctx.repo_locks([job_repo_url(job, t) for t in targets]):
+            outcome = _init_job_repos(job, targets, log=ctx.log)
+    if not outcome['success']:
+        raise tasks.TaskError(outcome['error'])
+    return {'message': outcome['message']}
+
+
+@tasks.register('install_restic', title='Install restic', cancellable=False)
+def _task_install_restic(ctx):
+    server = get_server(ctx.params.get('server_id'))
+    if not server:
+        raise tasks.TaskError('Server not found')
+    host, ssh_user = server.get('host', ''), server.get('ssh_user', '')
+    ssh_port = int(server.get('ssh_port') or 22)
+    if not host or not ssh_user:
+        raise tasks.TaskError('Server SSH configuration incomplete')
+    _restic_confirmed.discard(f"{ssh_user}@{host}:{ssh_port}")  # re-check, don't trust the cache
+    ssh_password = server.get('ssh_password', '')
+    if ssh_password and is_encrypted(ssh_password):
+        ssh_password = decrypt_credential(ssh_password)
+    ctx.add_secret(ssh_password)
+    ctx.step(1, 1, f'Checking/installing restic on {host}')
+    success, message = ensure_restic_installed(host, ssh_user, ssh_port, _get_ssh_key_path(server),
+                                               ssh_auth_type=server.get('ssh_auth_type', 'key_path'),
+                                               ssh_password=ssh_password)
+    ctx.log(message)
+    if not success:
+        raise tasks.TaskError(message)
+    return {'message': message}
+
+
+@tasks.register('pitr_ship', title='PITR check/ship now', cancellable=False)
+def _task_pitr_ship(ctx):
+    job = _task_job(ctx)
+    if not job.get('pitr_enabled'):
+        raise tasks.TaskError('Point-in-time recovery is off for this job')
+    ctx.step(1, 1, 'Checking the stream and shipping new logs')
+    ok, message = pitr_service.run_tick(ctx.params['job_id'])  # takes the "<job>:pitr" lock itself
+    ctx.log(message)
+    if not ok:
+        raise tasks.TaskError('A PITR check/ship is already running' if message == 'already running' else message)
+    return {'message': message}
+
+
+RESTORE_TIMEOUT = int(os.environ.get('RESTORE_TIMEOUT', 6 * 3600))
+
+
+@tasks.register('restore_files', title='Restore files', tier=tasks.TIER_CONFIRM)
+def _task_restore_files(ctx):
+    p = ctx.params
+    job = _task_job(ctx)
+    server = get_server(job.get('server_id')) if job.get('server_id') else None
+    if not server or not server.get('host'):
+        raise tasks.TaskError('The job has no server with SSH configured')
+    target = resolve_job_storage(job, p.get('storage_id'))
+    if not target:
+        raise tasks.TaskError('Storage not found for this job')
+    ctx.add_secret(*_job_secret_values(job, [target]))
+    script = _restore_files_script(job, target, p['snapshot_id'], p['source_path'], p['target_path'])
+    details = {k: p.get(k) for k in ('snapshot_id', 'storage_id', 'source_path', 'target_path')}
+    try:
+        with ctx.repo_locks([job_repo_url(job, target)]):
+            proc = _ssh_popen(_build_ssh_cmd_for_server(server, timeout=30), script)
+            rc = ctx.stream(proc, timeout=RESTORE_TIMEOUT)
+    except tasks.TaskCancelled:
+        _audit('RESTORE_FILES', 'job', p['job_id'], job.get('name'), dict(details, phase='cancelled', task=ctx.id),
+               status='failure', error='cancelled', user=ctx.created_by, ip=ctx.ip)
+        raise
+    if rc != 0:
+        _audit('RESTORE_FILES', 'job', p['job_id'], job.get('name'), dict(details, phase='finished', task=ctx.id),
+               status='failure', error=f'exit {rc}', user=ctx.created_by, ip=ctx.ip)
+        raise tasks.TaskError(f'Restore failed (exit code {rc}); see the log')
+    _audit('RESTORE_FILES', 'job', p['job_id'], job.get('name'), dict(details, phase='finished', task=ctx.id),
+           user=ctx.created_by, ip=ctx.ip)
+    return {'message': f"Restored {p['source_path']} to {server.get('name') or server['host']}:{p['target_path']}"}
+
+
+ZIP_TIMEOUT = int(os.environ.get('ZIP_TIMEOUT', 6 * 3600))
+
+
+@tasks.register('snapshot_zip', title='Prepare ZIP download')
+def _task_snapshot_zip(ctx):
+    import shutil
+    import zipfile
+    p = ctx.params
+    job = _task_job(ctx)
+    target = resolve_job_storage(job, p.get('storage_id'))
+    if not target:
+        raise tasks.TaskError('Storage not found for this job')
+    ctx.add_secret(*_job_secret_values(job, [target]))
+    file_path = p['path']
+    base = tasks.files_dir()
+    work = os.path.join(base, f'{ctx.id}.d')
+    zip_name = f'{ctx.id}.zip'
+    zip_path = os.path.join(base, zip_name)
+    archive_name = os.path.basename(file_path.rstrip('/')) or f"snapshot-{p['snapshot_id'][:8]}"
+    os.makedirs(work, mode=0o700, exist_ok=True)
+    try:
+        ctx.step(1, 3, f'Restoring {file_path} from the snapshot')
+        cmd = ['restic', 'restore', p['snapshot_id'], '--target', work, '--include', file_path]
+        if target.get('skip_ssl_verify'):
+            cmd.append('--insecure-tls')
+        with ctx.repo_locks([job_repo_url(job, target)]):
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                    env=job_restic_env(job, target))
+            rc = ctx.stream(proc, timeout=ZIP_TIMEOUT)
+        if rc != 0:
+            raise tasks.TaskError(f'restic restore failed (exit code {rc}); see the log')
+        extracted = os.path.join(work, file_path.strip('/'))
+        if not os.path.exists(extracted):
+            raise tasks.TaskError('Failed to locate the extracted files')
+        ctx.step(2, 3, 'Creating ZIP archive')
+        count = 0
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zipf:
+            if os.path.isfile(extracted):
+                zipf.write(extracted, os.path.basename(extracted))
+                count = 1
+            else:
+                for root, _dirs, files in os.walk(extracted):
+                    for name in files:
+                        ctx.check_cancelled()
+                        full = os.path.join(root, name)
+                        zipf.write(full, os.path.join(archive_name, os.path.relpath(full, extracted)))
+                        count += 1
+        size = os.path.getsize(zip_path)
+        ctx.step(3, 3, f'ZIP ready ({_format_bytes(size)}, {count} files)')
+        return {'file': zip_name, 'filename': f'{archive_name}.zip', 'mimetype': 'application/zip',
+                'size': size, 'files': count, 'download_url': f'/api/tasks/{ctx.id}/download',
+                'expires_in_hours': 24}
+    except BaseException:
+        try:
+            os.unlink(zip_path)
+        except OSError:
+            pass
+        raise
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+
 @app.route('/assets/<path:filename>')
 @limiter.exempt
 def serve_assets(filename):
@@ -6387,6 +7002,15 @@ def init_app():
             get_db().close()
         except Exception:
             pass
+
+    # Writable known_hosts (merges the mounted ~/.ssh/known_hosts in)
+    seed_known_hosts()
+
+    # Background tasks: fail the ones a dead worker left running, start this worker's runner
+    try:
+        tasks.start_runner(_lock_connection)
+    except Exception as e:
+        logger.warning(f"Task runner not started: {e}")
 
     # Compete for the scheduler lock; only the winning worker runs scheduled jobs
     init_scheduler_leader()

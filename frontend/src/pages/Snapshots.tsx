@@ -58,8 +58,12 @@ import {
   Archive,
   AlertTriangle,
 } from "lucide-react";
+import { useTasks } from "@/hooks/useTasks";
+import { useStepUp } from "@/hooks/useStepUp";
 
 export default function Snapshots() {
+  const { track } = useTasks();
+  const { withStepUp } = useStepUp();
   const { jobId } = useParams<{ jobId: string }>();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -139,7 +143,8 @@ export default function Snapshots() {
       });
       const data = await response.json();
       if (data.success) {
-        toast.success("Backup started");
+        track(data.task);
+        toast.success(data.deduplicated ? "A backup of this job is already queued" : "Backup started");
         fetchData();
       } else {
         toast.error(data.error || "Failed to start backup");
@@ -162,20 +167,25 @@ export default function Snapshots() {
 
     setIsRestoring(true);
     try {
-      const response = await fetch(`/api/jobs/${jobId}/snapshots/${restoreSnapshot.id}/restore`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source_path: "/",
-          target_path: targetPath,
-          storage: storageId || undefined,
-        }),
-      });
+      const response = await withStepUp(
+        () =>
+          fetch(`/api/jobs/${jobId}/snapshots/${restoreSnapshot.id}/restore`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              source_path: "/",
+              target_path: targetPath,
+              storage: storageId || undefined,
+            }),
+          }),
+        "Restoring writes files on the server"
+      );
 
       const data = await response.json();
 
       if (response.ok) {
-        toast.success(data.message || "Restore completed successfully");
+        track(data.task);
+        toast.success(data.message || "Restore started");
         setRestoreDialogOpen(false);
       } else {
         toast.error(data.error || "Restore failed");
@@ -191,26 +201,18 @@ export default function Snapshots() {
     setDownloadingZip(snapshot.id);
 
     try {
-      // Download the root path of the snapshot as ZIP
-      const url = `/api/jobs/${jobId}/snapshots/${snapshot.id}/download-zip?path=/&${storageQuery}`;
-      const response = await fetch(url);
-
+      // ZIP the snapshot root in the background; the download starts when it's ready
+      const response = await fetch(`/api/jobs/${jobId}/snapshots/${snapshot.id}/zip`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: "/", storage: storageId || undefined }),
+      });
+      const data = await response.json();
       if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error || "Download failed");
+        throw new Error(data.error || "Download failed");
       }
-
-      const blob = await response.blob();
-      const downloadUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = downloadUrl;
-      link.download = `snapshot-${snapshot.id.slice(0, 8)}.zip`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      window.URL.revokeObjectURL(downloadUrl);
-
-      toast.success("Snapshot downloaded as ZIP");
+      track(data.task, { autoDownload: true });
+      toast.success("Preparing ZIP - the download starts when it's ready");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Download failed");
     } finally {
