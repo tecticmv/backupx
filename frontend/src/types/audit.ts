@@ -1,22 +1,6 @@
-export type AuditAction =
-  | 'CREATE'
-  | 'READ'
-  | 'UPDATE'
-  | 'DELETE'
-  | 'LOGIN'
-  | 'LOGOUT'
-  | 'LOGIN_FAILED'
-  | 'RUN_BACKUP'
-  | 'BACKUP_COMPLETE'
-  | 'BACKUP_FAILED';
+import type { AuditAction, AuditResourceType } from '@/lib/audit';
 
-export type AuditResourceType =
-  | 'job'
-  | 'server'
-  | 's3_config'
-  | 'db_config'
-  | 'notification_channel'
-  | 'session';
+export type { AuditAction, AuditResourceType };
 
 export type AuditStatus = 'success' | 'failure';
 

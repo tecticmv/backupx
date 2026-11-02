@@ -4,7 +4,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { AUDIT_ACTION_GROUPS, AUDIT_RESOURCE_TYPES, auditActionVariant } from '@/lib/audit';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import {
   Shield,
@@ -93,20 +94,9 @@ export default function AuditLog() {
     }
   };
 
-  const getActionBadge = (action: AuditAction) => {
-    const variants: Record<string, 'default' | 'secondary' | 'destructive' | 'outline'> = {
-      CREATE: 'default',
-      UPDATE: 'secondary',
-      DELETE: 'destructive',
-      LOGIN: 'default',
-      LOGOUT: 'outline',
-      LOGIN_FAILED: 'destructive',
-      RUN_BACKUP: 'default',
-      BACKUP_COMPLETE: 'default',
-      BACKUP_FAILED: 'destructive',
-    };
-    return <Badge variant={variants[action] || 'outline'}>{action}</Badge>;
-  };
+  const getActionBadge = (action: AuditAction) => (
+    <Badge variant={auditActionVariant(action)}>{action}</Badge>
+  );
 
   const getStatusBadge = (status: AuditStatus) => {
     return (
@@ -124,6 +114,9 @@ export default function AuditLog() {
       db_config: 'Database',
       notification_channel: 'Notification',
       session: 'Session',
+      task: 'Task',
+      user: 'User',
+      system: 'System',
     };
     return icons[type] || type;
   };
@@ -236,18 +229,19 @@ export default function AuditLog() {
               className="w-64"
             />
             <Select value={actionFilter || "all"} onValueChange={(v) => setActionFilter(v === "all" ? "" : v)}>
-              <SelectTrigger className="w-40">
+              <SelectTrigger className="w-52">
                 <SelectValue placeholder="Action" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All Actions</SelectItem>
-                <SelectItem value="CREATE">Create</SelectItem>
-                <SelectItem value="UPDATE">Update</SelectItem>
-                <SelectItem value="DELETE">Delete</SelectItem>
-                <SelectItem value="LOGIN">Login</SelectItem>
-                <SelectItem value="LOGOUT">Logout</SelectItem>
-                <SelectItem value="LOGIN_FAILED">Login Failed</SelectItem>
-                <SelectItem value="RUN_BACKUP">Run Backup</SelectItem>
+                {AUDIT_ACTION_GROUPS.map((group) => (
+                  <SelectGroup key={group.label}>
+                    <SelectLabel>{group.label}</SelectLabel>
+                    {group.actions.map((a) => (
+                      <SelectItem key={a.value} value={a.value}>{a.label}</SelectItem>
+                    ))}
+                  </SelectGroup>
+                ))}
               </SelectContent>
             </Select>
             <Select value={resourceTypeFilter || "all"} onValueChange={(v) => setResourceTypeFilter(v === "all" ? "" : v)}>
@@ -256,12 +250,9 @@ export default function AuditLog() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All Resources</SelectItem>
-                <SelectItem value="job">Jobs</SelectItem>
-                <SelectItem value="server">Servers</SelectItem>
-                <SelectItem value="s3_config">S3 Storage</SelectItem>
-                <SelectItem value="db_config">Databases</SelectItem>
-                <SelectItem value="notification_channel">Notifications</SelectItem>
-                <SelectItem value="session">Sessions</SelectItem>
+                {AUDIT_RESOURCE_TYPES.map((r) => (
+                  <SelectItem key={r.value} value={r.value}>{r.label}</SelectItem>
+                ))}
               </SelectContent>
             </Select>
             <Select value={statusFilter || "all"} onValueChange={(v) => setStatusFilter(v === "all" ? "" : v)}>
