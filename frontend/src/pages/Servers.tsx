@@ -447,7 +447,7 @@ export default function Servers() {
                         ) : (
                           <Key className="h-3 w-3" />
                         )}
-                        {server.ssh_user}@:{server.ssh_port}
+                        {server.ssh_user || "root"}@{server.host}:{server.ssh_port ?? 22}
                       </div>
                     </TableCell>
                     <TableCell>
