@@ -136,7 +136,7 @@ function TaskItem({ task, expanded, onToggle }: { task: Task; expanded: boolean;
   const detail = task.error || task.result?.message || task.step;
 
   return (
-    <div className="rounded-lg border p-3">
+    <div className="min-w-0 rounded-lg border p-3">
       <button
         type="button"
         onClick={onToggle}
@@ -170,18 +170,18 @@ function TaskItem({ task, expanded, onToggle }: { task: Task; expanded: boolean;
       )}
 
       {expanded && (
-        <div className="mt-3 grid gap-3">
+        <div className="mt-3 grid min-w-0 gap-3">
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
             <span>Started {timeAgo(task.started_at || task.created_at)}</span>
             {task.finished_at && <span>Finished {timeAgo(task.finished_at)}</span>}
             {task.created_by && <span>by {task.created_by}</span>}
           </div>
           <TaskLog key={task.id} task={task} />
-          <div className="flex justify-end gap-2">
+          <div className="flex flex-wrap justify-end gap-2">
             {task.status === "succeeded" && task.result?.download_url && (
-              <Button size="sm" variant="outline" onClick={() => downloadTaskFile(task)}>
+              <Button size="sm" variant="outline" className="max-w-full" onClick={() => downloadTaskFile(task)}>
                 <Download className="mr-2 h-4 w-4" />
-                Download {task.result.filename}
+                <span className="truncate">Download {task.result.filename}</span>
               </Button>
             )}
             {active && task.cancellable && (
@@ -231,9 +231,9 @@ export function TaskTray() {
               Backups, restores and maintenance started from this app. Closing the page doesn't stop them.
             </SheetDescription>
           </SheetHeader>
-          <ScrollArea className="min-h-0 flex-1 px-4 pb-4">
-            <div className="grid gap-4">
-              <section className="grid gap-2">
+          <ScrollArea className="min-h-0 flex-1 [&_[data-slot=scroll-area-viewport]>div]:!block">
+            <div className="grid min-w-0 gap-4 px-4 pb-4">
+              <section className="grid min-w-0 gap-2">
                 <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                   Running ({active.length})
                 </h3>
@@ -251,7 +251,7 @@ export function TaskTray() {
                 )}
               </section>
               {recent.length > 0 && (
-                <section className="grid gap-2">
+                <section className="grid min-w-0 gap-2">
                   <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                     Last hour
                   </h3>
