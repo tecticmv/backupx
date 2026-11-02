@@ -453,3 +453,75 @@ def test_stale_lock_detector_uses_configured_min_age():
     issues = health.detect(base_state(probes=probes, stale_lock_min_age=180))
     [issue] = [i for i in issues if i.kind == 'stale_lock']
     assert '3 min' in issue.explanation
+
+
+# ---------------------------------------------------------------------------
+# B7: retention doesn't hold the job's run lock; short lock wait
+# ---------------------------------------------------------------------------
+
+def test_retention_runs_after_the_run_lock_is_released(monkeypatch):
+    import app.main as main
+    from contextlib import contextmanager
+    held, events = set(), []
+
+    @contextmanager
+    def fake_lock(connect, key):
+        if key in held:
+            yield False
+            return
+        held.add(key)
+        events.append(('take', key))
+        try:
+            yield True
+        finally:
+            held.discard(key)
+            events.append(('release', key))
+    monkeypatch.setattr(main, 'job_run_lock', fake_lock)
+    monkeypatch.setattr(main, '_retention_running', lambda job_id: False)
+
+    def inner(job_id):
+        run = main._current_run()
+        run.retention = ({'name': 'J'}, [{'name': 'primary'}])
+        return True, 'ok'
+    monkeypatch.setattr(main, '_run_backup_inner', inner)
+    seen = []
+    monkeypatch.setattr(main, 'apply_retention', lambda job_id, job, targets: seen.append(set(held)))
+    assert main.run_backup('rj1', trigger='manual') == (True, 'ok')
+    # forget ran without the job's run lock (Run now isn't refused), under its own retention lock
+    assert seen == [{'rj1:retention'}]
+    assert events.index(('release', 'rj1')) < events.index(('take', 'rj1:retention'))
+
+
+def test_finish_backup_queues_retention_inside_a_run(monkeypatch):
+    import app.main as main
+    for name in ('update_job_progress', 'update_job_status', 'add_history', 'send_notification',
+                 'invalidate_snapshot_cache', 'record_run_results'):
+        monkeypatch.setattr(main, name, lambda *a, **kw: None)
+    called = []
+    monkeypatch.setattr(main, 'apply_retention', lambda *a: called.append(a))
+    run = main.BackupRun('rj2')
+    main._run_context.run = run
+    try:
+        main._finish_backup('rj2', {'name': 'J'}, [{'name': 'p'}], main.utc_now(), 0, '', [],
+                            [{'exit_code': 0, 'output': []}], 'Backup')
+    finally:
+        main._run_context.run = None
+    assert called == [] and run.retention[1] == [{'name': 'p'}]
+
+
+def test_forget_after_backup_uses_short_lock_wait(monkeypatch):
+    from app import retention
+    import app.main as main
+    monkeypatch.delenv('RETENTION_FORGET_LOCK_WAIT', raising=False)
+    cfg = retention.settings()
+    assert cfg['forget_lock_wait'] == '30s' and cfg['lock_wait'] == '10m'
+    calls = []
+
+    def fake(job, target, args, timeout, lock_wait=None):
+        calls.append(lock_wait)
+        return subprocess.CompletedProcess(args, 1, '', 'unable to create lock in backend: repository is already '
+                                                         'locked exclusively by PID 1 on web1')
+    monkeypatch.setattr(main, '_restic_local', fake)
+    with pytest.raises(main.RetentionError) as e:
+        main.forget_on_target({'retention_daily': 7}, {'name': 'p'}, cfg)
+    assert calls == ['30s'] and 'locked' in str(e.value)

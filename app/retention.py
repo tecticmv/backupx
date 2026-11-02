@@ -52,8 +52,11 @@ def settings():
         # or day names); app.cron translates it for APScheduler.
         'prune_cron': (os.environ.get('RETENTION_PRUNE_CRON') or '0 4 * * sun').strip(),
         'prune_max_unused': (os.environ.get('RETENTION_PRUNE_MAX_UNUSED') or '10%').strip(),
-        # How long restic waits for another process's repository lock
+        # How long restic waits for another process's repository lock (prune)
         'lock_wait': (os.environ.get('RETENTION_LOCK_WAIT') or '10m').strip(),
+        # ... and the forget after each backup: short, so a stale lock fails it fast (the retention
+        # issue and the stale-lock fix take over) instead of blocking the job for RETENTION_LOCK_WAIT
+        'forget_lock_wait': (os.environ.get('RETENTION_FORGET_LOCK_WAIT') or '30s').strip(),
         'forget_timeout': int(os.environ.get('RETENTION_FORGET_TIMEOUT') or 900),
         'prune_timeout': int(os.environ.get('RETENTION_PRUNE_TIMEOUT') or 4 * 3600),
     }

@@ -2066,7 +2066,10 @@ RESTORE_BUSY_STATUSES = ('running', 'replacing', 'undoing')
 
 
 def job_activity():
-    """{job_id: ['drill' | 'restore', ...]}: what besides a backup is running for each job right now.
+    """{job_id: ['drill' | 'restore' | 'retention', ...]}: what besides a backup is running for each job now.
+
+    'retention' = the forget after a backup is running (it no longer holds the run lock, so Run now
+    is accepted and waits for it).
 
     'drill' = a restore drill of the job is running (a per-job drill task, or the weekly drill task while it
     has a copy of this job). 'restore' = a scratch restore / replace / undo started by a person is running
@@ -2095,7 +2098,23 @@ def job_activity():
                 add(row['job_id'], 'drill')
         elif row['status'] in RESTORE_BUSY_STATUSES:
             add(row['job_id'], 'restore')
+    for jid in retention_running_jobs():
+        add(jid, 'retention')
     return out
+
+
+def retention_running_jobs(job_ids=None):
+    """Jobs whose post-backup retention (forget) holds its lock right now (read-only, pg_locks)."""
+    from .scheduler.locks import JOB_LOCK_NAMESPACE
+    m = _m()
+    ids = list(job_ids) if job_ids is not None else list((m.load_jobs() or {}).keys())
+    if not ids:
+        return []
+    rows = _db().fetchall(
+        "SELECT j.id FROM unnest(%s::text[]) AS j(id) JOIN pg_locks l ON l.locktype = 'advisory' "
+        "AND l.classid = %s::bigint::oid AND l.objid = (hashtext(j.id || ':retention')::bigint & 4294967295)::oid "
+        "AND l.objsubid = 2 AND l.granted", (ids, JOB_LOCK_NAMESPACE))
+    return [r['id'] for r in rows]
 
 
 def _drill_card(probe):

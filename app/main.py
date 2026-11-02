@@ -583,6 +583,8 @@ def validate_bucket_name(name: str) -> bool:
 # How many scheduled backups run at once in the scheduler worker; the rest wait
 # for a free slot (many jobs share the same cron time, e.g. 02:00).
 BACKUP_MAX_CONCURRENT = max(1, int(os.environ.get('BACKUP_MAX_CONCURRENT', 4)))
+# Seconds a new run waits for the previous run's retention (forget) before starting anyway
+RETENTION_WAIT_BEFORE_BACKUP = max(0, int(os.environ.get('RETENTION_WAIT_BEFORE_BACKUP', 300)))
 # How late a queued run may still start. APScheduler drops a run as "missed" if it
 # starts later than this after its fire time, which includes time spent waiting
 # for a free slot, so it must cover the queue at the busiest cron time.
@@ -1906,6 +1908,8 @@ class BackupRun:
         self.task = task
         self.started_at = tasks.utcnow()
         self.recorded = False
+        # (job, targets) to forget on once the run lock is released (see run_backup)
+        self.retention = None
 
 
 _run_context = threading.local()
@@ -2074,7 +2078,13 @@ def run_backup(job_id, storage_ids=None, trigger='scheduled', task=None, run_id=
                     message = "Skipped: a backup of this job is already running"
                     logger.warning(f"Backup skipped, already running: {job_id}")
                     return False, message
-                return _run_backup_inner(job_id)
+                _wait_for_retention(job_id)
+                outcome = _run_backup_inner(job_id)
+            # Retention after the run lock is released: a forget waiting on someone else's
+            # repository lock must not make "Run now" answer 409 while the job looks idle
+            if run.retention:
+                _retention_after_backup(job_id, *run.retention)
+            return outcome
         except Exception as e:
             logger.exception(f"Backup run for job {job_id} failed with an unexpected error")
             message = sanitize_error_message(f"Backup failed: {type(e).__name__}: {e}")
@@ -2086,6 +2096,55 @@ def run_backup(job_id, storage_ids=None, trigger='scheduled', task=None, run_id=
                 get_db().close()
             except Exception:
                 pass
+
+
+def retention_lock_key(job_id):
+    return f'{job_id}:retention'
+
+
+def _retention_running(job_id):
+    """Read-only (pg_locks): is this job's post-backup retention running?"""
+    try:
+        from . import health_service
+        from .scheduler.locks import JOB_LOCK_NAMESPACE
+        return health_service.advisory_lock_held(JOB_LOCK_NAMESPACE, retention_lock_key(job_id))
+    except Exception:
+        return False
+
+
+def _wait_for_retention(job_id, max_wait=None):
+    """A new run waits (briefly) for the previous run's forget, which holds restic's exclusive lock."""
+    import time as _time
+    max_wait = RETENTION_WAIT_BEFORE_BACKUP if max_wait is None else max_wait
+    deadline = _time.monotonic() + max_wait
+    noted = False
+    while _retention_running(job_id) and _time.monotonic() < deadline:
+        if not noted:
+            logger.info(f"Backup of {job_id} waits for the previous run's retention (forget) to finish")
+            update_job_progress(job_id, 0, 'Waiting for retention (forget) of the previous run...')
+            noted = True
+        _time.sleep(2)
+
+
+def _retention_after_backup(job_id, job, targets):
+    """apply_retention under the job's retention lock (not its run lock). Never raises."""
+    try:
+        with job_run_lock(_lock_connection, retention_lock_key(job_id)) as acquired:
+            if not acquired:
+                logger.info(f"Retention for {job_id} skipped: another retention of this job is running")
+                return
+            apply_retention(job_id, job, targets)
+    except Exception as e:
+        logger.error(f"Retention after the backup of {job_id} failed: {e}")
+
+
+def _queue_retention(job_id, job, targets):
+    """Forget after this run: once its run lock is released (run_backup), or now without a run context."""
+    run = _current_run()
+    if run is not None and run.job_id == job_id:
+        run.retention = (job, list(targets))
+    else:
+        apply_retention(job_id, job, targets)
 
 
 def _report_backup_failure(job_id, message, job_name=None):
@@ -2886,7 +2945,7 @@ def _finish_backup(job_id, job, targets, start_time, returncode, stderr_text, pr
         add_history(job_id, job['name'], 'success', message, duration)
         send_notification(job_id, job['name'], 'success', message, duration)
         logger.info(f"{label} completed successfully: {job_id} (duration: {duration:.1f}s)")
-        apply_retention(job_id, job, targets)
+        _queue_retention(job_id, job, targets)
         return True, message
 
     if not any(r['exit_code'] is not None for r in results):
@@ -2910,7 +2969,7 @@ def _finish_backup(job_id, job, targets, start_time, returncode, stderr_text, pr
     logger.error(f"{label} failed: {job_id} - {error_msg[:200]}")
     if succeeded:
         # Forget only where this run stored a new snapshot
-        apply_retention(job_id, job, [t for t, r in zip(targets, results) if r['exit_code'] == 0])
+        _queue_retention(job_id, job, [t for t, r in zip(targets, results) if r['exit_code'] == 0])
     return False, error_msg
 
 
@@ -3478,7 +3537,10 @@ def forget_on_target(job, target, cfg):
     plan_args = retention.forget_plan_args(job)
     if plan_args is None:
         raise RetentionError('job has no retention policy')  # callers check first; never forget everything
-    proc = _restic_local(job, target, plan_args, cfg['forget_timeout'], cfg['lock_wait'])
+    # Short lock wait: a stale lock fails this forget quickly (retention issue + stale-lock fix)
+    # instead of waiting RETENTION_LOCK_WAIT behind it
+    lock_wait = cfg.get('forget_lock_wait') or cfg['lock_wait']
+    proc = _restic_local(job, target, plan_args, cfg['forget_timeout'], lock_wait)
     if proc.returncode != 0:
         raise RetentionError(_restic_error(proc, 'forget'))
     try:
@@ -3497,7 +3559,7 @@ def forget_on_target(job, target, cfg):
     if cfg['dry_run']:
         return len(remove), f'dry run: would remove {len(remove)} snapshot(s), keep {keep_count} ({policy}): {ids}'
     proc = _restic_local(job, target, retention.forget_ids_args([s['id'] for s in remove]),
-                         cfg['forget_timeout'], cfg['lock_wait'])
+                         cfg['forget_timeout'], lock_wait)
     if proc.returncode != 0:
         raise RetentionError(_restic_error(proc, 'forget'))
     return len(remove), f'removed {len(remove)} snapshot(s), kept {keep_count} ({policy}): {ids}'
@@ -3506,8 +3568,8 @@ def forget_on_target(job, target, cfg):
 def apply_retention(job_id, job, targets):
     """Forget old snapshots on each storage after a backup. Never raises.
 
-    Called while the job's run lock is held. Does nothing unless retention is
-    enabled and the job has at least one keep rule.
+    Called after the run, under the job's retention lock (<job>:retention), not its run lock
+    (run_backup). Does nothing unless retention is enabled and the job has at least one keep rule.
     """
     try:
         cfg = retention.settings()

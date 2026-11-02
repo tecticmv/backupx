@@ -94,6 +94,7 @@ const ACTIVITY_TEXT: Record<JobActivity, string> = {
   backup: "Backup running",
   drill: "Restore drill running",
   restore: "Restore running",
+  retention: "Retention (forget) running",
 };
 
 /** "Backup running, restore drill running" (null when nothing runs). */

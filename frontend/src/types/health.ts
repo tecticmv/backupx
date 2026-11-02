@@ -223,7 +223,7 @@ export interface RunLog {
   truncated: boolean;
 }
 
-export type JobActivity = "backup" | "drill" | "restore";
+export type JobActivity = "backup" | "drill" | "restore" | "retention";
 
 /** Whether anything runs for the job right now (what the dashboard's "Running" filter counts). */
 export function jobBusy(job: Pick<JobCardData, "running" | "activity">): boolean {
