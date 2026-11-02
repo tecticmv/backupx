@@ -252,10 +252,15 @@ def restore_points(job_id, storage_id=None):
     targets = m.get_job_storage_targets(job, include_inactive=True)
     target = _storage(job, storage_id)
     snapshots, error = [], None
-    try:
-        snapshots = m.get_snapshots(job, target)
-    except Exception as e:
-        error = m.sanitize_error_message(str(e))
+    problem = storage_precheck(target)
+    if problem:
+        # don't let restic retry a storage that is down for minutes while the wizard waits
+        error = f"Storage {target.get('name')} is not reachable: {problem.rstrip('.')}"
+    else:
+        try:
+            snapshots = m.get_snapshots(job, target)
+        except Exception as e:
+            error = m.sanitize_error_message(str(e))
     windows = _windows(job, engine, state)
     usable = r.restorable_windows(windows)
     ser = [{'from': r.iso(w.get('from')), 'to': r.iso(w.get('to')), 'anchored': bool(w.get('anchored')),
@@ -350,8 +355,8 @@ def derive_plan(data, cfg=None):
     # Seconds, not the ~15 min restic/wal-g spend retrying a storage that is down
     problem = storage_precheck(target)
     if problem:
-        raise RestoreError(f"Storage {target.get('name')} is not reachable: {problem}. Pick another storage or "
-                           'retry when it is back.', 'storage_unreachable')
+        raise RestoreError(f"Storage {target.get('name')} is not reachable: {problem.rstrip('.')}. Pick another "
+                           'storage or retry when it is back.', 'storage_unreachable')
     windows = _windows(job, engine, state)
     snapshots = []
     try:
@@ -917,8 +922,8 @@ def do_scratch(ctx, row, verify_production=True):
     try:
         problem = storage_precheck(target)
         if problem:
-            raise tasks.TaskError(f"Storage {target.get('name')} is not reachable, nothing was restored: {problem}. "
-                                  'Pick another storage or retry when it is back.')
+            raise tasks.TaskError(f"Storage {target.get('name')} is not reachable, nothing was restored: "
+                                  f"{problem.rstrip('.')}. Pick another storage or retry when it is back.")
         with ctx.repo_locks([_m().job_repo_url(job, target)]):
             if method == 'dump':
                 info = _scratch_dump(ctx, row, plan, job, db_config, target, work, engine)
