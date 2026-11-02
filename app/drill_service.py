@@ -131,7 +131,10 @@ def _reference(svc, job_id):
         wal = latest.get('wal') or {}
         if not wal.get('base_backup') or not wal.get('base_time'):
             raise tasks.TaskError("couldn't list the WAL-G base backups")
-        return latest, {'method': 'walg', 'base_backup': wal['base_backup'], 'time': wal['base_time']}
+        # Restore targets are whole seconds; the base backup finished at a fraction of one
+        # (12:04:42.16): its own point is the next whole second, else no base backup "finished before" it
+        return latest, {'method': 'walg', 'base_backup': wal['base_backup'],
+                        'time': r.iso(d.ceil_second(wal['base_time']))}
     raise tasks.TaskError('point-in-time recovery has no restorable window on this storage (the latest point is '
                           'a plain snapshot)')
 
@@ -146,6 +149,22 @@ def _restore(ctx, svc, job, plan, label):
         'info': {'drill': label, 'compare_production': False}, 'status': r.S_RUNNING,
         'created_by': ctx.created_by or 'restore-drill', 'task_id': ctx.id})
     return svc.do_scratch(ctx, row, verify_production=False)
+
+
+def _server_changed_at(job_id):
+    """When the PITR ticks last saw production's binlog position move (backupx's own row)."""
+    from . import pitr_service
+    try:
+        return svc_json(pitr_service.load_state(job_id).get('info')).get('server_changed_at')
+    except Exception:
+        return None
+
+
+def svc_json(text):
+    try:
+        return json.loads(text) if text else {}
+    except (TypeError, ValueError):
+        return {}
 
 
 def _drop(svc, ctx, row):
@@ -227,13 +246,23 @@ def run_drill(ctx, job_id):
         plan_c = _plan(svc, {'job_id': job_id, 'point_type': 'time', 'target_time': latest['target_time'],
                              'storage_id': storage_id})
         current = _restore(ctx, svc, job, plan_c, 'C')
+        c_info = svc._json(current.get('info'), {})
         c_tables = _list_tables(current, engine, databases)[:cfg['max_tables']]
         ctx.progress(90, f'Drill C: reading {len(c_tables)} tables')
         counts = _checksums(current, engine, c_tables, {f'{t[0]}.{t[1]}' for t in c_tables})
         _drop(svc, ctx, current)
         current = None
         latest_check = dict(d.readable(counts), target_time=latest.get('target_time'))
-        result.update(ok=comparison['ok'] and latest_check['ok'], comparison=comparison, latest=latest_check)
+        # ... and reaches as far as the window claims (backupx's records of production, no query)
+        reach = d.latest_reaches(plan_c.get('method'), plan_c.get('target_time'),
+                                 (plan_c.get('dump') or {}).get('time'), c_info.get('last_event_at'),
+                                 _server_changed_at(job_id), int(job.get('pitr_interval') or 5) + 2)
+        latest_check.update(reaches=reach['ok'], reaches_detail=reach['detail'],
+                            last_event_at=c_info.get('last_event_at'))
+        ctx.log(f"Drill C: newest replayed event {c_info.get('last_event_at') or 'unknown'}; "
+                f"{reach['detail'] or 'reach not checked'}", stream='system')
+        result.update(ok=comparison['ok'] and latest_check['ok'] and reach['ok'] is not False,
+                      comparison=comparison, latest=latest_check)
     except tasks.TaskCancelled:
         result['error'] = 'cancelled'
         raise
@@ -354,7 +383,8 @@ def serialize(result):
     out['mismatches'] = [{'table': m.get('table'), 'production': m.get('backup', m.get('production')),
                           'restored': m.get('pitr', m.get('restored'))} for m in (c.get('mismatches') or [])]
     latest = result.get('latest') or {}
-    out['latest'] = {k: latest.get(k) for k in ('ok', 'tables', 'errors', 'target_time')} if latest else None
+    out['latest'] = {k: latest.get(k) for k in ('ok', 'tables', 'errors', 'target_time', 'reaches',
+                                                 'reaches_detail', 'last_event_at')} if latest else None
     return out
 
 

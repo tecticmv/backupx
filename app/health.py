@@ -391,6 +391,23 @@ def heartbeat_stalled(heartbeat, read_at, now, max_age, interval_minutes=None) -
     return (now - hb).total_seconds() > max_age + interval + 120
 
 
+PITR_FAILING_TICKS = 3
+MIRROR_WARN_AFTER = timedelta(hours=1)
+MIRROR_CRITICAL_AFTER = timedelta(hours=6)
+
+
+def mirror_staleness(info, now):
+    """[(storage, last success, age)] for each storage the last WAL copy failed on."""
+    out = []
+    ok_at = (info or {}).get('mirror_ok_at') or {}
+    for m in (info or {}).get('mirror') or []:
+        if m.get('ok'):
+            continue
+        last = utc(ok_at.get(m.get('storage'))) if ok_at.get(m.get('storage')) else None
+        out.append((m.get('storage'), last, (now - last) if last else None))
+    return out
+
+
 def detect_pitr(state) -> List[Issue]:
     out = []
     now = state['now']
@@ -405,15 +422,48 @@ def detect_pitr(state) -> List[Issue]:
         info = ps.get('info') or {}
         evidence = {'state': st, 'window_end': _iso(ps.get('window_end')), 'lag_minutes': ps.get('lag_minutes'),
                     'last_error': _short(ps.get('last_error')) if ps.get('last_error') else None}
-        if kind == 'mysql':
+        failing = int(ps.get('consecutive_failures') or 0) >= PITR_FAILING_TICKS
+        failure_kind = info.get('failure_kind') or 'check'
+        if failing and failure_kind == 'ssh':
+            # The tick couldn't log in (host key changed, network, credentials): an SSH problem,
+            # not "archiving off" / "streamer stopped" (the stored facts are from the last good tick)
+            server = (state.get('servers') or {}).get(job.get('server_id')) or {}
+            server_name = server.get('name') or server.get('host') or 'the server'
+            out.append(Issue(
+                'pitr_streamer', 'pitr_ssh_failing',
+                SEV_CRITICAL if st in ('lagging', 'broken') else SEV_WARNING,
+                f"{job.get('name')}: point-in-time checks can't reach {server_name} over SSH",
+                "backupx can't log in to the database server, so it can't check or ship point-in-time "
+                "recovery data. Nothing on the server was changed; the last known state is kept. If the "
+                "server's host key changed, review and trust the new key (SSH issue of the server), then "
+                "Re-check.",
+                res, key=(job_id,), evidence=dict(evidence, consecutive_failures=ps.get('consecutive_failures')),
+                manual={'steps': ["Open the server's SSH issue (host key changed / unreachable) and fix it.",
+                                  "Then press Re-check; the next PITR check runs on its own."],
+                        'commands': []},
+                alert=False))
+        elif kind == 'mysql':
             hb_age = age_seconds(ps.get('heartbeat'), now)
             active = ps.get('streamer_active')
             down = ps.get('last_tick_at') and (
                 (active and active != 'active') or
                 heartbeat_stalled(ps.get('heartbeat'), ps.get('last_tick_at'), now, max_age,
                                   job.get('pitr_interval')))
-            failing = int(ps.get('consecutive_failures') or 0) >= 3
-            if down or failing:
+            ship = info.get('ship_failed') or {}
+            if failing and not down and failure_kind == 'ship':
+                names = ', '.join(ship.get('storages') or []) or 'a storage'
+                out.append(Issue(
+                    'pitr_ship', 'pitr_ship_failing',
+                    SEV_CRITICAL if st in ('lagging', 'broken') else SEV_WARNING,
+                    f"{job.get('name')}: shipping binlogs to {names} failing",
+                    "The binlog streamer is running and capturing changes, but shipping them to "
+                    f"{names} fails, so they wait in the spool on the database server (nothing is lost while "
+                    "the spool has room). The fix retries the shipment now.",
+                    res, key=(job_id,),
+                    evidence=dict(evidence, storages=names, since=ship.get('at'),
+                                  consecutive_failures=ps.get('consecutive_failures')),
+                    fix='pitr_ship_retry', alert=False))
+            elif down or failing:
                 evidence.update(streamer=active, heartbeat_age=human_age(hb_age),
                                 consecutive_failures=ps.get('consecutive_failures'))
                 out.append(Issue(
@@ -422,10 +472,21 @@ def detect_pitr(state) -> List[Issue]:
                     f"{job.get('name')}: binlog streamer {'stopped' if down else 'checks failing'}",
                     "The binlog streamer on the database server isn't running or has stalled, so new changes "
                     "aren't being captured for point-in-time recovery. The fix re-installs the streamer unit "
-                    "and restarts it, then ships what's queued.",
+                    "and restarts it, then ships what's queued." if down else
+                    "The point-in-time checks of this job keep failing (see the last error). The fix "
+                    "re-installs and restarts the streamer, then ships what's queued.",
                     res, key=(job_id,), evidence=evidence, fix='pitr_kick', alert=False))
         else:
-            if ps.get('streamer_active') == 'failing':
+            if failing:
+                out.append(Issue(
+                    'pitr_streamer', 'pitr_checks_failing',
+                    SEV_CRITICAL if st in ('lagging', 'broken') else SEV_WARNING,
+                    f"{job.get('name')}: WAL archiving checks failing",
+                    "backupx couldn't check WAL archiving on the database server (see the last error). The "
+                    "last known state is kept; nothing was changed on the server.",
+                    res, key=(job_id,), evidence=dict(evidence, consecutive_failures=ps.get('consecutive_failures')),
+                    fix='pitr_kick', alert=False))
+            elif ps.get('streamer_active') == 'failing':
                 out.append(Issue(
                     'pitr_streamer', 'wal_archive_failing',
                     SEV_CRITICAL if st in ('lagging', 'broken') else SEV_WARNING,
@@ -450,17 +511,28 @@ def detect_pitr(state) -> List[Issue]:
                                       "(archive_mode needs a restart) and press Re-check."],
                             'commands': list(state.get('pg_conf_changes') or [])},
                     wizard=_wizard(job_id)))
-            mirror = [m for m in (info.get('mirror') or []) if not m.get('ok')]
-            if mirror:
+            stale = mirror_staleness(info, now)
+            if stale:
+                oldest = max((age for _n, _t, age in stale if age is not None), default=None)
+                if oldest is not None and oldest >= MIRROR_CRITICAL_AFTER:
+                    severity, alert = SEV_CRITICAL, True
+                elif oldest is None or oldest >= MIRROR_WARN_AFTER:
+                    severity, alert = SEV_WARNING, False
+                else:
+                    severity, alert = SEV_INFO, False
+                last_ok = ', '.join(f"{n}: last copy {human_age(age.total_seconds()) + ' ago' if age else 'never'}"
+                                    for n, _t, age in stale)
                 out.append(Issue(
-                    'wal_mirror', 'wal_mirror_failed', SEV_WARNING,
+                    'wal_mirror', 'wal_mirror_failed', severity,
                     f"{job.get('name')}: WAL copy to other storages failed",
-                    "WAL reaches the primary storage, but copying it to the other storages failed. The fix "
-                    "retries the copy now.",
+                    "WAL reaches the primary storage, but copying it to the other storages failed, so those "
+                    "storages can't restore recent times. It escalates to critical when no copy has worked for "
+                    f"{int(MIRROR_CRITICAL_AFTER.total_seconds() // 3600)} h. The fix retries the copy now.",
                     res, key=(job_id,),
-                    evidence=dict(evidence, failed=', '.join(f"{m.get('storage')}: {m.get('error') or 'failed'}"
-                                                             for m in mirror)[:300]),
-                    fix='wal_mirror_retry'))
+                    evidence=dict(evidence, last_success=last_ok[:300],
+                                  failed=', '.join(f"{m.get('storage')}: {m.get('error') or 'failed'}"
+                                                   for m in info.get('mirror') or [] if not m.get('ok'))[:300]),
+                    fix='wal_mirror_retry', alert=alert))
         if st in ('broken', 'unanchored'):
             prereq = (state.get('probes') or {}).get(f'prereq:{job_id}') or {}
             prereq_ok = (prereq.get('data') or {}).get('ok')
@@ -660,6 +732,8 @@ def detect_servers(state) -> List[Issue]:
 def detect_repos(state) -> List[Issue]:
     out = []
     now = state['now']
+    min_age = int(state.get('stale_lock_min_age') or STALE_LOCK_MIN_AGE)
+    min_age_text = human_age(min_age)
     for job_id, job in state['jobs'].items():
         for st in state['job_storages'].get(job_id) or []:
             sid = st.get('id') or ''
@@ -702,7 +776,7 @@ def detect_repos(state) -> List[Issue]:
                 for lock in data.get('locks') or []:
                     decision = lock.get('decision') or 'wait'
                     age = age_seconds(lock.get('time'), now)
-                    if age is None or age < STALE_LOCK_MIN_AGE or decision == 'wait':
+                    if age is None or age < min_age or decision == 'wait':
                         continue
                     ev = {'storage': st.get('name'), 'lock_id': (lock.get('id') or '')[:12],
                           'host': lock.get('hostname'), 'pid': lock.get('pid'), 'user': lock.get('username'),
@@ -713,14 +787,14 @@ def detect_repos(state) -> List[Issue]:
                             'stale_lock', 'stale_lock', SEV_WARNING,
                             f"{job.get('name')}: stale restic lock on {st.get('name')}",
                             "A restic process that died (crash, reboot, killed run) left its lock behind. "
-                            "Locks block backups and retention. It's safe to remove: it's older than 30 minutes, "
+                            "Locks block backups and retention. It's safe to remove: it's older than " + min_age_text + ", "
                             "comes from a host backupx manages and nothing of backupx is using the repository.",
                             res, key=(job_id, sid, lock.get('id')), evidence=ev, fix='unlock_stale'))
                     else:
                         out.append(Issue(
                             'stale_lock', 'stale_lock_foreign', SEV_WARNING,
                             f"{job.get('name')}: old restic lock from {lock.get('hostname') or 'another host'}",
-                            "This lock hasn't been refreshed for over 30 minutes, but it comes from a host "
+                            "This lock hasn't been refreshed for over " + min_age_text + ", but it comes from a host "
                             "backupx doesn't manage. Make sure no restic is running there before removing it.",
                             res, key=(job_id, sid, lock.get('id')), evidence=ev, fix='unlock_lock'))
                 for key in data.get('keys') or []:

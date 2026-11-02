@@ -249,6 +249,7 @@ def collect_state(now=None):
         'retention': retention_runs,
         'pitr': pitr_rows,
         'pitr_heartbeat_max_age': pitr.settings()['heartbeat_max_age'],
+        'stale_lock_min_age': settings()['stale_lock_age'],
         'pg_conf_changes': pitr.postgres_conf_changes(),
         'scheduler': {'heartbeat_at': _get_setting(HEARTBEAT_KEY), 'max_age': max(120, 4 * interval + 30)},
         'channels': channels,
@@ -1307,7 +1308,7 @@ def _exec_install_restic(ctx, plan, issue):
     return result
 
 
-def _pitr_tick_forced(ctx, job_id, reset_walg=False):
+def _pitr_tick_forced(ctx, job_id, reset_walg=False, force=True):
     from . import pitr_service
     with ctx.lock(pitr_service.lock_key(job_id), wait=300, what='PITR shipping of this job'):
         if reset_walg:
@@ -1316,9 +1317,10 @@ def _pitr_tick_forced(ctx, job_id, reset_walg=False):
             info.pop('walg_env_hash', None)
             pitr_service.save_state(job_id, info=json.dumps(info))
         try:
-            ok, message = pitr_service._tick(job_id, force=True)
+            ok, message = pitr_service._tick(job_id, force=force)
         except Exception as e:
-            pitr_service._record_failure(job_id, f'{type(e).__name__}: {e}')
+            pitr_service._record_failure(job_id, str(e) if isinstance(e, pitr_service.PitrError)
+                                         else f'{type(e).__name__}: {e}', storages=getattr(e, 'storages', None))
             raise tasks.TaskError(_m().sanitize_error_message(str(e)))
     ctx.log(message)
     if not ok:
@@ -1363,6 +1365,25 @@ def _exec_pitr_kick(ctx, plan, issue):
     else:
         raise tasks.TaskError('The streamer was restarted but has not reported a fresh heartbeat yet; '
                               'check its journal (journalctl -u backupx-pitr-binlog@<job>)')
+    return {'message': message}
+
+
+@fix('pitr_ship_retry', health.TIER_SAFE, 'Retry shipping',
+     'Ships the binlogs waiting in the spool to every storage again now.', order=82)
+def _plan_pitr_ship_retry(issue):
+    job = _job_of(issue)
+    if not job.get('pitr_enabled'):
+        raise NotApplicable('PITR is off for this job')
+    names = (issue.evidence or {}).get('storages') or 'the failing storage'
+    return _plan('pitr_ship_retry', f"Ship the queued binlogs of {job.get('name')} again",
+                 [f'Ship the closed binlogs and the open-file copy to every storage (failed: {names})',
+                  'Delete them from the spool only after every storage has them'],
+                 downtime='None (the database and the streamer are not touched)', details={'job': job.get('name')})
+
+
+@executes('pitr_ship_retry')
+def _exec_pitr_ship_retry(ctx, plan, issue):
+    message = _pitr_tick_forced(ctx, issue.resource['job_id'], force=False)
     return {'message': message}
 
 
@@ -1849,7 +1870,7 @@ def _make_handler(action):
 
 
 NON_CANCELLABLE = {'run_now', 'rerun_failed', 'storage_retry', 'init_repo', 'install_restic', 'anchored_dump',
-                   'unlock_stale', 'unlock_lock', 'remove_key', 'trust_host_key', 'pitr_kick', 'walg_repush',
+                   'unlock_stale', 'unlock_lock', 'remove_key', 'trust_host_key', 'pitr_kick', 'pitr_ship_retry', 'walg_repush',
                    'pitr_client_image', 'retry_forget', 'repair_index'}
 
 for _action, _f in FIXES.items():

@@ -16,6 +16,7 @@ connects to production:
 
 import os
 import re
+from datetime import timedelta
 
 from . import restore as r
 
@@ -178,6 +179,47 @@ def compare_copies(a, b):
             'extra': extra[:50]}
 
 
+def ceil_second(value):
+    """The first whole second at or after `value` (restore targets have second precision)."""
+    t = r.utc(value)
+    if t is None:
+        return None
+    return t if t.microsecond == 0 else t.replace(microsecond=0) + timedelta(seconds=1)
+
+
+def latest_reaches(method, target_time, dump_time, last_event_at, server_changed_at, tolerance_minutes):
+    """C, MySQL/MariaDB: does the restored copy really reach as far as the window claims?
+
+    The window's end can be "now" because the streamer reported it was in sync; the drill checks
+    that against what was actually replayed: the newest replayed binlog event must be no older
+    than the last time production's binlog position was seen to move (server_changed_at, from
+    the PITR ticks - backupx's own records, not a production query), capped at the target time.
+    A frozen or renumbered chain (data stops at 15:04 while the server kept writing until the
+    claimed 15:23) fails here instead of passing as "verified".
+
+    Returns {'ok': True/False/None (not checkable), 'detail'}.
+    """
+    if method != 'binlog':
+        return {'ok': None, 'detail': ''}
+    target = r.utc(target_time) if target_time else None
+    changed = r.utc(server_changed_at) if server_changed_at else None
+    if target is None or changed is None:
+        return {'ok': None, 'detail': 'no record of when production last wrote; not checked'}
+    expected = min(target, changed)
+    if dump_time and expected <= r.utc(dump_time):
+        return {'ok': True, 'detail': 'no changes after the full backup'}
+    last = r.utc(last_event_at) if last_event_at else None
+    if last is None:
+        return {'ok': None, 'detail': "the newest replayed event couldn't be read; not checked"}
+    slack = timedelta(minutes=max(1, int(tolerance_minutes or 0)))
+    if last + slack >= expected:
+        return {'ok': True, 'detail': f'replayed up to {r.fmt_time(last)}'}
+    return {'ok': False,
+            'detail': (f'the restored data ends at {r.fmt_time(last)}, but production kept writing until at '
+                       f'least {r.fmt_time(expected)} (window end {r.fmt_time(target)}): the shipped binlogs '
+                       'miss changes')}
+
+
 def readable(counts):
     """C: every table of the latest-point copy must answer a COUNT(*). {ok, tables, errors}."""
     errors = sorted(t for t, v in counts.items() if v is None)
@@ -202,7 +244,9 @@ def summary(result):
         text += f"; unreadable: {', '.join(c['errors'][:5])}"
     latest = result.get('latest') or {}
     if latest:
-        if latest.get('ok'):
+        if latest.get('reaches') is False:
+            text += f"; latest point {latest.get('target_time')} INCOMPLETE: {latest.get('reaches_detail')}"
+        elif latest.get('ok'):
             text += f"; latest point {latest.get('target_time')} restored cleanly ({latest.get('tables')} tables readable)"
         else:
             text += (f"; latest point {latest.get('target_time')} NOT readable: "

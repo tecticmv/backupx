@@ -29,6 +29,14 @@ class PitrError(Exception):
     pass
 
 
+class ShipError(PitrError):
+    """Shipping to one or more storages failed (the streamer itself may be fine)."""
+
+    def __init__(self, message, storages=None):
+        super().__init__(message)
+        self.storages = list(storages or [])
+
+
 def _m():
     from . import main
     return main
@@ -171,6 +179,26 @@ def _run(server, script, timeout):
     return _m()._ssh_run(_ssh(server), script, timeout=timeout)
 
 
+def _run_checked(server, script, timeout, what):
+    """_run that treats a failed ssh/script as an error: PitrError instead of empty output.
+
+    Callers that parse facts from stdout must not read "no output" as "off": a failed login
+    (host key changed, network, sudo) would otherwise look like archiving switched off and be
+    saved as such.
+    """
+    try:
+        res = _run(server, script, timeout)
+    except subprocess.TimeoutExpired:
+        raise PitrError(f"{what}: no answer from {server.get('host') or 'the server'} within {timeout} s")
+    if res.returncode != 0:
+        ssh_text = pitr.ssh_failure_text(res.returncode, res.stderr, server.get('host') or '')
+        if ssh_text:
+            raise PitrError(ssh_text)
+        tail = ' '.join(x for x in (res.stderr or res.stdout or '').strip().splitlines()[-3:])
+        raise PitrError(f"{what} failed (exit {res.returncode})" + (f': {tail[:300]}' if tail else ''))
+    return res
+
+
 # ---------------------------------------------------------------------------
 # Prerequisites
 # ---------------------------------------------------------------------------
@@ -276,7 +304,8 @@ def run_tick(job_id):
         except Exception as e:
             logger.exception(f"PITR tick for job {job_id} failed")
             try:
-                _record_failure(job_id, f'{type(e).__name__}: {e}')
+                _record_failure(job_id, str(e) if isinstance(e, PitrError) else f'{type(e).__name__}: {e}',
+                                storages=getattr(e, 'storages', None))
             except Exception:
                 pass
             return False, str(e)
@@ -287,11 +316,22 @@ def run_tick(job_id):
                 pass
 
 
-def _record_failure(job_id, message):
+def _record_failure(job_id, message, storages=None):
+    """A failed tick: count it and keep the error; the stored facts (archiving, window, ...) stay as
+    they were - a failed check says nothing about the database."""
     m = _m()
     message = m.sanitize_error_message(message)
+    for prefix in ('PitrError: ',):
+        if message.startswith(prefix):
+            message = message[len(prefix):]
     state = load_state(job_id)
-    save_state(job_id, last_error=message, last_tick_at=_ts(_now()),
+    info = _json(state.get('info'), {})
+    info['failure_kind'] = pitr.tick_error_kind(message)
+    if info['failure_kind'] == pitr.TICK_ERROR_SHIP:
+        info['ship_failed'] = {'storages': list(storages or []), 'at': _now().isoformat()}
+    else:
+        info.pop('ship_failed', None)
+    save_state(job_id, last_error=message, last_tick_at=_ts(_now()), info=json.dumps(info),
                consecutive_failures=int(state.get('consecutive_failures') or 0) + 1)
     job = m.get_job(job_id)
     if job:
@@ -347,7 +387,9 @@ def _mysql_tick(job_id, job, server, db_config, targets, force=False):
                timeout=180)
     scan = pitr.parse_scan_output(res.stdout)
     if scan['errors'] or res.returncode != 0:
-        raise PitrError('; '.join(scan['errors']) or res.stderr.strip() or 'streamer setup failed')
+        raise PitrError('; '.join(scan['errors'])
+                        or pitr.ssh_failure_text(res.returncode, res.stderr, server.get('host'))
+                        or res.stderr.strip()[-300:] or 'streamer setup failed')
     version_change = None
     old_key, new_key = pitr.version_key(state.get('server_version')), pitr.version_key(scan['server_version'])
     if old_key and new_key and old_key != new_key:
@@ -357,12 +399,32 @@ def _mysql_tick(job_id, job, server, db_config, targets, force=False):
                 pitr.version_key(job.get('pitr_client_server_version')) != new_key:
             job = pin_client_image(job_id, job, server, scan['server_version'])
             # restart the streamer with the client matching the new version
-            _run(server, scripts.ensure_and_scan_script(job_id, db_config, pitr.effective_client_image(job),
-                                                        force=True), timeout=180)
+            _run_checked(server, scripts.ensure_and_scan_script(job_id, db_config, pitr.effective_client_image(job),
+                                                                force=True), 180, 'Restarting the streamer')
     plan = pitr.plan_shipment(state, scan, version_change=version_change)
     now = pitr._utc(scan['now']) if scan['now'] else _now()
     in_sync, alive = pitr.streamer_health(scan['active'], scan['heartbeat'],
                                           scan['now'] or int(_now().timestamp()), cfg['heartbeat_max_age'])
+    # Don't take the heartbeat's word alone: the window may only reach "now" while the spool
+    # really holds what the server has (a frozen stream or a renumbered server must not look current)
+    info = _json(state.get('info'), {})
+    if not scan['now']:
+        scan['now'] = int(now.timestamp())
+    progress = pitr.stream_progress(info, scan, state, in_sync, cfg['heartbeat_max_age'])
+    in_sync = progress['in_sync']
+    notice = None
+    if progress['reset'] and not scan['reset_pending']:
+        notice = progress['reason'] + '; restarting the streamer'
+    elif progress['frozen_ticks'] >= 2:
+        notice = 'the binlog stream is not receiving: ' + progress['reason'] + '; restarting the streamer'
+        alive = False
+    elif scan['reset_pending']:
+        notice = ('binlog numbering restarted on the server (' + scan['reset_pending'] + '); shipping the old '
+                  'binlogs, then a new chain starts (needs a new full backup)')
+    if notice and (progress['reset'] and not scan['reset_pending'] or progress['frozen_ticks'] in (2, 5, 8, 11)):
+        logger.warning(f"PITR: job {job.get('name')}: {notice}")
+        _run_checked(server, scripts.ensure_and_scan_script(job_id, db_config, pitr.effective_client_image(job),
+                                                            force=True), 180, 'Restarting the streamer')
 
     shipped = None
     message = ''
@@ -380,19 +442,27 @@ def _mysql_tick(job_id, job, server, db_config, targets, force=False):
         results, confirmed = pitr.parse_ship_output(res2.stdout, len(targets))
         ok = res2.returncode == 0 and confirmed and all(r['exit_code'] == 0 for r in results)
         if not ok:
-            failed = [f"{t['name']}: {' '.join(r['output'][-3:]) or 'exit ' + str(r['exit_code'])}"
-                      for t, r in zip(targets, results) if r['exit_code'] != 0]
+            ssh_text = None
+            if not any(r['exit_code'] is not None for r in results):  # never reached a storage
+                ssh_text = pitr.ssh_failure_text(res2.returncode, res2.stderr, server.get('host'))
+            if ssh_text:
+                raise PitrError(ssh_text)
+            bad = [(t, r) for t, r in zip(targets, results) if r['exit_code'] != 0]
+            failed = [f"{t['name']}: {' '.join(r['output'][-3:]) or 'exit ' + str(r['exit_code'])}" for t, r in bad]
             _forget_orphans(bjob, targets, results)
-            raise PitrError('shipping failed - ' + ('; '.join(failed) or res2.stderr.strip()[-300:]
-                                                     or 'unknown error'))
+            raise ShipError('shipping failed - ' + ('; '.join(failed) or res2.stderr.strip()[-300:]
+                                                    or 'unknown error'),
+                            storages=[t['name'] for t, _r in bad])
         shipped = results
 
-    _apply_plan(job_id, state, plan, scan, targets, shipped, in_sync, now)
+    _apply_plan(job_id, state, plan, scan, targets, shipped, in_sync, now, progress=progress, notice=notice)
     if plan['segments']:
         message = (f"shipped {sum(len(s['files']) for s in plan['segments'])} binlog file(s) "
                    f"up to {plan['segments'][-1]['last_file']}")
     _gc_partials(job_id, job, targets)
     refresh_state(job_id, job, live=alive)
+    if notice:
+        message = (message + '; ' if message else '') + notice
     return True, message or 'nothing new to ship'
 
 
@@ -417,15 +487,16 @@ def _forget_orphans(bjob, targets, results):
             logger.warning(f"PITR: couldn't forget orphan snapshots on {target.get('name')}: {e}")
 
 
-def _apply_plan(job_id, state, plan, scan, targets, shipped, in_sync, now):
+def _apply_plan(job_id, state, plan, scan, targets, shipped, in_sync, now, progress=None, notice=None):
     conn = _db()
     for br in plan['breaks']:
+        started = br.get('at') if br.get('at') and pitr._utc(br['at']) <= now else now
         conn.execute('''
             INSERT INTO pitr_chains (job_id, chain_id, start_seq, server_uuid, base, reason, started_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (job_id, chain_id) DO NOTHING
         ''', (job_id, br['chain_id'], br['start_seq'], br['server_uuid'], br['base'], br['reason'][:500],
-              _ts(now)))
+              _ts(started)))
         if br['reason'] != 'start':
             logger.warning(f"PITR: job {job_id}: chain broken - {br['reason']}")
     if plan['server_uuid']:
@@ -448,8 +519,20 @@ def _apply_plan(job_id, state, plan, scan, targets, shipped, in_sync, now):
         'binlog_base': plan['base'] or None, 'last_seq': plan['last_seq'],
         'streamer_active': scan['active'], 'heartbeat': _ts(scan['heartbeat']) if scan['heartbeat'] else None,
         'server_version': scan['server_version'] or state.get('server_version'),
-        'last_tick_at': _ts(now), 'last_error': None, 'consecutive_failures': 0,
+        'last_tick_at': _ts(now), 'last_error': _m().sanitize_error_message(notice) if notice else None,
+        'consecutive_failures': 0,
     }
+    info = _json(state.get('info'), {})
+    for key in ('failure_kind', 'ship_failed'):
+        info.pop(key, None)
+    if progress is not None:
+        changed = progress.get('server_changed_at')
+        info.update(server_pos=progress.get('server_pos'), spool_pos=progress.get('spool_pos'),
+                    frozen_ticks=progress.get('frozen_ticks') or 0, in_sync=bool(progress.get('in_sync')),
+                    stream_note=progress.get('reason') or None,
+                    server_changed_at=(pitr._utc(changed).isoformat() if isinstance(changed, (int, float))
+                                       else changed))
+    fields['info'] = json.dumps(info)
     if plan['segments'] or (plan['partial'] and shipped):
         # a copy of the open binlog is a shipment too (a quiet server may not close a file for days)
         fields['last_ship_at'] = _ts(now)
@@ -580,6 +663,28 @@ def _describe_window(window):
     return f"restorable {window['from'].strftime('%Y-%m-%d %H:%M')} .. {window['to'].strftime('%Y-%m-%d %H:%M')} UTC"
 
 
+def _lagging_message(job, old, window, lag):
+    """The lagging alert text, in the engine's own terms."""
+    lag_text = f"{round(lag) if lag is not None else '?'} min"
+    error = old.get('last_error')
+    if (old.get('kind') or 'mysql') == 'postgres':
+        info = _json(old.get('info'), {})
+        caught = pitr._utc(info.get('caught_up_at')) if info.get('caught_up_at') else None
+        since = caught.strftime('%Y-%m-%d %H:%M UTC') if caught else 'unknown'
+        message = (f"WAL archiving is behind: PostgreSQL changes are verified archived only up to {since} "
+                   f"({lag_text} ago)")
+        detail = info.get('archiver')
+        if error:
+            message += f". Last error: {error}"
+        elif detail and not str(detail).startswith('idle'):
+            message += f" ({detail})"
+        return message
+    message = f"Point-in-time recovery is lagging: newest restorable time is {lag_text} old"
+    if error:
+        message += f". Last error: {error}"
+    return message
+
+
 def _notify(job_id, job, kind_alert, new_state, old, window, lag, windows):
     m = _m()
     name = f"{job.get('name') or job_id} (PITR)"
@@ -589,10 +694,7 @@ def _notify(job_id, job, kind_alert, new_state, old, window, lag, windows):
     else:
         status = 'failed'
         if new_state == pitr.STATE_LAGGING:
-            message = (f"Point-in-time recovery is lagging: newest restorable time is "
-                       f"{round(lag) if lag is not None else '?'} min old")
-            if old.get('last_error'):
-                message += f". Last error: {old['last_error']}"
+            message = _lagging_message(job, old, window, lag)
         elif new_state == pitr.STATE_BROKEN:
             reason = windows[-1]['reason'] if windows else 'unknown'
             message = (f"Point-in-time recovery chain broken ({reason}); times after the break are not "
@@ -877,14 +979,18 @@ def _pg_windows(state):
     to = pitr._utc(int(end))
     frm = pitr._utc(start) if start else None
     anchored = bool(frm and frm <= to and reason == 'start')
-    # idle_at: the last tick that found nothing written since the last archived WAL;
-    # the window is current up to then even though the archive time is old.
+    # caught_up_at: up to when the ticks verified everything written was archived (see
+    # pitr.pg_caught_up); the window is current up to then even though the archive time is old.
+    # (idle_at, the older field, only for a row written before caught_up_at existed.)
     return [{'chain_id': 1, 'reason': reason, 'from': frm if anchored else None, 'to': to,
-             'anchored': anchored, 'anchor_ids': [], 'complete_at': info.get('idle_at')}]
+             'anchored': anchored, 'anchor_ids': [],
+             'complete_at': info.get('caught_up_at') or info.get('idle_at')}]
+
+
+PG_REQUIRED_FACTS = ('server_version_num', 'archive_mode', 'archive_command')
 
 
 def _pg_tick(job_id, job, server, db_config, targets):
-    m = _m()
     state = load_state(job_id)
     info = _json(state.get('info'), {})
     primary = targets[0]
@@ -893,20 +999,32 @@ def _pg_tick(job_id, job, server, db_config, targets):
     if info.get('walg_env_hash') != env_hash or not info.get('walg_version'):
         info.update(install_walg(server, primary, prefix))
         info['walg_env_hash'] = env_hash
-    res = _run(server, scripts.pg_prereq_script(), timeout=90)
+    # A failed login or script is an error (normal failure path, stored facts untouched), never
+    # "archiving off": that would skip the nightly base backup and hide an SSH problem.
+    res = _run_checked(server, scripts.pg_prereq_script(), 90, 'PostgreSQL status check')
     facts = pitr.parse_kv_output(res.stdout)
     if facts.get('connect_error'):
         raise PitrError('psql: ' + facts['connect_error'])
+    missing = [k for k in PG_REQUIRED_FACTS if k not in facts]
+    if missing:
+        raise PitrError('PostgreSQL status check returned no ' + ', '.join(missing)
+                        + ' (incomplete output; nothing was changed)')
     archiving = facts.get('archive_mode') in ('on', 'always') and \
         pitr.WALG_ARCHIVE_COMMAND.split()[0] in facts.get('archive_command', '')
     health = pitr.walg_archiver_health(facts)
     now = _now()
+    caught_up = None
+    if archiving:
+        caught_up = pitr.pg_caught_up(info.get('caught_up_at'), health,
+                                      facts.get('archiver_last_archived_time'), now)
     info.update(archive_mode=facts.get('archive_mode'), archiving=archiving,
-                last_archived_wal=facts.get('archiver_last_archived_wal'),
-                last_archived_time=facts.get('archiver_last_archived_time') or None,
+                last_archived_wal=facts.get('archiver_last_archived_wal') or info.get('last_archived_wal'),
+                last_archived_time=facts.get('archiver_last_archived_time') or info.get('last_archived_time'),
                 archiver_failed_count=facts.get('archiver_failed_count'),
                 current_wal_file=facts.get('current_wal_file') or None,
-                archiver=health['detail'],
+                archiver=health['detail'], pending_segments=health['pending'],
+                caught_up_at=caught_up.isoformat() if caught_up else None,
+                # UI wording only ("idle - nothing written since ..."), not the lag
                 idle_at=now.isoformat() if archiving and health['idle'] else None)
     message = None if archiving else ('postgresql.conf changes pending (archive_mode/archive_command); '
                                       'see Check prerequisites')
@@ -915,34 +1033,54 @@ def _pg_tick(job_id, job, server, db_config, targets):
     ship_ok = archiving and not health['failing']
     if archiving:
         res = _run(server, scripts.walg_run_script('wal-g backup-list --json --detail'), timeout=120)
-        try:
-            backups = json.loads(res.stdout.strip() or '[]') or []
-        except ValueError:
-            backups = []
-        times = sorted(b.get('start_time') for b in backups if b.get('start_time'))
-        info['oldest_base_backup'] = times[0] if times else None
-        info['base_backups'] = len(backups)
+        backups = None
+        if res.returncode == 0:
+            try:
+                backups = json.loads(res.stdout.strip() or '[]') or []
+            except ValueError:
+                backups = None
+        if backups is not None:
+            times = sorted(b.get('start_time') for b in backups if b.get('start_time'))
+            info['oldest_base_backup'] = times[0] if times else None
+            info['base_backups'] = len(backups)
+            info.pop('backup_list_error', None)
+        else:
+            # keep the last known base backups: a listing error is not "no base backup"
+            info['backup_list_error'] = (pitr.ssh_failure_text(res.returncode, res.stderr, server.get('host'))
+                                         or (res.stderr or '').strip()[-200:] or 'unreadable wal-g output')
         last_verify = info.get('verify_at')
         if not last_verify or _now() - pitr._utc(last_verify) > timedelta(hours=1):
             res = _run(server, scripts.walg_run_script('wal-g wal-verify integrity timeline --json'), timeout=600)
             try:
+                if res.returncode != 0:
+                    raise ValueError
                 verdict = json.loads(res.stdout.strip().splitlines()[-1])
                 integrity = verdict.get('integrity', {})
                 info['integrity'] = integrity.get('status')
                 info['integrity_detail'] = json.dumps(integrity.get('details'))[:300]
                 info['timeline'] = verdict.get('timeline', {}).get('status')
+                info['verify_at'] = _now().isoformat()
+                info.pop('verify_error', None)
             except (ValueError, IndexError, AttributeError):
-                info['integrity'] = None
-            info['verify_at'] = _now().isoformat()
+                # keep the last verdict; retried next tick
+                info['verify_error'] = (res.stderr or '').strip()[-200:] or 'unreadable wal-verify output'
         if len(targets) > 1:
             last_mirror = info.get('mirror_at')
             if not last_mirror or _now() - pitr._utc(last_mirror) >= timedelta(minutes=15):
                 info['mirror'] = _mirror_wal(prefix, primary, targets[1:])
                 info['mirror_at'] = _now().isoformat()
-                failed = [f"{r['storage']}: {r['error'] or 'failed'}" for r in info['mirror'] if not r['ok']]
-                if failed:
+                ok_at = dict(info.get('mirror_ok_at') or {})
+                for r in info['mirror']:
+                    if r['ok']:
+                        ok_at[r['storage']] = info['mirror_at']
+                    else:
+                        # first failure since tracking began: count from the previous copy run
+                        ok_at.setdefault(r['storage'], last_mirror or info['mirror_at'])
+                info['mirror_ok_at'] = ok_at
+                if any(not r['ok'] for r in info['mirror']):
+                    # The copy to the other storages is its own issue (wal_mirror_failed, escalating
+                    # with its age); it is not the primary's lag and stays out of the lagging alert
                     ship_ok = False
-                    message = message or ('WAL mirror failed - ' + '; '.join(failed))[:500]
             else:
                 ship_ok = False  # nothing shipped to the other storages this tick
     fields = {}
@@ -950,6 +1088,7 @@ def _pg_tick(job_id, job, server, db_config, targets):
         # A "ship": WAL on the primary is current (archiver healthy) and every storage
         # has it - even when an idle server produced no new files.
         fields['last_ship_at'] = _ts(now)
+    info.pop('failure_kind', None)
     save_state(job_id, kind='postgres', info=json.dumps(info), last_tick_at=_ts(now),
                last_error=message, consecutive_failures=0,
                streamer_active=('failing' if health['failing'] else 'active') if archiving else 'inactive',
@@ -1025,11 +1164,23 @@ def run_pg_base_backup(job_id):
                     return False, 'not a PITR PostgreSQL job'
                 state = load_state(job_id)
                 if not _json(state.get('info'), {}).get('archiving'):
-                    return False, 'archiving not enabled yet'
-                res = _run(server, scripts.walg_run_script('wal-g backup-push "$PGDATA"'),
-                           timeout=int(job.get('timeout') or 7200))
+                    # Never silent: without a base backup the restorable window stops moving forward
+                    message = ('WAL-G base backup skipped: WAL archiving is not switched on for this server '
+                               '(last check: ' + (state.get('last_error') or 'archive_mode/archive_command not set')
+                               + '). Open the PITR setup.')
+                    message = m.sanitize_error_message(message, 600)
+                    logger.warning(f"PITR: job {job_id}: {message}")
+                    m.add_history(job_id, job['name'], 'skipped', message, 0)
+                    m.send_notification(job_id, f"{job['name']} (PITR)", 'failed', message, 0)
+                    return False, message
+                try:
+                    res = _run(server, scripts.walg_run_script('wal-g backup-push "$PGDATA"'),
+                               timeout=int(job.get('timeout') or 7200))
+                except subprocess.TimeoutExpired:
+                    raise PitrError(f"wal-g backup-push did not finish within {int(job.get('timeout') or 7200)} s")
                 if res.returncode != 0:
-                    raise PitrError(res.stderr.strip()[-400:] or 'wal-g backup-push failed')
+                    raise PitrError(pitr.ssh_failure_text(res.returncode, res.stderr, server.get('host'))
+                                    or res.stderr.strip()[-400:] or 'wal-g backup-push failed')
                 m.add_history(job_id, job['name'], 'success', 'WAL-G base backup (PITR) completed', 0)
                 return True, 'ok'
         except Exception as e:

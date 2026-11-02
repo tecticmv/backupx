@@ -13,7 +13,7 @@ from datetime import timezone
 
 from . import pitr
 
-STREAMER_VERSION = '2'
+STREAMER_VERSION = '3'
 STREAMER_PATH = '/usr/local/lib/backupx-pitr/binlog-streamer.sh'
 UNIT_NAME = 'backupx-pitr-binlog@.service'
 UNIT_PATH = '/etc/systemd/system/' + UNIT_NAME
@@ -130,7 +130,7 @@ if [ -n "$OLD_UUID" ] && [ "$OLD_UUID" != "$UUID" ]; then
         exit 1
     fi
     event "gap: server_uuid changed $OLD_UUID -> $UUID"
-    rm -f "$STATE/last_shipped"
+    rm -f "$STATE/last_shipped" "$STATE/server_binlogs" "$STATE/server_hw" "$STATE/reset_pending"
 fi
 if [ -e "$STATE/spool-closed" ]; then
     if [ -n "$(newest_spool)" ]; then
@@ -149,9 +149,99 @@ first_after() {  # first server binlog whose number is greater than $1's
     done
 }
 
+# --- Numbering restarts -------------------------------------------------------
+# Binary logs on the server can be wiped and renumbered from .000001 (reset of the
+# binary logs, also MySQL 8.4's "binary logs and GTIDs" reset). A file name then no
+# longer identifies the data: our copy of mysql-bin.000003 is not the server's new
+# mysql-bin.000003. Signs, checked at start and every minute:
+#   - the server's newest file number is below the highest we have seen (server_hw);
+#   - a file that was closed in our last listing changed size, or the then-open file shrank;
+#   - our copy of the server's current file is bigger than the server's (we only ever
+#     have less, the spool is read before the server is asked);
+#   - at start: our copy and the server's file of the same name were created at
+#     different times (their format description events differ).
+# Then the old spool is shipped as closed, a gap is reported (new chain, needs a new
+# anchored dump) and streaming restarts from the server's first file.
+newest_name() { printf '%s\n' "$1" | cut -f1 | grep -E '\.[0-9]{6,}$' | sort -t. -k2,2n | tail -n1; }
+size_in() { printf '%s\n' "$1" | awk -F'\t' -v n="$2" '$1 == n { print $2; exit }'; }
+reset_reason() {  # reset_reason "<name<TAB>size listing>"; prints the reason and succeeds on a restart
+    local listing="$1" hw newest prev prev_newest name size cur
+    newest=$(newest_name "$listing")
+    hw=$(cat "$STATE/server_hw" 2>/dev/null || true)
+    if [ -n "$hw" ] && [ -n "$newest" ] && [ "$(seq_of "$newest")" -lt "$(seq_of "$hw")" ]; then
+        echo "the server's newest binlog is $newest but it had reached $hw"; return 0
+    fi
+    [ -f "$STATE/server_binlogs" ] || return 1
+    prev=$(cat "$STATE/server_binlogs")
+    prev_newest=$(newest_name "$prev")
+    while IFS="$(printf '\t')" read -r name size; do
+        [ -n "$name" ] && [ -n "$size" ] || continue
+        cur=$(size_in "$listing" "$name")
+        [ -n "$cur" ] || continue
+        if [ "$name" = "$prev_newest" ]; then
+            [ "$cur" -lt "$size" ] && { echo "binlog $name shrank on the server ($size -> $cur bytes)"; return 0; }
+        elif [ "$cur" != "$size" ]; then
+            echo "closed binlog $name changed size on the server ($size -> $cur bytes)"; return 0
+        fi
+    done <<EOF_LISTING
+$prev
+EOF_LISTING
+    return 1
+}
+remember_listing() {  # the server's listing and the highest file number seen
+    local newest hw
+    printf '%s\n' "$1" > "$STATE/server_binlogs.new" && mv -f "$STATE/server_binlogs.new" "$STATE/server_binlogs"
+    newest=$(newest_name "$1")
+    hw=$(cat "$STATE/server_hw" 2>/dev/null || true)
+    if [ -n "$newest" ] && { [ -z "$hw" ] || [ "$(seq_of "$newest")" -ge "$(seq_of "$hw")" ]; }; then
+        printf '%s\n' "$newest" > "$STATE/server_hw"
+    fi
+}
+created_line() {  # the "#YYMMDD HH:MM:SS server id N" header of a binlog's format description event
+    grep -a -m1 'Start: binlog v' | sed -n 's/^\(#[0-9]\{6\} \{1,2\}[0-9]\{1,2\}:[0-9]\{2\}:[0-9]\{2\} server id [0-9]*\).*/\1/p'
+}
+same_file() {  # same_file NAME: does our spool copy hold the start of the server's file of that name?
+    local ours theirs
+    ours=$(pitr_client "$BINLOG" --defaults-file="$CNF" --stop-position=4096 "$OUT_DIR/$1" 2>/dev/null | created_line)
+    theirs=$(pitr_client "$BINLOG" --defaults-file="$CNF" --read-from-remote-server --stop-position=4096 "$1" 2>/dev/null \
+        | created_line)
+    # unknown on either side: no verdict (the size checks still apply)
+    [ -z "$ours" ] || [ -z "$theirs" ] || [ "$ours" = "$theirs" ]
+}
+
 NEWEST=$(newest_spool)
 LAST=$(cat "$STATE/last_shipped" 2>/dev/null || true)
-if [ -n "$NEWEST" ]; then
+RESET=""
+if [ -e "$STATE/reset_pending" ]; then
+    RESET=$(cat "$STATE/reset_pending")
+elif RESET=$(reset_reason "$LOGS"); then
+    :
+elif [ -n "$NEWEST" ] && printf '%s\n' "$NAMES" | grep -qx "$NEWEST"; then
+    SERVER_SIZE=$(size_in "$LOGS" "$NEWEST")
+    LOCAL_SIZE=$(stat -c %s "$SPOOL/$NEWEST" 2>/dev/null || echo 0)
+    if [ -n "$SERVER_SIZE" ] && [ "$LOCAL_SIZE" -gt "$SERVER_SIZE" ]; then
+        RESET="our copy of $NEWEST ($LOCAL_SIZE bytes) is bigger than the server's ($SERVER_SIZE bytes)"
+    elif ! same_file "$NEWEST"; then
+        RESET="the server's $NEWEST is a different file than our copy (created at another time)"
+    else
+        RESET=""
+    fi
+else
+    RESET=""
+fi
+if [ -n "$RESET" ]; then
+    printf '%s\n' "$RESET" > "$STATE/reset_pending"
+    if [ -n "$NEWEST" ]; then
+        # Ship what we have of the old numbering first (every spool file counts as closed)
+        touch "$STATE/spool-closed"
+        log "binlog numbering restarted on the server ($RESET); waiting for backupx to ship the old spool"
+        sleep 60
+        exit 1
+    fi
+    START=$(printf '%s\n' "$NAMES" | head -n1)
+    event "gap: binlog numbering restarted on the server ($RESET); streaming again from its first binlog $START"
+    rm -f "$STATE/last_shipped" "$STATE/server_binlogs" "$STATE/server_hw" "$STATE/reset_pending"
+elif [ -n "$NEWEST" ]; then
     if printf '%s\n' "$NAMES" | grep -qx "$NEWEST"; then
         START="$NEWEST"  # re-fetch the file being written when we stopped
     else
@@ -170,6 +260,7 @@ else
     START=$(printf '%s\n' "$NAMES" | tail -n1)
     log "first start: streaming from the current binlog $START"
 fi
+remember_listing "$LOGS"
 
 # mysqlbinlog reads only our option file (--defaults-file, must come first): the host's
 # [client] section may hold options it rejects (MariaDB 10.3: default-character-set).
@@ -194,20 +285,43 @@ stop() {
 }
 trap stop TERM INT
 
-# Watchdog: in sync = we hold the server's current binlog and at least what the
-# server had a minute ago. Out of sync for 5 checks in a row = stalled
-# connection; exit so systemd restarts us (resuming from the newest file).
+# Watchdog, every minute. In sync = we hold the server's current binlog, no more of it
+# than the server (the spool is read first, the server can only be ahead) and at least
+# what the server had a minute ago; then the heartbeat is touched and the verified
+# position written to sync_pos. Out of sync for 5 checks in a row = stalled
+# connection; exit so systemd restarts us (resuming from the newest file). A numbering
+# restart exits at once (handled at the next start).
 behind=0
 prev_size=""
 while kill -0 "$PID" 2>/dev/null; do
     sleep 60 & wait $!
-    CUR=$(pitr_q "SHOW BINARY LOGS" 2>/dev/null | tail -n1 | cut -f1,2) || continue
-    CUR_NAME=$(printf '%s' "$CUR" | cut -f1)
-    CUR_SIZE=$(printf '%s' "$CUR" | cut -f2)
     LOCAL=$(newest_spool)
     LOCAL_SIZE=$(stat -c %s "$SPOOL/$LOCAL" 2>/dev/null || echo 0)
+    LISTING=$(pitr_q "SHOW BINARY LOGS" 2>/dev/null | cut -f1,2) || continue
+    [ -n "$LISTING" ] || continue
+    CUR=$(printf '%s\n' "$LISTING" | tail -n1)
+    CUR_NAME=$(printf '%s' "$CUR" | cut -f1)
+    CUR_SIZE=$(printf '%s' "$CUR" | cut -f2)
+    REASON=""
+    if REASON=$(reset_reason "$LISTING"); then
+        :
+    elif [ "$CUR_NAME" = "$LOCAL" ] && [ "$LOCAL_SIZE" -gt "$CUR_SIZE" ]; then
+        REASON="our copy of $LOCAL ($LOCAL_SIZE bytes) is bigger than the server's ($CUR_SIZE bytes)"
+    else
+        REASON=""
+    fi
+    if [ -n "$REASON" ]; then
+        printf '%s\n' "$REASON" > "$STATE/reset_pending"
+        log "binlog numbering restarted on the server: $REASON; restarting"
+        kill "$PID" 2>/dev/null
+        [ -n "$PITR_RUN_IMAGE" ] && $DOCKER rm -f "$CONTAINER_NAME" >/dev/null 2>&1
+        break
+    fi
+    remember_listing "$LISTING"
     if [ "$CUR_NAME" = "$LOCAL" ] && { [ -z "$prev_size" ] || [ "$LOCAL_SIZE" -ge "$prev_size" ]; }; then
         behind=0
+        printf '%s\t%s\t%s\n' "$LOCAL" "$LOCAL_SIZE" "$(date +%s)" > "$STATE/sync_pos.new" \
+            && mv -f "$STATE/sync_pos.new" "$STATE/sync_pos"
         touch "$STATE/heartbeat"
     else
         behind=$((behind + 1))
@@ -346,6 +460,12 @@ printf 'PITR\\tACTIVE\\t%s\\n' "$($SUDO systemctl is-active "$UNIT" 2>/dev/null)
 [ -f "$STATE/last_shipped" ] && printf 'PITR\\tLAST_SHIPPED\\t%s\\n' "$(head -n1 "$STATE/last_shipped")"
 [ -e "$STATE/spool-closed" ] && printf 'PITR\\tCLOSED_ALL\\t1\\n'
 [ -e "$STATE/heartbeat" ] && printf 'PITR\\tHEARTBEAT\\t%s\\n' "$(stat -c %Y "$STATE/heartbeat")"
+[ -f "$STATE/sync_pos" ] && printf 'PITR\\tSYNC_POS\\t%s\\n' "$(head -n1 "$STATE/sync_pos")"
+[ -f "$STATE/reset_pending" ] && printf 'PITR\\tRESET_PENDING\\t%s\\n' "$(head -n1 "$STATE/reset_pending")"
+if [ -f "$STATE/server_binlogs" ]; then
+    printf 'PITR\\tSERVER_LOGS_AT\\t%s\\n' "$(stat -c %Y "$STATE/server_binlogs")"
+    tail -n 50 "$STATE/server_binlogs" | sed 's/^/PITR\\tSERVER_LOG\\t/'
+fi
 for f in "$SPOOL"/*; do
     [ -f "$f" ] || continue
     printf 'PITR\\tFILE\\t%s\\t%s\\n' "${{f##*/}}" "$(stat -c '%s	%Y' "$f")"
@@ -647,6 +767,10 @@ if [ $RC -ne 0 ]; then
         cat "$WORK/replay.err" >&2; echo "decoding the binlogs failed" >&2; exit 1
     fi
 fi
+# The newest event replayed (UTC): how far the restored data really reaches
+LAST_EVENT=$(grep -a -oE '^#[0-9]{{6}} +[0-9]{{1,2}}:[0-9]{{2}}:[0-9]{{2}} server id' "$WORK/replay.sql" \\
+    | grep -vE '^#(700101|691231)' | tail -n1 | sed 's/ server id$//; s/^#//') || true
+echo "BACKUPX-LAST-EVENT ${{LAST_EVENT:-unknown}}"
 
 note "Starting a scratch $SERVER_IMAGE container ($NAME, no published ports)"
 docker run -d --name "$NAME" ${{DOCKER_ARGS:-}} {root_env} -e TZ=UTC "$SERVER_IMAGE" {server_args} >/dev/null

@@ -997,12 +997,12 @@ def test_mysql_prereq_script_measures_sudo_and_binlog_start(tmp_path, sudo_ok):
 
 def test_streamer_runs_mysqlbinlog_with_only_its_own_option_file():
     lines = [line for line in scripts.STREAMER_SCRIPT.splitlines() if 'pitr_client' in line and '"$BINLOG"' in line]
-    assert len(lines) == 2
+    assert len(lines) == 4  # --help probe, the stream, and the two file-identity reads (numbering restarts)
     for line in lines:
         # --defaults-file must be the first option; --no-defaults + --defaults-extra-file is rejected
         assert '"$BINLOG" --defaults-file="$CNF"' in line, line
         assert '--defaults-extra-file' not in line and '--no-defaults' not in line
-    assert scripts.STREAMER_VERSION != '1'  # changed content: installed hosts get the new script + restart
+    assert scripts.STREAMER_VERSION not in ('1', '2')  # changed content: installed hosts get the new script + restart
 
 
 # ---------------------------------------------------------------------------
@@ -1125,7 +1125,11 @@ def test_pg_tick_mirror_failure_is_not_a_ship(monkeypatch):
     ps, job, targets, sent, _ = _pg_tick_env(monkeypatch, PG_FACTS, rows, mirror_ok=False)
     rows.update(state=pitr.STATE_OK, alerted_state=None)
     ps._pg_tick('dspace', job, dict(SERVER), {'type': 'postgresql'}, targets)
-    assert 'last_ship_at' not in rows and 'WAL mirror failed' in rows['last_error']
+    assert 'last_ship_at' not in rows
+    # the copy to R2 is its own issue (wal_mirror_failed), not the primary's last error / lag
+    assert rows['last_error'] is None
+    info = json.loads(rows['info'])
+    assert info['mirror'][0]['ok'] is False and info['mirror_ok_at']['Cloudflare R2']
     assert rows['state'] == pitr.STATE_OK                           # the primary still has every WAL
 
 

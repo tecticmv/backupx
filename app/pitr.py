@@ -46,6 +46,8 @@ STATE_OK = 'ok'
 STATE_LAGGING = 'lagging'        # anchored, but the newest restorable time is too old
 STATE_BROKEN = 'broken'          # the chain broke and no anchor has landed in the new one
 STATE_UNANCHORED = 'unanchored'  # streaming fine, but no dump anchors this chain yet
+# The streamer's gap text when the server's binlog numbering restarted (a reset of the binary logs)
+NUMBERING_RESTART = 'binlog numbering restarted'
 BAD_STATES = (STATE_LAGGING, STATE_BROKEN, STATE_UNANCHORED)
 
 DEFAULT_INTERVAL_MINUTES = 5
@@ -620,7 +622,7 @@ def parse_scan_output(text):
     """
     scan = {'files': [], 'events': [], 'journal': [], 'uuid': '', 'last_shipped': '', 'active': '',
             'closed_all': False, 'heartbeat': None, 'now': None, 'server_version': '', 'install': '',
-            'errors': []}
+            'errors': [], 'sync_pos': None, 'reset_pending': '', 'server_logs': [], 'server_logs_at': None}
     for line in (text or '').splitlines():
         if not line.startswith('PITR\t'):
             continue
@@ -662,8 +664,87 @@ def parse_scan_output(text):
             scan['server_version'] = values[0] if values else ''
         elif key == 'INSTALL':
             scan['install'] = values[0] if values else ''
+        elif key == 'SYNC_POS' and len(values) >= 3:
+            size, at = _int_or_none(values[1]), _int_or_none(values[2])
+            if split_binlog_name(values[0]) and size is not None and at is not None:
+                scan['sync_pos'] = {'name': values[0], 'size': size, 'at': at}
+        elif key == 'RESET_PENDING':
+            scan['reset_pending'] = '\t'.join(values)
+        elif key == 'SERVER_LOGS_AT':
+            scan['server_logs_at'] = _int_or_none(values[0] if values else '')
+        elif key == 'SERVER_LOG' and len(values) >= 2:
+            size = _int_or_none(values[1])
+            if split_binlog_name(values[0]) and size is not None:
+                scan['server_logs'].append({'name': values[0], 'size': size})
     scan['files'].sort(key=lambda f: (split_binlog_name(f['name'])[0], binlog_seq(f['name'])))
+    scan['server_logs'].sort(key=lambda f: binlog_seq(f['name']))
     return scan
+
+
+def stream_progress(info, scan, state, in_sync, max_age):
+    """Is the spool really keeping up with the server? (the tick's own check, besides the streamer's)
+
+    info: the job's pitr_state.info; scan: parse_scan_output(); state: pitr_state row;
+    in_sync: what the heartbeat says (streamer_health). Uses the streamer's latest
+    `SHOW BINARY LOGS` listing (taken before the spool was read, so the spool must hold at
+    least that much) and its last verified position (sync_pos).
+
+    Returns {'in_sync', 'behind', 'frozen_ticks', 'reset', 'server_pos', 'server_changed_at',
+             'spool_pos', 'reason'}:
+      in_sync          heartbeat fresh AND the verified position is the open file AND the spool
+                       is not behind the server's listing AND no numbering restart is pending
+      behind           the spool lacks data the server had when it was last listed
+      frozen_ticks     consecutive ticks behind (2+ = the streamer is not receiving: restart it)
+      reset            the server's binlog numbering went backwards (a reset of the binary logs);
+                       the streamer reports reset_pending itself, this is the backstop
+      server_changed_at  last time the server's binlog position was seen to move (epoch of the
+                       listing): the drill checks the restored data reaches it
+    """
+    info = info or {}
+    now = scan.get('now') or 0
+    logs = scan.get('server_logs') or []
+    logs_at = scan.get('server_logs_at')
+    fresh_listing = bool(logs and logs_at and now - logs_at <= max_age)
+    server = logs[-1] if logs else None
+    files = scan.get('files') or []
+    spool = files[-1] if files else None
+    out = {'in_sync': bool(in_sync), 'behind': False, 'frozen_ticks': 0, 'reset': scan.get('reset_pending') or '',
+           'server_pos': info.get('server_pos'), 'server_changed_at': info.get('server_changed_at'),
+           'spool_pos': {'name': spool['name'], 'size': spool['size']} if spool else None, 'reason': ''}
+    if server and fresh_listing:
+        pos = {'name': server['name'], 'size': server['size']}
+        old = info.get('server_pos') or {}
+        if pos['name'] != old.get('name') or pos['size'] != old.get('size'):
+            out['server_changed_at'] = logs_at
+        out['server_pos'] = pos
+        last_seq = state.get('last_seq')
+        s_base, s_seq = split_binlog_name(server['name'])
+        if not out['reset'] and last_seq is not None and s_base == (state.get('binlog_base') or s_base) \
+                and s_seq < int(last_seq):
+            out['reset'] = (f"the server's newest binlog is {server['name']} but "
+                            f"{s_base}.{int(last_seq):06d} was already shipped")
+        if spool and not scan.get('closed_all'):
+            sp_base, sp_seq = split_binlog_name(spool['name'])
+            if sp_base == s_base and (sp_seq < s_seq or (sp_seq == s_seq and spool['size'] < server['size'])):
+                out['behind'] = True
+                out['reason'] = (f"the spool has {spool['name']} ({spool['size']} bytes) but the server already "
+                                 f"had {server['name']} ({server['size']} bytes)")
+    elif logs_at is not None and not fresh_listing:
+        out['reason'] = 'the streamer has not listed the server for a while'
+    out['frozen_ticks'] = int(info.get('frozen_ticks') or 0) + 1 if out['behind'] else 0
+    sync = scan.get('sync_pos')
+    open_file = None if scan.get('closed_all') or not files else files[-1]
+    if out['in_sync'] and sync is not None:
+        # the heartbeat only counts for the file the streamer verified, and only while it is fresh
+        if not open_file or sync['name'] != open_file['name'] or open_file['size'] < sync['size'] \
+                or now - sync['at'] > max_age:
+            out['in_sync'] = False
+            out['reason'] = out['reason'] or 'the verified position is not the open file'
+    if out['behind'] or out['reset'] or (logs_at is not None and not fresh_listing):
+        out['in_sync'] = False
+    if out['reset']:
+        out['reason'] = 'binlog numbering restarted on the server: ' + out['reset']
+    return out
 
 
 def _int_or_none(text):
@@ -709,11 +790,14 @@ def plan_shipment(state, scan, version_change=None):
     last_seq = int(last_seq) if last_seq is not None else None
     breaks = []
 
-    def new_chain(start_seq, reason, new_base=None):
+    def new_chain(start_seq, reason, new_base=None, at=None):
         nonlocal chain_id, last_seq
         chain_id += 1
-        breaks.append({'chain_id': chain_id, 'start_seq': start_seq, 'reason': reason,
-                       'server_uuid': scan.get('uuid') or uuid, 'base': new_base or base})
+        br = {'chain_id': chain_id, 'start_seq': start_seq, 'reason': reason,
+              'server_uuid': scan.get('uuid') or uuid, 'base': new_base or base}
+        if at is not None:
+            br['at'] = at  # when the streamer saw it (chain started_at)
+        breaks.append(br)
         last_seq = None if start_seq is None else start_seq - 1
 
     files = list(scan.get('files') or [])
@@ -723,7 +807,7 @@ def plan_shipment(state, scan, version_change=None):
     # Streamer-reported gaps. "... continuing at <file>" pins the break to that file:
     # the numbering may have no hole (the file being streamed was purged and the
     # server went on with the next one) while data is still missing.
-    break_points, generic_gap = {}, None
+    break_points, generic_gap, generic_at = {}, None, None
     for event in scan.get('events') or []:
         if not event['text'].startswith('gap'):
             continue
@@ -734,6 +818,10 @@ def plan_shipment(state, scan, version_change=None):
             break_points[seq] = reason
         elif 'server_uuid changed' not in event['text']:
             generic_gap = reason
+            try:
+                generic_at = _utc(event['time']) if event.get('time') else None
+            except ValueError:
+                generic_at = None
     ack = max((e['line'] for e in scan.get('events') or []), default=0)
 
     scan_uuid = scan.get('uuid') or ''
@@ -752,7 +840,7 @@ def plan_shipment(state, scan, version_change=None):
     elif generic_gap and chain_id:
         first = closed[0] if closed else open_file
         new_chain(binlog_seq(first['name']) if first else None, generic_gap,
-                  split_binlog_name(first['name'])[0] if first else base)
+                  split_binlog_name(first['name'])[0] if first else base, at=generic_at)
     elif version_change and chain_id:
         # Same server, new major.minor (upgrade): restores past this point need a dump taken by the new
         # version, so start a new chain; times before it stay restorable from the old one
@@ -855,6 +943,11 @@ def anchor_usable(anchor, chain, min_retained_seq):
     if anchor.get('forgotten') or not anchor.get('snapshots'):
         return False
     if (anchor.get('server_uuid') or '') != (chain.get('server_uuid') or ''):
+        return False
+    if NUMBERING_RESTART in (chain.get('reason') or '') and chain.get('started_at') and anchor.get('time') \
+            and _utc(anchor['time']) < _utc(chain['started_at']):
+        # The server's binlog numbering restarted: a dump from before that names a file
+        # (mysql-bin.000012:pos) that exists again with different contents
         return False
     a_base, a_seq = split_binlog_name(anchor.get('binlog_file') or '') or (None, None)
     if a_seq is None or a_base != chain.get('base'):
@@ -1131,6 +1224,69 @@ def walg_archiver_health(facts):
     else:
         detail = f'{pending} segment(s) not archived yet (current {facts.get("current_wal_file")})'
     return {'idle': pending == 0 and not failing, 'pending': pending, 'failing': failing, 'detail': detail}
+
+
+def pg_caught_up(previous, health, last_archived_epoch, now):
+    """Up to when an archiving PostgreSQL server is verified to be restorable (caught_up_at).
+
+    previous: the stored caught_up_at (or None); health: walg_archiver_health();
+    last_archived_epoch: pg_stat_archiver.last_archived_time (epoch or None).
+
+    - idle (the current WAL segment is the last archived one): everything written so far is
+      archived -> now;
+    - otherwise everything up to the last archive, and everything up to the previous verified
+      point, is still archived: max(previous, last archive). An idle server whose autovacuum or
+      checkpoint wrote a few bytes into a fresh segment (only that open segment pending, archived at
+      archive_timeout) keeps the time it was last seen idle instead of falling back to its last
+      archive hours ago;
+    - unknown position (in recovery, timeline switch, no answer) or a failing archive_command:
+      never moves forward past the last archive, so the lag grows until it is verified again.
+    """
+    now = _utc(now)
+    if health.get('idle') and not health.get('failing'):
+        return now
+    candidates = [_utc(previous) if previous else None,
+                  _utc(int(last_archived_epoch)) if _int_or_none(last_archived_epoch) is not None else None]
+    candidates = [c for c in candidates if c is not None and c <= now]
+    return max(candidates) if candidates else None
+
+
+TICK_ERROR_SSH = 'ssh'
+TICK_ERROR_SHIP = 'ship'
+TICK_ERROR_CHECK = 'check'
+_SSH_ERROR = re.compile(r'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|'
+                        r'Permission denied \(publickey|Connection refused|Connection timed out|'
+                        r'No route to host|Could not resolve hostname|Connection closed by|'
+                        r'kex_exchange_identification|ssh: connect to host|Name or service not known', re.I)
+
+
+def ssh_failure_text(returncode, stderr, host=''):
+    """A readable SSH error when a remote command failed because of ssh itself, else None.
+
+    ssh exits 255 for its own errors (login, host key, network); the remote script's exit code
+    otherwise. A host key change is called out: it is fixed by trusting the new key, not by
+    re-running anything.
+    """
+    text = (stderr or '').strip()
+    if 'REMOTE HOST IDENTIFICATION HAS CHANGED' in text or 'Host key verification failed' in text:
+        return (f"SSH to {host or 'the server'} refused: the server's host key changed (REMOTE HOST "
+                "IDENTIFICATION HAS CHANGED); check it and trust the new key in Health")
+    if returncode == 255 or _SSH_ERROR.search(text):
+        lines = [x for x in text.splitlines() if x.strip() and not x.startswith('Warning: Permanently added')]
+        return f"SSH to {host or 'the server'} failed: " + (' '.join(lines[-2:])[:300] or f'exit {returncode}')
+    return None
+
+
+def tick_error_kind(message):
+    """ssh / ship / check for a stored PITR tick error (health issue titles and fixes)."""
+    text = message or ''
+    if text.startswith('SSH to '):
+        return TICK_ERROR_SSH
+    if text.startswith('shipping failed'):  # restic's storage errors look like network errors too
+        return TICK_ERROR_SHIP
+    if _SSH_ERROR.search(text):
+        return TICK_ERROR_SSH
+    return TICK_ERROR_CHECK
 
 
 def evaluate_pg_prereqs(facts):

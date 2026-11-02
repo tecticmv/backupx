@@ -742,11 +742,19 @@ def _scratch_binlog(ctx, row, plan, job, target, work, engine):
     env.update({'NAME': row['container'], 'WORK': work, 'BACKUPX_STEPS': '1',
                 'DOCKER_ARGS': rs.docker_args(row['id'], job['id'])})
     os.makedirs(work, mode=0o700, exist_ok=True)
-    rc = run_local(ctx, script, env=env)
+    seen = {}
+
+    def on_line(_stream, line):
+        last = r.parse_last_event_marker(line)
+        if last is not None:
+            seen['last_event_at'] = last
+
+    rc = run_local(ctx, script, env=env, on_line=on_line)
     if rc != 0:
         raise tasks.TaskError(f'The point-in-time restore failed (exit code {rc}); see the log')
     return {'server_version': inputs['server_version'], 'image': inputs['server_image'],
-            'binlog_image': inputs['binlog_image']}
+            'binlog_image': inputs['binlog_image'],
+            'last_event_at': r.iso(seen['last_event_at']) if seen.get('last_event_at') else None}
 
 
 def _scratch_walg(ctx, row, plan, job, db_config, target, work):

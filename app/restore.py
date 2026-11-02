@@ -109,6 +109,18 @@ def iso(value):
     return value.isoformat() if value else None
 
 
+def parse_last_event_marker(line):
+    """'BACKUPX-LAST-EVENT 261102 15:04:01' (the restore script, UTC) -> aware datetime, else None."""
+    match = re.match(r'^\s*BACKUPX-LAST-EVENT\s+(\d{6})\s+(\d{1,2}):(\d{2}):(\d{2})\s*$', line or '')
+    if not match:
+        return None
+    try:
+        return datetime.strptime(f'{match.group(1)} {int(match.group(2)):02d}:{match.group(3)}:{match.group(4)}',
+                                 '%y%m%d %H:%M:%S').replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def container_name(restore_id):
     return f'{CONTAINER_PREFIX}{restore_id}'
 
