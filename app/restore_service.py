@@ -347,6 +347,11 @@ def derive_plan(data, cfg=None):
     job, db_config, server, engine, state = job_context(job_id)
     target = _storage(job, data.get('storage_id'))
     m = _m()
+    # Seconds, not the ~15 min restic/wal-g spend retrying a storage that is down
+    problem = storage_precheck(target)
+    if problem:
+        raise RestoreError(f"Storage {target.get('name')} is not reachable: {problem}. Pick another storage or "
+                           'retry when it is back.', 'storage_unreachable')
     windows = _windows(job, engine, state)
     snapshots = []
     try:
