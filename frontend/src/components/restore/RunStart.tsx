@@ -18,7 +18,7 @@ interface RunStartProps {
   error: string | null;
   starting: boolean;
   onStart: () => void;
-  /** Scratch database restores: compare with production afterwards (reads production row counts). */
+  /** Scratch database restores: compare with production afterwards (reads production row counts; off by default). */
   compareProduction?: boolean;
   onCompareProductionChange?: (value: boolean) => void;
 }
@@ -72,17 +72,17 @@ export default function RunStart(props: RunStartProps) {
           <AlertDescription>{error}</AlertDescription>
         </Alert>
       )}
-      {target === "scratch" && plan?.plan && plan.plan.engine !== "files" && onCompareProductionChange && (
+      {target === "scratch" && (plan?.plan || planLoading) && plan?.plan?.engine !== "files" && onCompareProductionChange && (
         <div className="flex items-start gap-2">
           <Checkbox
             id="restore-compare-production"
-            checked={compareProduction ?? true}
+            checked={compareProduction ?? false}
             onCheckedChange={(v) => onCompareProductionChange(v === true)}
           />
           <div className="grid gap-1">
             <Label htmlFor="restore-compare-production">Compare row counts with production afterwards</Label>
             <p className="text-xs text-muted-foreground">
-              Runs read-only count queries on the production database. Untick to check the restored copy only.
+              Off by default: the restored copy is checked on its own. Tick to also run read-only count queries on the production database.
             </p>
           </div>
         </div>

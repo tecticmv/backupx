@@ -15,7 +15,7 @@ import StorageUsageChart from "@/components/dashboard/StorageUsageChart";
 import JobFormModal from "@/components/JobFormModal";
 import { useHealth, usePolledJson, useRunJob } from "@/hooks/useHealth";
 import { formatDateTime, formatRelative } from "@/lib/format";
-import type { DashboardOverview, JobCardData } from "@/types/health";
+import { jobBusy, type DashboardOverview, type JobCardData } from "@/types/health";
 
 type JobFilter = "all" | "issues" | "running";
 
@@ -50,12 +50,12 @@ export default function Dashboard() {
     () => ({
       all: jobs.length,
       issues: jobs.filter(hasProblems).length,
-      running: jobs.filter((j) => j.running).length,
+      running: jobs.filter(jobBusy).length,
     }),
     [jobs]
   );
   const visibleJobs = useMemo(() => {
-    const list = filter === "issues" ? jobs.filter(hasProblems) : filter === "running" ? jobs.filter((j) => j.running) : jobs;
+    const list = filter === "issues" ? jobs.filter(hasProblems) : filter === "running" ? jobs.filter(jobBusy) : jobs;
     // Problems first, then by name
     return [...list].sort((a, b) => Number(hasProblems(b)) - Number(hasProblems(a)) || a.name.localeCompare(b.name));
   }, [jobs, filter]);

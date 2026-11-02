@@ -85,7 +85,7 @@ export interface RestorePlanRequest {
   storage_id?: string | null;
   target: RestoreTarget;
   plan_hash?: string;
-  /** Scratch restores: also compare row counts with production afterwards (reads production). Default true. */
+  /** Scratch restores: also compare row counts with production afterwards (reads production). Default false. */
   compare_production?: boolean;
 }
 
@@ -116,6 +116,8 @@ export interface RestorePlan {
   where: string;
   steps: string[];
   warnings: string[];
+  /** Scratch database restores: whether the checks also read production row counts. */
+  compare_production?: boolean;
 }
 
 export interface PlanResponse {
@@ -128,6 +130,8 @@ export interface PlanResponse {
 export interface Verify {
   checked_at: string;
   phase: "scratch" | "after_replace";
+  /** False when production wasn't queried (copy-only counts); missing on checks made before this field. */
+  production?: boolean;
   tables: {
     name: string;
     prod_estimate: number | null;

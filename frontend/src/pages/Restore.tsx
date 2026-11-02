@@ -84,7 +84,8 @@ export default function Restore() {
   const [pointType, setPointType] = useState<PointType>(snapshotParam ? "snapshot" : "latest");
   const [timeMs, setTimeMs] = useState<number | null>(null);
   const [target, setTarget] = useState<RestoreTarget>("scratch");
-  const [compareProduction, setCompareProduction] = useState(true);
+  // Off by default: the checks read the restored copy only unless the admin opts in
+  const [compareProduction, setCompareProduction] = useState(false);
 
   // ---------- the loaded restore (polled while it runs) ----------
   const [restoreState, setRestoreState] = useState<{ id: string; data: RestoreRecord | null; error: string | null } | null>(null);
@@ -186,8 +187,10 @@ export default function Restore() {
       target_time: pointType === "time" ? (timeIso ?? undefined) : undefined,
       storage_id: storageId,
       target,
+      // Part of the plan (its steps and hash), so ticking the box re-plans
+      ...(target === "scratch" ? { compare_production: compareProduction } : {}),
     };
-  }, [jobId, points, isFiles, pointValid, useScript, pointType, snapshotParam, timeIso, storageId, target]);
+  }, [jobId, points, isFiles, pointValid, useScript, pointType, snapshotParam, timeIso, storageId, target, compareProduction]);
   const planKey = planRequest ? JSON.stringify(planRequest) : null;
 
   const [planState, setPlanState] = useState<{ key: string; data: PlanResponse | null; error: string | null } | null>(null);
@@ -242,7 +245,6 @@ export default function Restore() {
         ...planRequest,
         ...echo,
         plan_hash: plan.plan_hash,
-        ...(target === "scratch" ? { compare_production: compareProduction } : {}),
       });
       const data = (await response.json().catch(() => ({}))) as RestoreStartResponse;
       if (response.ok && data.task) {

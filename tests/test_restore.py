@@ -567,3 +567,76 @@ def test_local_scripts_run_with_secrets_only_in_env(world, monkeypatch):
     with pytest.raises(OSError):
         svc._popen_local('echo hi', {'RESTIC_PASSWORD': 'Restic-Secret-pw1'})
     assert seen['args'] == ['bash', '-s'] and seen['env']['RESTIC_PASSWORD'] == 'Restic-Secret-pw1'
+
+
+# =============================================================================
+# Production comparison is opt-in; dashboard counts drills and restores as running
+# =============================================================================
+
+def test_scratch_restore_does_not_compare_with_production_by_default(api, monkeypatch):
+    from app import restore_service as svc
+    monkeypatch.setattr(svc, '_free_bytes', lambda path: 10 ** 12)
+    data, res = _plan(api)
+    plan = res.get_json()
+    assert plan['plan']['compare_production'] is False
+    assert not any('production' in s and 'not queried' not in s for s in plan['plan']['steps'])
+    assert plan['plan']['steps'][-1] == 'Count rows in the restored copy (production not queried)'
+    out = api.post('/api/restores', json=dict(data, plan_hash=plan['plan_hash'])).get_json()
+    row = svc.get_row(out['restore']['id'])
+    assert json.loads(row['info'])['compare_production'] is False and not svc.compares_production(row)
+
+
+def test_scratch_restore_compares_with_production_when_ticked(api, monkeypatch):
+    from app import restore_service as svc
+    monkeypatch.setattr(svc, '_free_bytes', lambda path: 10 ** 12)
+    data, res = _plan(api, compare_production=True)
+    plan = res.get_json()
+    assert plan['plan']['compare_production'] is True
+    assert plan['plan']['steps'][-1] == 'Compare row counts with production'
+    # the choice is part of the reviewed plan: starting with the other choice is a changed plan
+    unticked = dict(data, compare_production=False, plan_hash=plan['plan_hash'])
+    assert api.post('/api/restores', json=unticked).get_json()['code'] == 'plan_changed'
+    out = api.post('/api/restores', json=dict(data, plan_hash=plan['plan_hash'])).get_json()
+    assert svc.compares_production(svc.get_row(out['restore']['id']))
+
+
+def test_only_an_explicit_true_turns_the_comparison_on():
+    from app import restore_service as svc
+    for value in (None, False, 'true', 1, 'yes'):
+        assert svc.wants_production_compare({'compare_production': value}) is False
+    assert svc.wants_production_compare({}) is False and svc.wants_production_compare(None) is False
+    assert svc.wants_production_compare({'compare_production': True}) is True
+
+
+def test_verify_line_for_copy_only_checks():
+    from app import restore_service as svc
+    line = svc._verify_line({'production': False, 'summary': {'tables': 7}, 'prod_error': 'not compared: x'})
+    assert line == 'Counted rows in 7 tables of the restored copy (production not queried)'
+    assert svc._verify_line({'production': True, 'summary': {'tables': 3}}).startswith('Compared 3 tables')
+
+
+def test_dashboard_counts_running_drills_and_restores(api, db):
+    from app import health_service as hs
+    from app import restore_service as svc
+    assert hs.job_activity().get('rxjob') is None
+    # a ready scratch copy is not running anything
+    _ready_restore(status='ready')
+    assert hs.job_activity().get('rxjob') is None
+    # a scratch restore a person started is running
+    running = _ready_restore(status='running')
+    assert hs.job_activity()['rxjob'] == ['restore']
+    svc.update_row(running['id'], status='removed')
+    # weekly drills: the drill copy counts while the drill task runs (also while it is 'ready' for checksums)
+    drill_row = _ready_restore(status='ready', info={'drill': 'A', 'compare_production': False})
+    assert hs.job_activity().get('rxjob') is None  # no drill task: a leftover copy, not a running drill
+    task, _ = tasks.enqueue('restore_drill_all', {'scheduled': True}, title='Weekly restore drills')
+    assert hs.job_activity()['rxjob'] == ['drill']
+    card = next(c for c in api.get('/api/dashboard/overview').get_json()['jobs'] if c['id'] == 'rxjob')
+    assert card['activity'] == ['drill'] and card['running'] is False
+    svc.update_row(drill_row['id'], status='removed')
+    assert hs.job_activity().get('rxjob') is None  # weekly task between jobs
+    # a per-job drill task counts for its job straight away
+    tasks.enqueue('restore_drill', {'job_id': 'rxfiles'}, title='Restore drill', resource_type='job',
+                  resource_id='rxfiles')
+    busy = hs.job_activity()
+    assert busy.get('rxfiles') == ['drill'] and busy.get('rxjob') is None

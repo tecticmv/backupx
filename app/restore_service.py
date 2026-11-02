@@ -463,6 +463,9 @@ def derive_plan(data, cfg=None):
     else:
         plan['where'] = (f"backupx server: scratch container (no published ports, removed after "
                          f"{cfg['ttl_hours']} h unless kept longer)")
+    if target_type == r.TARGET_SCRATCH and engine in r.DB_ENGINES:
+        # Off unless asked for: the default checks read the restored copy only, never production
+        plan['compare_production'] = wants_production_compare(data)
     plan['steps'] = _scratch_steps(plan)
     plan['summary'] = r.plan_summary(plan)
     if engine in r.DB_ENGINES and not shutil.which('docker') and target_type == r.TARGET_SCRATCH:
@@ -490,15 +493,22 @@ def _scratch_steps(plan):
     if m == 'files':
         return ['Restore the snapshot into a work directory in the backupx container',
                 'Copy it to the extract directory on the backupx server']
+    check = ('Compare row counts with production' if plan.get('compare_production')
+             else 'Count rows in the restored copy (production not queried)')
     if m == 'dump':
         return ['Fetch the dump from the snapshot', 'Start a scratch database container (no published ports)',
-                'Load the dump', 'Compare row counts with production']
+                'Load the dump', check]
     if m == 'binlog':
         return ['Fetch the anchored dump and the binlog segments', 'Decode the binlogs up to the target second',
                 'Start a scratch database container (no published ports)', 'Load the dump and replay the binlogs',
-                'Compare row counts with production']
+                check]
     return ['Fetch the WAL-G base backup', 'Start a scratch PostgreSQL container with recovery to the target time',
-            'Replay WAL and promote', 'Compare row counts with production']
+            'Replay WAL and promote', check]
+
+
+def wants_production_compare(data):
+    """A new scratch restore compares with production only when the request says so explicitly."""
+    return (data or {}).get('compare_production') is True
 
 
 def present(plan):
@@ -542,7 +552,7 @@ def start_restore(data, user=None, ip=None):
         'container': r.container_name(restore_id) if plan['engine'] in r.DB_ENGINES and kind == 'restore_scratch'
         else None,
         'plan': plan, 'info': ({'files_target': 'scratch'} if kind == 'restore_files_paths' else
-                               {'compare_production': (data or {}).get('compare_production', True) is not False}),
+                               {'compare_production': wants_production_compare(data)}),
         'status': r.S_RUNNING, 'created_by': user,
     })
     if kind == 'restore_files_paths':
@@ -837,8 +847,8 @@ def _scratch_files(ctx, row, plan, job, target, work):
 
 
 def compares_production(row):
-    """Whether a scratch restore's checks also read production row counts (default yes; per restore)."""
-    return _json(row.get('info'), {}).get('compare_production', True) is not False
+    """Whether a scratch restore's checks also read production row counts (only when asked for; per restore)."""
+    return _json(row.get('info'), {}).get('compare_production') is True
 
 
 def do_scratch(ctx, row, verify_production=True):
@@ -898,6 +908,8 @@ def do_scratch(ctx, row, verify_production=True):
 
 def _verify_line(verify):
     s = verify.get('summary') or {}
+    if verify.get('production') is False:
+        return f"Counted rows in {s.get('tables', 0)} tables of the restored copy (production not queried)"
     text = f"Compared {s.get('tables', 0)} tables"
     if s.get('key_tables'):
         text += f", {s['key_tables']} key tables ({s.get('key_mismatches', 0)} differ)"
@@ -1019,7 +1031,8 @@ def run_verify(row, phase='scratch', production=True):
     if phase == 'after_replace' and cfg['health_url']:
         health_url = check_health_url(cfg['health_url'])
     return {
-        'checked_at': r.iso(r.utcnow()), 'phase': phase, 'tables': rows, 'prod_error': prod_error,
+        'checked_at': r.iso(r.utcnow()), 'phase': phase, 'production': bool(production), 'tables': rows,
+        'prod_error': prod_error,
         'restored_error': (r_errors[0] if r_errors and not r_est else None),
         'check_sql': check, 'health_url': health_url,
         'summary': {'tables': len(rows), 'key_tables': len(key_tables),
@@ -1043,9 +1056,10 @@ def _task_verify(ctx):
         raise tasks.TaskError('This restore has no scratch database any more')
     job, *_rest = job_context(row['job_id'])
     ctx.add_secret(*_m()._job_secret_values(job))
-    ctx.step(1, 1, 'Comparing row counts')
     phase = 'after_replace' if row['status'] == r.S_REPLACED else 'scratch'
-    verify = run_verify(row, phase=phase, production=phase == 'after_replace' or compares_production(row))
+    production = phase == 'after_replace' or compares_production(row)
+    ctx.step(1, 1, 'Comparing row counts with production' if production else 'Counting rows in the restored copy')
+    verify = run_verify(row, phase=phase, production=production)
     update_row(row['id'], verify=verify)
     return {'message': _verify_line(verify), 'restore_id': row['id']}
 
@@ -1429,7 +1443,8 @@ def _task_undo(ctx):
                 'snapshot_id': pre['snapshot_id'], 'target_time': _naive(child_plan.get('target_time')),
                 'storage_id': pre['storage_id'], 'target_type': 'scratch', 'server': 'backupx',
                 'container': r.container_name(child_id), 'plan': child_plan,
-                'info': {'undo_of': orig['id'], 'databases': plan['production']['databases']},
+                'info': {'undo_of': orig['id'], 'databases': plan['production']['databases'],
+                         'compare_production': True},  # Undo replaces production anyway
                 'status': r.S_RUNNING, 'created_by': ctx.created_by})
             child = do_scratch(ctx, child)
             child_rplan = dict(plan, restore_id=child['id'],

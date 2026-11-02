@@ -1958,6 +1958,11 @@ def dashboard_overview(job_id=None):
     except Exception:
         pass
     tz_name = m.get_scheduler_timezone()
+    try:
+        busy = job_activity()
+    except Exception:
+        logger.debug('job activity lookup failed', exc_info=True)
+        busy = {}
     cards = []
     for jid, job in state['jobs'].items():
         latest = state['latest_results'].get(jid) or {}
@@ -1997,7 +2002,9 @@ def dashboard_overview(job_id=None):
         cards.append({
             'id': jid, 'name': job.get('name'), 'backup_type': job.get('backup_type') or 'filesystem',
             'server_name': server.get('name'), 'status': job.get('status') or 'never',
-            'running': job.get('status') == 'running', 'schedule_enabled': bool(job.get('schedule_enabled')),
+            'running': job.get('status') == 'running',
+            'activity': (['backup'] if job.get('status') == 'running' else []) + busy.get(jid, []),
+            'schedule_enabled': bool(job.get('schedule_enabled')),
             'schedule_cron': job.get('schedule_cron'), 'next_run': next_run,
             'last_run': _iso(job.get('last_run')), 'last_success': _iso(job.get('last_success')),
             'overdue_since': job.get('overdue_since'),
@@ -2029,6 +2036,42 @@ def dashboard_overview(job_id=None):
         events = [e for e in events if e.get('job_id') == job_id]
     return {'jobs': cards, 'activity': events, 'storage_usage': usage,
             'storage_usage_checked_at': _iso(checked)}
+
+
+RESTORE_BUSY_STATUSES = ('running', 'replacing', 'undoing')
+
+
+def job_activity():
+    """{job_id: ['drill' | 'restore', ...]}: what besides a backup is running for each job right now.
+
+    'drill' = a restore drill of the job is running (a per-job drill task, or the weekly drill task while it
+    has a copy of this job). 'restore' = a scratch restore / replace / undo started by a person is running
+    (the same restore tasks the activity timeline shows as running). Ready scratch copies don't count.
+    """
+    db = _db()
+    drill_tasks = db.fetchall("SELECT kind, resource_type, resource_id FROM tasks WHERE kind IN "
+                              "('restore_drill', 'restore_drill_all') AND status IN ('queued', 'running')")
+    out = {}
+
+    def add(jid, what):
+        if jid and what not in out.setdefault(jid, []):
+            out[jid].append(what)
+    for t in drill_tasks:
+        if t['kind'] == 'restore_drill' and t.get('resource_type') == 'job':
+            add(t['resource_id'], 'drill')
+    for row in db.fetchall("SELECT job_id, status, info FROM restores WHERE status IN ('running', 'ready', "
+                           "'replacing', 'undoing')"):
+        try:
+            info = json.loads(row.get('info') or '{}') if isinstance(row.get('info'), str) else (row.get('info') or {})
+        except ValueError:
+            info = {}
+        if info.get('drill'):
+            # drill copies stay 'ready' while their checksums run; only count them while a drill task runs
+            if drill_tasks:
+                add(row['job_id'], 'drill')
+        elif row['status'] in RESTORE_BUSY_STATUSES:
+            add(row['job_id'], 'restore')
+    return out
 
 
 def _drill_card(probe):

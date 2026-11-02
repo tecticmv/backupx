@@ -139,7 +139,10 @@ export interface JobCardData {
   backup_type: "filesystem" | "database";
   server_name: string | null;
   status: string;
+  /** A backup of this job is running (disables Run now). */
   running: boolean;
+  /** Everything running for this job: backup, restore drill, scratch restore / replace / undo. */
+  activity?: JobActivity[];
   schedule_enabled: boolean;
   schedule_cron: string | null;
   next_run: string | null;
@@ -216,4 +219,11 @@ export interface RunLog {
   storage_id?: string;
   content: string;
   truncated: boolean;
+}
+
+export type JobActivity = "backup" | "drill" | "restore";
+
+/** Whether anything runs for the job right now (what the dashboard's "Running" filter counts). */
+export function jobBusy(job: Pick<JobCardData, "running" | "activity">): boolean {
+  return job.running || (job.activity?.length ?? 0) > 0;
 }

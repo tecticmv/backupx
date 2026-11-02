@@ -16,8 +16,11 @@ function MatchBadge({ match }: { match: boolean | null }) {
   );
 }
 
-/** Row counts per table, production vs restored; key tables first, mismatches highlighted. */
-export default function VerifyTable({ tables }: { tables: Verify["tables"] }) {
+/**
+ * Row counts per table, production vs restored; key tables first, mismatches highlighted.
+ * copyOnly: production wasn't queried, so only the restored copy's counts are shown.
+ */
+export default function VerifyTable({ tables, copyOnly = false }: { tables: Verify["tables"]; copyOnly?: boolean }) {
   const rows = [...tables].sort((a, b) => {
     if (a.key !== b.key) return a.key ? -1 : 1;
     if ((a.match === false) !== (b.match === false)) return a.match === false ? -1 : 1;
@@ -32,11 +35,11 @@ export default function VerifyTable({ tables }: { tables: Verify["tables"] }) {
         <TableHeader>
           <TableRow>
             <TableHead>Table</TableHead>
-            <TableHead className="text-right">Prod (est.)</TableHead>
+            {!copyOnly && <TableHead className="text-right">Prod (est.)</TableHead>}
             <TableHead className="text-right">Restored (est.)</TableHead>
-            <TableHead className="text-right">Prod exact</TableHead>
+            {!copyOnly && <TableHead className="text-right">Prod exact</TableHead>}
             <TableHead className="text-right">Restored exact</TableHead>
-            <TableHead>Match</TableHead>
+            {!copyOnly && <TableHead>Match</TableHead>}
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -50,13 +53,15 @@ export default function VerifyTable({ tables }: { tables: Verify["tables"] }) {
                   </Badge>
                 )}
               </TableCell>
-              <TableCell className="text-right tabular-nums">{num(t.prod_estimate)}</TableCell>
+              {!copyOnly && <TableCell className="text-right tabular-nums">{num(t.prod_estimate)}</TableCell>}
               <TableCell className="text-right tabular-nums">{num(t.restored_estimate)}</TableCell>
-              <TableCell className="text-right tabular-nums">{num(t.prod_exact)}</TableCell>
+              {!copyOnly && <TableCell className="text-right tabular-nums">{num(t.prod_exact)}</TableCell>}
               <TableCell className="text-right tabular-nums">{num(t.restored_exact)}</TableCell>
-              <TableCell>
-                <MatchBadge match={t.match} />
-              </TableCell>
+              {!copyOnly && (
+                <TableCell>
+                  <MatchBadge match={t.match} />
+                </TableCell>
+              )}
             </TableRow>
           ))}
         </TableBody>

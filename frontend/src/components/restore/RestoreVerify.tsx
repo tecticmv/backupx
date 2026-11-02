@@ -35,6 +35,7 @@ import VerifyTable from "@/components/restore/VerifyTable";
 import { useTasks } from "@/hooks/useTasks";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import {
+  describeBase,
   describePoint,
   dumpRestore,
   extendRestore,
@@ -47,17 +48,27 @@ import type { Restore } from "@/types/restore";
 
 type Busy = "dump" | "verify" | "extend" | "remove" | null;
 
+/** "not compared: x" -> "Not compared: x." so it reads as a sentence before the next one. */
+function asSentence(text: string): string {
+  const t = text.trim();
+  if (!t) return t;
+  const capped = t.charAt(0).toUpperCase() + t.slice(1);
+  return /[.!?]$/.test(capped) ? capped : `${capped}.`;
+}
+
 interface RestoreVerifyProps {
   restore: Restore;
   onChanged: () => void;
 }
 
-/** Step 5: compare the restored copy with production, then keep / download / remove / replace production. */
+/** Step 5: check the restored copy (optionally against production), then keep / download / remove / replace production. */
 export default function RestoreVerify({ restore, onChanged }: RestoreVerifyProps) {
   const { track } = useTasks();
   const [busy, setBusy] = useState<Busy>(null);
   const [action, setAction] = useState<ProductionAction | null>(null);
   const verify = restore.verify;
+  // Copy-only checks: production wasn't queried (the default for scratch restores and drills)
+  const copyOnly = !!verify && (verify.production === false || !!verify.prod_error?.startsWith("not compared"));
   const isDb = restore.engine !== "files";
   const scratchUp = restore.status === "ready" || restore.status === "replaced" || restore.status === "undone";
   const gone = ["removed", "expired", "cancelled", "failed"].includes(restore.status);
@@ -121,6 +132,7 @@ export default function RestoreVerify({ restore, onChanged }: RestoreVerifyProps
             ) : (
               restore.plan?.where
             )}
+            {describeBase(restore) && ` · ${describeBase(restore)}`}
           </CardDescription>
           <CardAction>
             <RestoreStatusBadge status={restore.status} />
@@ -236,13 +248,17 @@ export default function RestoreVerify({ restore, onChanged }: RestoreVerifyProps
           <CardHeader>
             <CardTitle className="text-base">Checks</CardTitle>
             <CardDescription>
-              {verify
-                ? `${verify.phase === "after_replace" ? "After replacing production" : "Scratch copy vs production"} · checked ${formatRelative(verify.checked_at)} · ${verify.summary.tables} tables, ${verify.summary.key_tables} key, ${verify.summary.key_mismatches} key mismatches`
-                : "No checks yet."}
+              {!verify
+                ? "No checks yet."
+                : copyOnly
+                  ? `Restored copy only (production not queried) · checked ${formatRelative(verify.checked_at)} · rows counted in ${verify.summary.tables} tables`
+                  : `${verify.phase === "after_replace" ? "After replacing production" : "Scratch copy vs production"} · checked ${formatRelative(verify.checked_at)} · ${verify.summary.tables} tables, ${verify.summary.key_tables} key, ${verify.summary.key_mismatches} key mismatches`}
             </CardDescription>
             {verify && (
               <CardAction>
-                {verify.summary.key_mismatches === 0 ? (
+                {copyOnly ? (
+                  <Badge variant="outline">Copy only</Badge>
+                ) : verify.summary.key_mismatches === 0 ? (
                   <Badge variant="outline" className="border-emerald-500/50 text-emerald-600 dark:text-emerald-400">
                     <CheckCircle2 /> Key tables match
                   </Badge>
@@ -258,20 +274,18 @@ export default function RestoreVerify({ restore, onChanged }: RestoreVerifyProps
             {verify?.prod_error && (
               <Alert>
                 <AlertTriangle className="h-4 w-4" />
-                <AlertTitle>
-                  {verify.prod_error.startsWith("not compared") ? "Not compared with production" : "Production couldn't be queried"}
-                </AlertTitle>
+                <AlertTitle>{copyOnly ? "Not compared with production" : "Production couldn't be queried"}</AlertTitle>
                 <AlertDescription className="break-words">
-                  {verify.prod_error} The restored copy is still usable; only the comparison is missing.
+                  {asSentence(verify.prod_error)} The restored copy is still usable; only the comparison is missing.
                 </AlertDescription>
               </Alert>
             )}
-            {verify && <VerifyTable tables={verify.tables} />}
+            {verify && <VerifyTable tables={verify.tables} copyOnly={copyOnly} />}
             {verify?.check_sql && (
               <div className="space-y-2 rounded-md border p-3">
                 <div className="flex items-center justify-between">
                   <span className="font-medium">Check SQL</span>
-                  {verify.check_sql.match === null ? (
+                  {copyOnly ? null : verify.check_sql.match === null ? (
                     <Badge variant="outline">n/a</Badge>
                   ) : verify.check_sql.match ? (
                     <Badge variant="outline" className="border-emerald-500/50 text-emerald-600 dark:text-emerald-400">
@@ -282,13 +296,15 @@ export default function RestoreVerify({ restore, onChanged }: RestoreVerifyProps
                   )}
                 </div>
                 {verify.check_sql.error && <p className="text-destructive">{verify.check_sql.error}</p>}
-                <div className="grid gap-2 md:grid-cols-2">
-                  <div>
-                    <p className="text-xs text-muted-foreground">Production</p>
-                    <pre className="max-h-40 overflow-auto rounded bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap">
-                      {verify.check_sql.prod ?? "—"}
-                    </pre>
-                  </div>
+                <div className={copyOnly ? "grid gap-2" : "grid gap-2 md:grid-cols-2"}>
+                  {!copyOnly && (
+                    <div>
+                      <p className="text-xs text-muted-foreground">Production</p>
+                      <pre className="max-h-40 overflow-auto rounded bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap">
+                        {verify.check_sql.prod ?? "—"}
+                      </pre>
+                    </div>
+                  )}
                   <div>
                     <p className="text-xs text-muted-foreground">Restored</p>
                     <pre className="max-h-40 overflow-auto rounded bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap">

@@ -1,4 +1,4 @@
-import { useLocation } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { SidebarProvider, SidebarInset, SidebarTrigger } from "@/components/ui/sidebar";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -16,42 +16,55 @@ interface LayoutProps {
   children: React.ReactNode;
 }
 
+// Same labels as the sidebar
 const routeNames: Record<string, string> = {
   "/": "Dashboard",
   "/jobs": "Backup Jobs",
-  "/history": "History",
+  "/restore": "Restore",
+  "/history": "Run History",
   "/servers": "Servers",
   "/databases": "Databases",
-  "/storage": "S3 Storage",
+  "/storage": "Storage",
+  "/notifications": "Notifications",
+  "/audit": "Audit Log",
+  "/settings": "Settings",
 };
+
+interface Crumb {
+  path: string;
+  label: string;
+  isCurrentPage?: boolean;
+}
+
+/** Breadcrumbs for a path; every route in App.tsx gets a real title (never a generic "Page"). */
+function breadcrumbsFor(pathname: string): Crumb[] {
+  const path = pathname.length > 1 ? pathname.replace(/\/+$/, "") : pathname;
+  const jobs = { path: "/jobs", label: routeNames["/jobs"] };
+  const job = path.match(/^\/jobs\/([^/]+)/);
+  if (job) {
+    const jobPath = `/jobs/${job[1]}`;
+    const rest = path.slice(jobPath.length);
+    if (!rest) return [jobs, { path, label: "Job", isCurrentPage: true }];
+    const jobCrumb = { path: jobPath, label: "Job" };
+    if (rest === "/snapshots") return [jobs, jobCrumb, { path, label: "Snapshots", isCurrentPage: true }];
+    if (/^\/snapshots\/[^/]+\/files$/.test(rest)) {
+      return [jobs, jobCrumb, { path: `${jobPath}/snapshots`, label: "Snapshots" }, { path, label: "Files", isCurrentPage: true }];
+    }
+    if (rest === "/pitr-setup") return [jobs, jobCrumb, { path, label: "PITR setup", isCurrentPage: true }];
+  }
+  if (/^\/storage\/[^/]+\/browse$/.test(path)) {
+    return [{ path: "/storage", label: routeNames["/storage"] }, { path, label: "Browse", isCurrentPage: true }];
+  }
+  if (routeNames[path]) return [{ path, label: routeNames[path], isCurrentPage: true }];
+  // Unknown route: its top-level section, else the last path segment
+  const top = `/${path.split("/")[1] ?? ""}`;
+  const label = routeNames[top] ?? (path.split("/").filter(Boolean).pop() ?? "Dashboard");
+  return [{ path, label, isCurrentPage: true }];
+}
 
 export default function Layout({ children }: LayoutProps) {
   const location = useLocation();
-
-  const getBreadcrumbs = () => {
-    const path = location.pathname;
-
-    // Handle job snapshots routes
-    if (path.match(/\/jobs\/[^/]+\/snapshots/)) {
-      return [
-        { path: "/jobs", label: "Backup Jobs" },
-        { path: path, label: "Snapshots", isCurrentPage: true },
-      ];
-    }
-
-    // Job detail page
-    if (path.match(/^\/jobs\/[^/]+\/?$/)) {
-      return [
-        { path: "/jobs", label: "Backup Jobs" },
-        { path: path, label: "Job", isCurrentPage: true },
-      ];
-    }
-
-    const label = routeNames[path] || "Page";
-    return [{ path, label, isCurrentPage: true }];
-  };
-
-  const breadcrumbs = getBreadcrumbs();
+  const breadcrumbs = breadcrumbsFor(location.pathname);
 
   return (
     <SidebarProvider>
@@ -68,8 +81,8 @@ export default function Layout({ children }: LayoutProps) {
                   {crumb.isCurrentPage ? (
                     <BreadcrumbPage>{crumb.label}</BreadcrumbPage>
                   ) : (
-                    <BreadcrumbLink href={crumb.path}>
-                      {crumb.label}
+                    <BreadcrumbLink asChild>
+                      <Link to={crumb.path}>{crumb.label}</Link>
                     </BreadcrumbLink>
                   )}
                 </BreadcrumbItem>

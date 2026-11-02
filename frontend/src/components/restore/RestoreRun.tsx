@@ -7,7 +7,7 @@ import { TaskLog } from "@/components/TaskTray";
 import RestoreStatusBadge from "@/components/restore/RestoreStatusBadge";
 import { downloadTaskFile, useTasks } from "@/hooks/useTasks";
 import { formatDuration } from "@/lib/format";
-import { currentTask, describePoint } from "@/lib/restore";
+import { currentTask, describeBase, describePoint } from "@/lib/restore";
 import { isActiveTask } from "@/types/task";
 import type { Restore } from "@/types/restore";
 
@@ -32,6 +32,7 @@ export default function RestoreRun({ restore, onShowVerify }: RestoreRunProps) {
         </CardTitle>
         <CardDescription>
           {restore.job_name} · {describePoint(restore)} · {restore.target_type}
+          {describeBase(restore) && ` · ${describeBase(restore)}`}
         </CardDescription>
         <CardAction>
           <RestoreStatusBadge status={restore.status} />

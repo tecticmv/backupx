@@ -33,7 +33,7 @@ import { formatWindow } from "@/lib/pitr";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { SEVERITY_META } from "@/lib/health";
 import { cn } from "@/lib/utils";
-import type { JobCardData, JobCardStorage } from "@/types/health";
+import type { JobActivity, JobCardData, JobCardStorage } from "@/types/health";
 import type { PitrState } from "@/types/job";
 
 const STORAGE_STATUS: Record<string, { label: string; icon: typeof CheckCircle2; className: string }> = {
@@ -90,9 +90,25 @@ interface JobCardProps {
   onDetailPage?: boolean;
 }
 
+const ACTIVITY_TEXT: Record<JobActivity, string> = {
+  backup: "Backup running",
+  drill: "Restore drill running",
+  restore: "Restore running",
+};
+
+/** "Backup running, restore drill running" (null when nothing runs). */
+function activityText(activity: JobActivity[] | undefined, backupRunning: boolean): string | null {
+  const kinds = new Set<JobActivity>(activity ?? []);
+  if (backupRunning) kinds.add("backup");
+  const parts = [...kinds].map((k) => ACTIVITY_TEXT[k]);
+  if (!parts.length) return null;
+  return parts.map((p, i) => (i === 0 ? p : p.charAt(0).toLowerCase() + p.slice(1))).join(", ");
+}
+
 export default function JobCard({ job, onRun, onDetailPage = false }: JobCardProps) {
   const [starting, setStarting] = useState(false);
   const running = starting || job.running;
+  const busyText = activityText(job.activity, running);
   const issueTotal = job.issues.critical + job.issues.warning + job.issues.info;
   const worst = job.issues.critical ? "critical" : job.issues.warning ? "warning" : job.issues.info ? "info" : null;
 
@@ -127,7 +143,11 @@ export default function JobCard({ job, onRun, onDetailPage = false }: JobCardPro
               {job.name}
             </Link>
           )}
-          {running && <Loader2 className="h-4 w-4 shrink-0 animate-spin text-primary" aria-label="Running" />}
+          {busyText && (
+            <span title={busyText} className="inline-flex shrink-0">
+              <Loader2 className="h-4 w-4 animate-spin text-primary" aria-label={busyText} />
+            </span>
+          )}
         </CardTitle>
         <p className="truncate text-xs text-muted-foreground">{job.server_name ?? "No server"}</p>
         <CardAction>

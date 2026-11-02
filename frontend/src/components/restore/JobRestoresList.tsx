@@ -4,7 +4,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import RestoreStatusBadge from "@/components/restore/RestoreStatusBadge";
 import { usePolledJson } from "@/hooks/useHealth";
 import { formatRelative } from "@/lib/format";
-import { describePoint } from "@/lib/restore";
+import { describeBase, describePoint } from "@/lib/restore";
 import type { Restore } from "@/types/restore";
 
 /** This job's restores, newest first, each linking into the wizard. */
@@ -41,6 +41,7 @@ export default function JobRestoresList({ jobId }: { jobId: string }) {
                 {formatRelative(r.created_at)}
                 {r.created_by ? ` by ${r.created_by}` : ""}
                 {r.parent_id ? " · undo" : ""}
+                {describeBase(r) ? ` · ${describeBase(r)}` : ""}
               </p>
             </div>
             <RestoreStatusBadge status={r.status} />

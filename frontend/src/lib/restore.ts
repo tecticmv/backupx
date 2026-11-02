@@ -202,11 +202,21 @@ export function formatLocal(iso: string | null | undefined): string {
 }
 
 /** Short point description of a restore: "snapshot ab12cd34" / "2026-10-31 21:00:05 UTC". */
-export function describePoint(r: Pick<Restore, "point_type" | "snapshot_id" | "target_time">): string {
+type PointFields = Pick<Restore, "point_type" | "snapshot_id" | "target_time">;
+
+/** The restore point: its time for "latest" / exact-time restores, the snapshot for snapshot restores. */
+export function describePoint(r: PointFields): string {
   if (r.point_type === "time" && r.target_time) return formatUtc(r.target_time);
+  if (r.point_type === "latest" && r.target_time) return `latest · ${formatUtc(r.target_time)}`;
   if (r.snapshot_id) return `snapshot ${r.snapshot_id.slice(0, 8)}`;
   if (r.target_time) return formatUtc(r.target_time);
   return "latest";
+}
+
+/** Secondary info: the dump snapshot a "latest" / exact-time restore starts from (null otherwise). */
+export function describeBase(r: PointFields): string | null {
+  if (r.point_type === "snapshot" || !r.snapshot_id || !r.target_time) return null;
+  return `base snapshot ${r.snapshot_id.slice(0, 8)}`;
 }
 
 /** True when `iso` falls inside a restorable window (inclusive). */

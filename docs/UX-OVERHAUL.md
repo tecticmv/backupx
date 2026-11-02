@@ -692,9 +692,26 @@ Not enough disk (there or at any later plan) = drill *skipped* (history
 alert, no issue.
 
 Scratch restores started from the wizard take `compare_production` (default
-true; checkbox on the Start step): false = the Verify step counts rows in the
-copy only and never queries production (also for *Re-check*); kept in
-`restores.info.compare_production`.
+**false**; checkbox on the Start step, unticked by default). It is part of the
+plan (`plan.compare_production`, so its hash; ticking the box re-plans) and
+only an explicit `true` turns it on. Off = the plan's last step is "Count rows
+in the restored copy (production not queried)", the Verify step counts rows in
+the copy only and never queries production (also for *Re-check*), and the
+Checks card says "Restored copy only" with a "Copy only" badge and no
+production columns (verify JSON `production: false`). On = the old behaviour
+("Compare row counts with production", "Scratch copy vs production", key-table
+match). Kept in `restores.info.compare_production`; rows without the key count
+as off. Undo's internal scratch copy keeps comparing (it replaces production
+anyway).
+
+Dashboard "Running (N)" (and the Running filter) counts jobs with anything
+running: a backup (`running`), a restore drill (per-job `restore_drill` task,
+or a drill copy of the job while `restore_drill_all` runs), or a scratch
+restore / replace / undo a person started (restore row `running` /
+`replacing` / `undoing`, the restore tasks the activity timeline shows as
+running). Ready scratch copies are not running. Card field `activity`
+(`backup` / `drill` / `restore`, `health_service.job_activity()`); `running`
+stays backup-only (it disables Run now).
 
 ### Health hooks
 

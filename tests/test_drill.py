@@ -298,7 +298,8 @@ def test_drill_skips_without_scratch_disk(world, monkeypatch):
 
 def test_scratch_restore_can_skip_the_production_comparison(monkeypatch):
     from app import restore_service as svc
-    assert svc.compares_production({'info': '{}'})
+    assert not svc.compares_production({'info': '{}'})  # off unless asked for
+    assert svc.compares_production({'info': '{"compare_production": true}'})
     assert not svc.compares_production({'info': '{"compare_production": false}'})
     monkeypatch.setattr(svc, 'job_context', lambda jid: ({'id': jid}, {'databases': 'app'}, {'name': 's'},
                                                          r.ENGINE_MYSQL, {}))
