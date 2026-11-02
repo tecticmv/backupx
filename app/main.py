@@ -567,6 +567,12 @@ def _endpoint_scheme_error(endpoint, skip_ssl_verify):
     return {'error': message, 'error_kind': kind, 'suggested_endpoint': _toggle_endpoint_scheme(endpoint)}
 
 
+def bucket_missing_error(stderr):
+    """rclone's answer for a bucket that doesn't exist (lsd: "directory not found", S3: NoSuchBucket)."""
+    text = stderr or ''
+    return 'directory not found' in text or 'NoSuchBucket' in text
+
+
 def explain_rclone_error(stderr):
     """Turn rclone's S3 error output into a short, actionable message."""
     text = stderr or ''
@@ -574,7 +580,8 @@ def explain_rclone_error(stderr):
         ('InvalidAccessKeyId', 'The access key is not recognized by this endpoint.'),
         ('SignatureDoesNotMatch', 'The secret key is wrong for this access key.'),
         ('AccessDenied', 'Access denied. The credentials are valid but lack permission for this bucket.'),
-        ('NoSuchBucket', 'The bucket does not exist on this endpoint.'),
+        ('NoSuchBucket', 'The bucket does not exist on this endpoint (the first backup creates it if the key may).'),
+        ('directory not found', 'The bucket (or folder) does not exist on this endpoint yet.'),
         ('AuthorizationHeaderMalformed', 'The region does not match the bucket. Check the Region field.'),
         ('PermanentRedirect', 'The bucket lives in a different region or endpoint. Check the Region and Endpoint.'),
         ('server gave HTTP response to HTTPS client', 'The endpoint does not support HTTPS. Prefix it with http://.'),
@@ -2879,9 +2886,14 @@ def _stream_restic_progress(proc, job_id, timeout, target_names):
             files_new = msg.get('files_new', 0)
             files_changed = msg.get('files_changed', 0)
             duration = msg.get('total_duration', 0)
-            update_job_progress(job_id, 30 + int(((current or 0) + 1) * 60 / count),
-                label(f"Done: {_format_bytes(total)} processed, {_format_bytes(added)} added, "
-                      f"{files_new} new / {files_changed} changed files in {duration:.1f}s"))
+            done_text = (f"Done: {_format_bytes(total)} processed, {_format_bytes(added)} added, "
+                         f"{files_new} new / {files_changed} changed files in {duration:.1f}s")
+            update_job_progress(job_id, 30 + int(((current or 0) + 1) * 60 / count), label(done_text))
+            if current is not None and current < len(results):
+                # the per-storage log keeps restic's summary (a clean run printed nothing else)
+                results[current]['output'].append(
+                    f"snapshot {(msg.get('snapshot_id') or '?')[:8]} saved - {done_text[6:]}; "
+                    f"{msg.get('files_unmodified', 0)} unchanged, {msg.get('total_files_processed', 0)} files total")
 
         elif msg_type in ('error', 'exit_error'):
             # restic --json reports errors as JSON; keep them as readable text
@@ -5538,11 +5550,21 @@ def api_test_s3_connection():
             timeout=30
         )
 
+        scheme = 'HTTPS' if s3_endpoint_url(endpoint).startswith('https://') else 'plain HTTP'
         if result.returncode == 0:
-            scheme = 'HTTPS' if s3_endpoint_url(endpoint).startswith('https://') else 'plain HTTP'
             return jsonify({'success': True, 'message': f'Connection successful over {scheme}'})
-        else:
-            return jsonify({'error': explain_rclone_error(result.stderr), 'details': sanitize_error_message(result.stderr, 2000)}), 400
+        if bucket_missing_error(result.stderr):
+            # The credentials may still be fine: list the buckets to tell "no bucket yet" from a bad login
+            listing = subprocess.run(['rclone', 'lsd', 'test:'] + (['--no-check-certificate'] if skip_ssl_verify else []),
+                                     capture_output=True, text=True, env=env, timeout=30)
+            if listing.returncode == 0:
+                return jsonify({'success': True, 'bucket_missing': True,
+                                'message': (f'Connection successful over {scheme}. Bucket "{bucket}" does not exist '
+                                            'yet: it is created with the first backup (the access key needs '
+                                            'permission to create buckets; otherwise create it in the storage first).')})
+            return jsonify({'error': explain_rclone_error(listing.stderr),
+                            'details': sanitize_error_message(listing.stderr, 2000)}), 400
+        return jsonify({'error': explain_rclone_error(result.stderr), 'details': sanitize_error_message(result.stderr, 2000)}), 400
 
     except subprocess.TimeoutExpired:
         return jsonify({'error': 'The endpoint accepted the connection but did not answer S3 requests within 30 seconds'}), 400

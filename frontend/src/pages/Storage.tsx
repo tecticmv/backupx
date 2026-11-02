@@ -197,7 +197,11 @@ export default function Storage() {
         throw new Error(data.error || "Connection test failed");
       }
 
-      toast.success(data.message || "S3 connection successful!");
+      if (data.bucket_missing) {
+        toast.warning(data.message, { duration: 10000 });
+      } else {
+        toast.success(data.message || "S3 connection successful!");
+      }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Connection test failed");
     } finally {

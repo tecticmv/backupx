@@ -692,3 +692,15 @@ def test_compare_shows_exact_counts_without_judging_non_key_tables():
     rows = r.compare({'shop.products': 0}, {'shop.products': 0}, [], {'shop.products': 1000},
                      {'shop.products': 1000})
     assert rows[0]['restored_exact'] == 1000 and rows[0]['match'] is None and not rows[0]['key']
+
+
+# ---------------------------------------------------------------------------
+# Minor: missing bucket is explained; a clean run keeps restic's summary in its log
+# ---------------------------------------------------------------------------
+
+def test_missing_bucket_is_explained():
+    import app.main as main
+    err = '2026/11/02 14:00:00 ERROR : : error listing: directory not found\nFailed to lsd: directory not found'
+    assert main.bucket_missing_error(err)
+    assert 'does not exist' in main.explain_rclone_error(err)
+    assert not main.bucket_missing_error('SignatureDoesNotMatch')

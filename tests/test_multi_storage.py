@@ -72,6 +72,8 @@ def test_partial_failure_is_reported_per_storage(recorded):
     assert results[0]['exit_code'] == 0
     assert results[1]['exit_code'] == 1
     assert any('unable to open repository' in line for line in results[1]['output'])
+    # a clean storage keeps restic's summary in its log (was "(empty log)")
+    assert any(line.startswith('snapshot ') and '1 new / 0 changed files' in line for line in results[0]['output'])
 
     ok, message = main._finish_backup('job1', JOB, targets, main.utc_now(), returncode, stderr_text,
                                       preamble, results, 'Backup')
