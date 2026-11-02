@@ -128,7 +128,7 @@ export default function JobCard({ job, onRun, onDetailPage = false }: JobCardPro
     : null;
 
   return (
-    <Card className={cn("gap-4", worst && `border-l-4 ${SEVERITY_META[worst].border}`)}>
+    <Card className={cn("min-w-0 gap-4", worst && `border-l-4 ${SEVERITY_META[worst].border}`)}>
       <CardHeader className="gap-1">
         <CardTitle className="flex min-w-0 items-center gap-2 text-base">
           {job.backup_type === "database" ? (
@@ -220,7 +220,7 @@ export default function JobCard({ job, onRun, onDetailPage = false }: JobCardPro
         </dl>
       </CardContent>
 
-      <CardFooter className="mt-auto gap-2">
+      <CardFooter className="mt-auto flex-wrap gap-2">
         <Button size="sm" variant="outline" onClick={() => run()} disabled={running}>
           {running ? <Loader2 className="animate-spin" /> : <Play />}
           Run now
@@ -250,7 +250,7 @@ export default function JobCard({ job, onRun, onDetailPage = false }: JobCardPro
               <MoreHorizontal />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
+          <DropdownMenuContent align="end" collisionPadding={16} className="max-w-[calc(100vw-2rem)]">
             {!onDetailPage && (
               <DropdownMenuItem asChild>
                 <Link to={`/jobs/${job.id}`}>
