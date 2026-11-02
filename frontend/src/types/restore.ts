@@ -144,7 +144,14 @@ export interface Verify {
   prod_error: string | null;
   check_sql: { prod: string | null; restored: string | null; match: boolean | null; error: string | null } | null;
   health_url: { url: string; status: number | null; ok: boolean; error: string | null } | null;
-  summary: { tables: number; key_tables: number; key_mismatches: number };
+  summary: {
+    tables: number;
+    key_tables: number;
+    key_mismatches: number;
+    /** tables counted exactly (key tables + small MySQL/MariaDB tables); missing on older checks */
+    exact_tables?: number;
+    exact_max_rows?: number | null;
+  };
 }
 
 export interface Restore {

@@ -646,3 +646,49 @@ def test_storage_precheck_fast_failures():
                                      'bucket': 'b'}, 3) is None
     finally:
         up.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# B9: verify counts small MySQL/MariaDB tables exactly; production never gets ANALYZE
+# ---------------------------------------------------------------------------
+
+def test_verify_bodies_exact_small_tables_and_read_only_production():
+    import inspect
+    from app import restore_scripts as rs, restore_service as svc
+    from tests.test_prod_safety import _read_only
+    for engine in (r.ENGINE_MYSQL, r.ENGINE_MARIADB):
+        prod = rs.verify_body(engine, ['shop'], ['shop.orders'], '', analyze=False, exact_max_rows=200000)
+        assert 'ANALYZE' not in prod and 'COALESCE(table_rows, 0) <= 200000' in prod and 'run_sql "exact:$s.$t"' in prod
+        _read_only(prod, 'verify (prod, exact small tables)')
+        scratch = rs.verify_body(engine, ['shop'], [], '', analyze=True, exact_max_rows=200000)
+        assert 'ANALYZE LOCAL TABLE' in scratch
+    src = inspect.getsource(svc.run_verify)
+    assert 'prod_sql(job, db_config, server, prod_body)' in src and 'analyze=False' in src
+
+
+@pytest.mark.skipif(not _bash(), reason='needs bash')
+def test_verify_exact_loop_counts_small_tables_and_skips_key_tables():
+    from app import restore_scripts as rs
+    body = rs.verify_body(r.ENGINE_MARIADB, ['shop'], ['shop.orders'], '', analyze=False, exact_max_rows=10)
+    # fake bxsql: the "small tables" query returns two tables; COUNT(*) returns 1000
+    fake = r'''
+bxsql() {
+    q=$(cat)
+    case "$q" in
+        *"<= 10 ORDER BY"*) printf 'shop\tproducts\nshop\torders\n' ;;
+        *"COUNT(*)"*) echo 1000 ;;
+        *) printf 'shop\tproducts\t0\nshop\torders\t5\n' ;;
+    esac
+}
+'''
+    out = subprocess.run(['bash', '-c', rs.PREAMBLE + fake + body], capture_output=True, text=True).stdout
+    marked = r.parse_marked_output(out)
+    assert marked['exact:shop.products'] == (0, ['1000'])
+    assert 'exact:shop.orders' in marked  # the key table, counted once by its own statement
+    assert list(marked).count('exact:shop.orders') == 1
+
+
+def test_compare_shows_exact_counts_without_judging_non_key_tables():
+    rows = r.compare({'shop.products': 0}, {'shop.products': 0}, [], {'shop.products': 1000},
+                     {'shop.products': 1000})
+    assert rows[0]['restored_exact'] == 1000 and rows[0]['match'] is None and not rows[0]['key']

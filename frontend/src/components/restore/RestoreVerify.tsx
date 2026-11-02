@@ -258,6 +258,10 @@ export default function RestoreVerify({ restore, onChanged }: RestoreVerifyProps
               <CardAction>
                 {copyOnly ? (
                   <Badge variant="outline">Copy only</Badge>
+                ) : verify.summary.key_tables === 0 ? (
+                  <Badge variant="outline" className="text-muted-foreground">
+                    <AlertTriangle /> No key tables to compare
+                  </Badge>
                 ) : verify.summary.key_mismatches === 0 ? (
                   <Badge variant="outline" className="border-emerald-500/50 text-emerald-600 dark:text-emerald-400">
                     <CheckCircle2 /> Key tables match
@@ -280,7 +284,20 @@ export default function RestoreVerify({ restore, onChanged }: RestoreVerifyProps
                 </AlertDescription>
               </Alert>
             )}
+            {verify && !copyOnly && verify.summary.key_tables === 0 && (
+              <p className="text-muted-foreground">
+                No key tables are configured, so nothing was judged as matching or not: the counts below are
+                for information. Set key tables (below) to compare their exact row counts with production.
+              </p>
+            )}
             {verify && <VerifyTable tables={verify.tables} copyOnly={copyOnly} />}
+            {verify && (
+              <p className="text-xs text-muted-foreground">
+                est. = the database's own row estimate (statistics; can be far off, especially right after a
+                load). Exact = COUNT(*): key tables
+                {verify.summary.exact_max_rows ? `, and tables estimated under ${verify.summary.exact_max_rows.toLocaleString()} rows` : ""}.
+              </p>
+            )}
             {verify?.check_sql && (
               <div className="space-y-2 rounded-md border p-3">
                 <div className="flex items-center justify-between">

@@ -348,10 +348,15 @@ def _pg_ident(name):
     return '"' + name.replace('"', '""') + '"'
 
 
-def verify_body(engine, databases, key_tables, check_sql='', analyze=False):
-    """Statements printing estimates (est), exact counts of key tables (exact:<name>) and the check (check).
+def verify_body(engine, databases, key_tables, check_sql='', analyze=False, exact_max_rows=None, exact_limit=300):
+    """Statements printing estimates (est), exact counts (exact:<name>) and the check (check).
 
     databases: the databases to compare ([] = all non-system ones).
+    analyze: refresh the statistics first - ONLY for the scratch copy (it writes statistics),
+      never for production.
+    exact_max_rows: MySQL/MariaDB also count small tables exactly (estimated at most this many
+      rows, at most exact_limit tables): InnoDB's estimates are often far off for small tables
+      (0 for a 1000-row table right after a load). Key tables are always counted.
     """
     lines = [RUN_SQL]
     if engine == r.ENGINE_POSTGRES:
@@ -382,7 +387,30 @@ def verify_body(engine, databases, key_tables, check_sql='', analyze=False):
     if engine == r.ENGINE_MYSQL:
         # MySQL 8 caches information_schema statistics for a day by default
         est = 'SET SESSION information_schema_stats_expiry = 0; ' + est
+    tables_sql = ("SELECT table_schema, table_name FROM information_schema.tables "
+                  f"WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ({where})")
+    if databases:
+        tables_sql += ' AND table_schema IN (' + ', '.join(_sql_lit(d) for d in databases) + ')'
+    if analyze:
+        # scratch copy only: fresh InnoDB statistics before estimating
+        lines.append(f'''printf '%s\\n' {q(tables_sql)} | bxsql "" 2>/dev/null | head -n {int(exact_limit) * 10} | \\
+    while IFS="$TAB" read -r s t; do
+        [ -n "$t" ] || continue
+        printf 'ANALYZE LOCAL TABLE `%s`.`%s`\\n' "$(printf '%s' "$s" | sed 's/`/``/g')" "$(printf '%s' "$t" | sed 's/`/``/g')" \\
+            | bxsql "" >/dev/null 2>&1
+    done''')
     lines.append(f'run_sql est "" {q(est)}')
+    if exact_max_rows:
+        small = (('SET SESSION information_schema_stats_expiry = 0; ' if engine == r.ENGINE_MYSQL else '')
+                 + tables_sql + f' AND COALESCE(table_rows, 0) <= {int(exact_max_rows)} ORDER BY 1, 2'
+                 + f' LIMIT {int(exact_limit)}')
+        keys = ' '.join(q(k) for k in key_tables)
+        lines.append(f'''BX_KEYS=" {keys} "
+printf '%s\\n' {q(small)} | bxsql "" 2>/dev/null | while IFS="$TAB" read -r s t; do
+    [ -n "$t" ] || continue
+    case "$BX_KEYS" in *" $s.$t "*) continue ;; esac
+    run_sql "exact:$s.$t" "" "SELECT COUNT(*) FROM \\`$(printf '%s' "$s" | sed 's/`/``/g')\\`.\\`$(printf '%s' "$t" | sed 's/`/``/g')\\`"
+done''')
     lines.append(f'run_sql dbs "" {q("SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN (" + where + ")")}')
     for name in key_tables:
         db, table = name.split('.', 1)

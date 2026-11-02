@@ -952,6 +952,8 @@ def _verify_line(verify):
     text = f"Compared {s.get('tables', 0)} tables"
     if s.get('key_tables'):
         text += f", {s['key_tables']} key tables ({s.get('key_mismatches', 0)} differ)"
+    else:
+        text += ', no key tables configured (counts for information only)'
     if verify.get('prod_error'):
         text += f"; production not queried: {verify['prod_error']}"
     return text
@@ -1032,7 +1034,12 @@ def run_verify(row, phase='scratch', production=True):
     cfg = verify_config(job, engine)
     key_tables, _bad = r.normalize_key_tables(cfg['key_tables'], engine)
     databases = r.configured_databases(db_config)
-    body = rs.verify_body(engine, databases, key_tables, cfg['check_sql'], analyze=(phase == 'scratch'))
+    exact_max = r.settings()['verify_exact_max_rows']
+    # The copy may refresh its statistics (ANALYZE); production only ever gets reads
+    body = rs.verify_body(engine, databases, key_tables, cfg['check_sql'], analyze=True,
+                          exact_max_rows=exact_max)
+    prod_body = rs.verify_body(engine, databases, key_tables, cfg['check_sql'], analyze=False,
+                               exact_max_rows=exact_max)
     local = capture_local(rs.PREAMBLE + rs.scratch_runner(engine, row['container'], info.get('superuser') or 'postgres')
                           + body, timeout=900)
     r_est, r_exact, r_check, r_errors, r_dbs = _parse_verify(r.parse_marked_output(local.stdout), engine)
@@ -1043,7 +1050,7 @@ def run_verify(row, phase='scratch', production=True):
     try:
         if not production:
             raise _NotQueried()
-        res = prod_sql(job, db_config, server, body)
+        res = prod_sql(job, db_config, server, prod_body)
         p_est, p_exact, p_check, p_errors, _ = _parse_verify(r.parse_marked_output(res.stdout), engine)
         if res.returncode != 0 and not p_est:
             prod_error = _m().sanitize_error_message((res.stderr or res.stdout or '').strip()[-300:] or
@@ -1075,7 +1082,9 @@ def run_verify(row, phase='scratch', production=True):
         'restored_error': (r_errors[0] if r_errors and not r_est else None),
         'check_sql': check, 'health_url': health_url,
         'summary': {'tables': len(rows), 'key_tables': len(key_tables),
-                    'key_mismatches': len([x for x in rows if x['key'] and x['match'] is False])},
+                    'key_mismatches': len([x for x in rows if x['key'] and x['match'] is False]),
+                    'exact_tables': len([x for x in rows if x.get('restored_exact') is not None]),
+                    'exact_max_rows': exact_max if engine != r.ENGINE_POSTGRES else None},
     }
 
 

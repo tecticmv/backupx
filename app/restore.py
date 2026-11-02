@@ -89,6 +89,8 @@ def settings():
         'helper_image': os.environ.get('RESTORE_HELPER_IMAGE', 'busybox:1.36').strip(),
         'host_files_dir': os.environ.get('RESTORE_HOST_FILES_DIR', '/var/tmp/backupx-restore').rstrip('/'),
         'timeout': max(600, _env_int('RESTORE_TIMEOUT', 6 * 3600)),
+        # Verify: MySQL/MariaDB tables estimated at most this many rows are also counted exactly
+        'verify_exact_max_rows': max(0, _env_int('RESTORE_VERIFY_EXACT_MAX_ROWS', 200000)),
         'cleanup_minutes': max(1, _env_int('RESTORE_CLEANUP_MINUTES', 10)),
         'ready_timeout': max(60, _env_int('RESTORE_READY_TIMEOUT', 900)),
         'import_rate': max(1, _env_int('RESTORE_IMPORT_MB_PER_S', 10)),
