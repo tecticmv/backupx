@@ -410,6 +410,10 @@ def _mysql_tick(job_id, job, server, db_config, targets, force=False):
     info = _json(state.get('info'), {})
     if not scan['now']:
         scan['now'] = int(now.timestamp())
+    # The streamer's own facts are fresh even if shipping fails below: keep them, so a storage that
+    # is down reads as "shipping failing", not as a stalled streamer (old heartbeat vs new tick time)
+    save_state(job_id, streamer_active=scan['active'] or None,
+               heartbeat=_ts(scan['heartbeat']) if scan['heartbeat'] else state.get('heartbeat'))
     progress = pitr.stream_progress(info, scan, state, in_sync, cfg['heartbeat_max_age'])
     in_sync = progress['in_sync']
     notice = None

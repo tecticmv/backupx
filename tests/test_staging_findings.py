@@ -720,3 +720,46 @@ def test_pg_lsn_and_drill_reference_uses_the_base_end_lsn(monkeypatch):
     latest, ref = ds._reference(Svc, 'db-pg10')
     assert ref == {'method': 'walg', 'base_backup': 'base_000000010000000000000003',
                    'time': '2026-11-02T18:15:35+00:00', 'lsn': '0/3000138'}
+
+
+def test_ship_failure_keeps_the_streamer_facts_fresh(monkeypatch):
+    """Staging: with one storage down the old heartbeat aged against the new tick time and the
+    issue read "binlog streamer stopped". The tick now stores the scan's heartbeat before shipping."""
+    from app import pitr_service as ps
+    import app.main as main
+    now = int(T0.timestamp())
+    rows = {'kind': 'mysql', 'chain_id': 1, 'server_uuid': UUID, 'binlog_base': 'mysql-bin', 'last_seq': 3,
+            'heartbeat': T0 - timedelta(minutes=20), 'last_tick_at': T0 - timedelta(minutes=2), 'info': '{}',
+            'consecutive_failures': 2, 'state': 'ok'}
+    monkeypatch.setattr(ps, 'load_state', lambda job_id: dict(rows))
+    monkeypatch.setattr(ps, 'save_state', lambda job_id, **kw: rows.update(kw))
+    monkeypatch.setattr(ps, '_now', lambda: T0)
+    monkeypatch.setattr(ps, '_forget_orphans', lambda *a: None)
+    monkeypatch.setattr(main, 'ensure_restic_installed', lambda *a, **k: (True, 'ok'))
+    monkeypatch.setattr(main, '_restic_target_blocks', lambda *a: '')
+    monkeypatch.setattr(main, 'get_job', lambda job_id: None)
+    scan = '\n'.join([f'PITR\tNOW\t{now}', 'PITR\tACTIVE\tactive', f'PITR\tUUID\t{UUID}',
+                      f'PITR\tHEARTBEAT\t{now - 30}', f'PITR\tFILE\tmysql-bin.000004\t5000\t{now - 10}',
+                      f'PITR\tFILE\tmysql-bin.000005\t300\t{now}'])
+    ship = '\n'.join(['{"message_type":"backupx_target","index":0}', '{"message_type":"backupx_target_done","index":0,"exit_code":0}',
+                      '{"message_type":"backupx_target","index":1}', 'Fatal: unable to open config file: dial tcp: lookup minio2',
+                      '{"message_type":"backupx_target_done","index":1,"exit_code":1}'])
+
+    def fake_run(server, script, timeout):
+        if 'pitr_ship()' in script:
+            return subprocess.CompletedProcess([], 1, ship, '')
+        return subprocess.CompletedProcess([], 0, scan, '')
+    monkeypatch.setattr(ps, '_run', fake_run)
+    job = {'id': 'koha', 'name': 'Koha', 'pitr_enabled': True, 'restic_password': 'x', 'pitr_interval': 2}
+    targets = [dict(TARGET), dict(TARGET, id='st2', name='MinIO 2')]
+    with pytest.raises(ps.ShipError) as e:
+        ps._mysql_tick('koha', job, dict(SERVER), {'username': 'u'}, targets)
+    assert e.value.storages == ['MinIO 2'] and pitr._utc(rows['heartbeat']) == pitr._utc(now - 30)
+    ps._record_failure('koha', str(e.value), storages=e.value.storages)
+    state = base_state()
+    state['jobs']['j1'].update(pitr_enabled=True, backup_type='database', pitr_interval=2)
+    state['now'] = T0 + timedelta(seconds=5)
+    ps_row = dict(rows, info=json.loads(rows['info']))
+    state['pitr'] = {'j1': ps_row}
+    [issue] = [i for i in health.detect(state) if i.family.startswith('pitr')]
+    assert issue.kind == 'pitr_ship_failing' and 'MinIO 2' in issue.title
