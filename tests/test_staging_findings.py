@@ -773,3 +773,23 @@ def test_archiver_health_after_a_base_backup_history_file():
     assert h['pending'] == 1 and not h['idle']
     h = pitr.walg_archiver_health(dict(facts, current_wal_file='00000001000000000000000F'))
     assert h['idle'] and h['pending'] == 0
+
+
+def test_snapshot_point_refetches_a_stale_per_worker_cache(monkeypatch):
+    """Staging: Undo failed "Snapshot not found on this storage" - the pre-restore snapshot was made in
+    another gunicorn worker, this worker's 60 s snapshot cache didn't have it yet."""
+    from app import restore_service as svc
+    import app.main as main
+    lists = [[{'id': 'old1', 'time': '2026-11-02T20:00:00Z', 'paths': ['/tmp/x/db.sql.gz']}],
+             [{'id': 'old1', 'time': '2026-11-02T20:00:00Z', 'paths': ['/tmp/x/db.sql.gz']},
+              {'id': 'pre1', 'time': '2026-11-02T22:52:00Z', 'paths': ['/tmp/y/db.sql.gz'], 'tags': ['pre-restore']}]]
+    calls = []
+    monkeypatch.setattr(main, 'get_snapshots', lambda job, target: calls.append(1) or lists[min(len(calls) - 1, 1)])
+    monkeypatch.setattr(main, 'invalidate_snapshot_cache', lambda job_id: calls.append('inv'))
+    monkeypatch.setattr(svc, 'storage_precheck', lambda target, timeout=8: None)
+    monkeypatch.setattr(svc, 'job_context', lambda jid: ({'id': jid, 'name': 'J', 'backup_type': 'database'},
+                                                         {'type': 'mysql'}, {}, r.ENGINE_MYSQL, {}))
+    monkeypatch.setattr(svc, '_storage', lambda job, sid: {'id': 's1', 'name': 'stg-minio-a'})
+    monkeypatch.setattr(svc, '_windows', lambda job, engine, state: [])
+    plan, _err = svc.derive_plan({'job_id': 'j', 'point_type': 'snapshot', 'snapshot_id': 'pre1', 'target': 'scratch'})
+    assert plan['dump']['snapshot_id'] == 'pre1' and 'inv' in calls

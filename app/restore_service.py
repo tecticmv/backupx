@@ -369,6 +369,16 @@ def derive_plan(data, cfg=None):
     method, snap, target_time = None, None, None
     if point_type == r.POINT_SNAPSHOT:
         snap = _find_snapshot(snapshots, data.get('snapshot_id') or '')
+        if not snap and data.get('snapshot_id'):
+            # The snapshot list is cached per gunicorn worker (60 s): a snapshot another worker just
+            # made (the pre-restore backup an Undo restores) isn't in this worker's copy yet
+            m.invalidate_snapshot_cache(job_id)
+            try:
+                snapshots = m.get_snapshots(job, target)
+            except Exception as e:
+                raise RestoreError(f"Can't list snapshots on {target['name']}: {m.sanitize_error_message(str(e))}",
+                                   'not_restorable')
+            snap = _find_snapshot(snapshots, data['snapshot_id'])
         if not snap:
             raise RestoreError('Snapshot not found on this storage', 'not_restorable')
         method = 'files' if engine == r.ENGINE_FILES else 'dump'
