@@ -364,19 +364,37 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # Input Validation
 # =============================================================================
 
+_HOST_LABEL = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$')
+
+
 def validate_hostname(hostname: str) -> bool:
-    """Validate hostname or IP address"""
-    if not hostname or len(hostname) > 255:
+    """A host name (RFC 1123: labels of letters, digits and inner hyphens, e.g. it-ali-mac,
+    bxstg-maria106, db01.lan) or an IPv4/IPv6 address. Never starts with '-' (it becomes an ssh
+    argument)."""
+    import ipaddress
+    if not hostname or not isinstance(hostname, str) or len(hostname) > 253:
         return False
-    # Allow IPv4, IPv6, or valid hostname
-    hostname_pattern = re.compile(
-        r'^('
-        r'([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z]{2,}|'  # hostname
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|'  # IPv4
-        r'\[?[a-fA-F0-9:]+\]?'  # IPv6
-        r')$'
-    )
-    return bool(hostname_pattern.match(hostname))
+    text = hostname.strip()
+    if text != hostname or not text:
+        return False
+    try:
+        ipaddress.ip_address(text[1:-1] if text.startswith('[') and text.endswith(']') else text)
+        return True
+    except ValueError:
+        pass
+    name = text[:-1] if text.endswith('.') else text
+    labels = name.split('.')
+    if not all(_HOST_LABEL.match(label) for label in labels):
+        return False
+    # all-numeric dotted names must be real IPv4 addresses (999.1.1.1 is not a host name)
+    return not all(label.isdigit() for label in labels)
+
+
+def server_name_taken(name, exclude_id=None):
+    """Another server already has this name (case-insensitive, trimmed)."""
+    wanted = (name or '').strip().lower()
+    return any((s.get('name') or '').strip().lower() == wanted and s.get('id') != exclude_id
+               for s in load_servers())
 
 
 def validate_port(port: int) -> bool:
@@ -5726,6 +5744,8 @@ def api_create_server_route():
     # Validate hostname
     if not validate_hostname(data['host']):
         return jsonify({'error': 'Invalid hostname or IP address'}), 400
+    if server_name_taken(data['name']):
+        return jsonify({'error': f"A server named {data['name'].strip()} exists already"}), 400
 
     if not data.get('ssh_user'):
         return jsonify({'error': 'ssh_user is required'}), 400
@@ -5817,6 +5837,15 @@ def api_update_server_route(server_id):
     if not server:
         return jsonify({'error': 'Server not found'}), 404
 
+    if 'host' in data and not validate_hostname(data.get('host')):
+        return jsonify({'error': 'Invalid hostname or IP address'}), 400
+    if 'name' in data:
+        if not (data.get('name') or '').strip():
+            return jsonify({'error': 'name is required'}), 400
+        if server_name_taken(data['name'], exclude_id=server_id):
+            return jsonify({'error': f"A server named {data['name'].strip()} exists already"}), 400
+    if 'ssh_port' in data and not validate_port(int(data.get('ssh_port') or 0)):
+        return jsonify({'error': 'Invalid SSH port (must be 1-65535)'}), 400
     server['name'] = data.get('name', server['name'])
     server['host'] = data.get('host', server['host'])
     server['status'] = data.get('status', server.get('status', 'active'))

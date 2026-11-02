@@ -578,3 +578,25 @@ def test_docker_mysql_exec_passes_login_on_stdin(tmp_path):
     assert 'SECRET' not in argv_line and '--all-databases' in argv_line
     assert 'MODE: 600' in out and 'user="root"' in out
     assert 'password="' + secret.replace('\\', '\\\\').replace('"', '\\"') + '"' in out
+
+
+# ---------------------------------------------------------------------------
+# B10: RFC 1123 host names; no duplicate server names
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('host,ok', [
+    ('bxstg-maria106', True), ('it-ali-mac', True), ('db01', True), ('db01.lan', True), ('localhost', True),
+    ('10.231.0.7', True), ('2001:db8::1', True), ('[2001:db8::1]', True), ('a.b-c.example.com.', True),
+    ('-oProxyCommand=x', False), ('host-', False), ('ho_st', False), ('999.1.1.1', False), ('a..b', False),
+    (' host', False), ('a' * 64, False), ('', False), (None, False)])
+def test_validate_hostname_rfc1123(host, ok):
+    from app.main import validate_hostname
+    assert validate_hostname(host) is ok
+
+
+def test_server_name_must_be_unique(monkeypatch):
+    import app.main as main
+    monkeypatch.setattr(main, 'load_servers', lambda: [{'id': 's1', 'name': 'bxstg-maria106'}])
+    assert main.server_name_taken(' BXSTG-maria106 ')
+    assert not main.server_name_taken('bxstg-maria106', exclude_id='s1')
+    assert not main.server_name_taken('it-ali-mac')
