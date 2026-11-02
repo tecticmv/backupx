@@ -640,3 +640,12 @@ def test_dashboard_counts_running_drills_and_restores(api, db):
                   resource_id='rxfiles')
     busy = hs.job_activity()
     assert busy.get('rxfiles') == ['drill'] and busy.get('rxjob') is None
+
+
+def test_plan_summary_binlog_wording():
+    base = {'method': 'binlog', 'dump': {'time': None}, 'download_bytes': 0}
+    one_open = r.plan_summary(dict(base, binlogs={'files': 1, 'segments': 0, 'partial': True}))
+    assert '1 binlog file (open-file copy)' in one_open and 'files' not in one_open
+    assert '1 binlog file,' in r.plan_summary(dict(base, binlogs={'files': 1, 'segments': 1, 'partial': False}))
+    assert '3 binlog files incl. the open-file copy' in r.plan_summary(
+        dict(base, binlogs={'files': 3, 'segments': 1, 'partial': True}))

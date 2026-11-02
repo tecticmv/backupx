@@ -24,6 +24,21 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 /** The server's restore plan: what gets downloaded, how big, where it goes, disk check, warnings. */
+
+function plural(n: number, word: string) {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+/** `files` includes the open-file copy when `partial` is set. */
+function binlogCountText(b: { files: number; segments: number; partial: boolean }) {
+  const archived = Math.max(0, b.files - (b.partial ? 1 : 0));
+  if (b.segments === 0 || archived === 0) {
+    return b.partial ? "1 binlog file (open-file copy)" : plural(b.files, "binlog file");
+  }
+  const main = `${plural(archived, "binlog file")} in ${plural(b.segments, "segment")}`;
+  return b.partial ? `${main} + 1 open-file copy` : main;
+}
+
 export default function PlanSummary({ plan, loading, error, title = "Restore plan" }: PlanSummaryProps) {
   if (!plan) {
     return (
@@ -80,11 +95,10 @@ export default function PlanSummary({ plan, loading, error, title = "Restore pla
           )}
           {plan.binlogs && (
             <Row label="Binlogs">
-              {plan.binlogs.files} files in {plan.binlogs.segments} segment{plan.binlogs.segments === 1 ? "" : "s"} ·{" "}
-              {formatBytes(plan.binlogs.size)}
+              {binlogCountText(plan.binlogs)} · {formatBytes(plan.binlogs.size)}
               <span className="block font-mono text-xs text-muted-foreground">
                 {plan.binlogs.first} → {plan.binlogs.last}
-                {plan.binlogs.partial ? " (last file partial)" : ""}
+                {plan.binlogs.partial ? " (last file is an open-file copy)" : ""}
               </span>
             </Row>
           )}

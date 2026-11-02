@@ -316,8 +316,13 @@ def plan_summary(plan):
         parts.append(f"dump of {fmt_time(d.get('time'))}")
         b = plan.get('binlogs')
         if b:
-            parts.append(f"{b['files']} binlog file{'s' if b['files'] != 1 else ''}"
-                         + (' (+ the open file)' if b.get('partial') else ''))
+            # 'files' already counts the open-file copy when 'partial' is set
+            n = int(b.get('files') or 0)
+            if b.get('partial') and n <= 1:
+                parts.append('1 binlog file (open-file copy)')
+            else:
+                parts.append(f"{n} binlog file{'s' if n != 1 else ''}"
+                             + (' incl. the open-file copy' if b.get('partial') else ''))
     return ' + '.join(parts) + f", ~{fmt_bytes(plan.get('download_bytes'))} to download"
 
 
