@@ -739,3 +739,93 @@ def test_unlock_over_ssh_keeps_secrets_out_of_argv(world, db, monkeypatch):
     for secret in ('Restic-Secret-pw1', 'SK-hxs1-secret', 'AK-hxs1', 'Ssh-Secret-pw1'):
         assert secret not in ' '.join(argv)
     assert 'Restic-Secret-pw1' in script and 'restic unlock' in script and '--remove-all' not in script
+
+
+# --- PITR streamer heartbeat between ticks ----------------------------------------------
+
+def _pitr_state(heartbeat, last_tick_at, active='active', interval=5):
+    state = base_state()
+    state['jobs']['j1'].update(pitr_enabled=True, backup_type='database', pitr_interval=interval)
+    state['pitr'] = {'j1': {'kind': 'mysql', 'state': 'ok', 'last_tick_at': last_tick_at,
+                            'streamer_active': active, 'heartbeat': heartbeat}}
+    return state
+
+
+def test_heartbeat_read_at_last_tick_is_no_false_alarm_between_ticks():
+    # Tick 5.5 min ago read a 40 s old heartbeat; the stored value is now 6+ min old: still fine
+    state = _pitr_state(heartbeat=_ago(minutes=6, seconds=10), last_tick_at=_ago(minutes=5, seconds=30))
+    assert health.detect(state) == []
+
+
+def test_dead_streamer_is_seen_on_the_next_tick():
+    # The streamer died 6 min ago; the tick 10 s ago read a heartbeat older than max_age (300 s)
+    state = _pitr_state(heartbeat=_ago(minutes=6), last_tick_at=_ago(seconds=10))
+    [issue] = health.detect(state)
+    assert issue.kind == 'pitr_streamer_down'
+    assert issue.evidence['heartbeat_age'] == '6 min'
+    # a stopped unit is down at once
+    state = _pitr_state(heartbeat=_ago(seconds=30), last_tick_at=_ago(seconds=10), active='failed')
+    assert kinds(health.detect(state)) == ['pitr_streamer_down']
+
+
+def test_heartbeat_backstop_when_ticks_stop_landing():
+    # Last tick 14 min ago saw a fresh heartbeat; nothing since: > max_age + interval + 2 min (12 min)
+    state = _pitr_state(heartbeat=_ago(minutes=15), last_tick_at=_ago(minutes=14))
+    assert kinds(health.detect(state)) == ['pitr_streamer_down']
+    # but not yet after one missed tick
+    state = _pitr_state(heartbeat=_ago(minutes=11), last_tick_at=_ago(minutes=10, seconds=30))
+    assert health.detect(state) == []
+
+
+def test_heartbeat_stalled_rules():
+    assert health.heartbeat_stalled(None, _ago(seconds=5), NOW, 300) is False  # just started
+    assert health.heartbeat_stalled(_ago(minutes=8), _ago(minutes=7, seconds=30), NOW, 300) is False
+    assert health.heartbeat_stalled(_ago(minutes=8), _ago(minutes=2), NOW, 300) is True
+    # a longer interval stretches only the backstop
+    assert health.heartbeat_stalled(_ago(minutes=20), _ago(minutes=19), NOW, 300, interval_minutes=15) is False
+    assert health.heartbeat_stalled(_ago(minutes=20), _ago(minutes=19), NOW, 300, interval_minutes=5) is True
+
+
+# --- Dashboard activity: scheduled no-ops stay out --------------------------------------
+
+def _finished_task(db, kind, result, created_by=None, status='succeeded', title=None):
+    row, _ = tasks.enqueue(kind, {}, title=title or kind, created_by=created_by)
+    db.execute('UPDATE tasks SET status = %s, result = %s, finished_at = %s WHERE id = %s',
+               (status, json.dumps(result), tasks.utcnow(), row['id']))
+    db.commit()
+    return row['id']
+
+
+def test_activity_hides_scheduled_noop_tasks(db):
+    from app import health_service as hs
+    noop = _finished_task(db, 'restore_cleanup', {'message': 'Nothing to clean up', 'noop': True,
+                                                  'expired': []})
+    legacy = _finished_task(db, 'restore_cleanup', {'message': 'Nothing to clean up', 'expired': []})
+    did_work = _finished_task(db, 'restore_cleanup', {'message': '1 item(s) cleaned up', 'noop': False,
+                                                      'expired': ['r1']})
+    failed = _finished_task(db, 'restore_cleanup', {'message': 'x'}, status='failed')
+    sweep = _finished_task(db, 'health_sweep', {'message': 'Checked 3 item(s): 0 issue(s), 0 critical'})
+    manual_sweep = _finished_task(db, 'health_sweep', {'message': 'Checked 3'}, created_by='admin')
+    by_person = _finished_task(db, 'restore_cleanup', {'message': 'Nothing to clean up', 'noop': True},
+                               created_by='admin')
+    shown = {e.get('task_id') for e in hs.activity() if e['type'] == 'task'}
+    assert noop not in shown and legacy not in shown and sweep not in shown
+    assert {did_work, failed, manual_sweep, by_person} <= shown
+    # still in the task list
+    ids = {t['id'] for t in tasks.list_tasks(limit=50)}
+    assert noop in ids and legacy in ids
+
+
+def test_restore_cleanup_marks_a_noop_result(monkeypatch):
+    from app import restore_service as svc
+    monkeypatch.setattr(svc, 'cleanup', lambda log=None: {'expired': [], 'interrupted': [], 'orphans': [],
+                                                          'pre_restore_forgotten': []})
+
+    class Ctx:
+        def log(self, *a, **k):
+            pass
+    assert svc._task_cleanup(Ctx())['noop'] is True
+    monkeypatch.setattr(svc, 'cleanup', lambda log=None: {'expired': ['r1'], 'interrupted': [], 'orphans': [],
+                                                          'pre_restore_forgotten': []})
+    out = svc._task_cleanup(Ctx())
+    assert out['noop'] is False and out['message'] == '1 item(s) cleaned up'

@@ -831,6 +831,25 @@ def _utc(value):
     return value
 
 
+def idle_since(kind, window_end, lag_minutes, idle_at, now, interval_minutes=None):
+    """Since when an idle PostgreSQL server has written nothing (its window end), else None.
+
+    WAL-G: when the last tick found nothing written since the last archived
+    WAL (info.idle_at), the server is current (lag 0) although the newest
+    restorable time is its last write, which can be hours old. The UI shows
+    "idle - nothing written since <time>" instead of "lag 0 min" next to an
+    old window end. Only once the window end is older than two intervals
+    (at least 15 minutes), so a busy server never reads as idle.
+    """
+    if kind != 'postgres' or not window_end or not idle_at or lag_minutes is None or lag_minutes > 1:
+        return None
+    end = _utc(window_end)
+    interval = max(1, int(interval_minutes or DEFAULT_INTERVAL_MINUTES))
+    if _utc(now) - end < timedelta(minutes=max(15, 2 * interval)):
+        return None
+    return end
+
+
 def anchor_usable(anchor, chain, min_retained_seq):
     """Can this dump start a replay inside this chain?"""
     if anchor.get('forgotten') or not anchor.get('snapshots'):

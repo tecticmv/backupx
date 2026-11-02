@@ -239,7 +239,7 @@ one any time from the job page (*Run drill now*).
 | `PITR_MAX_CONCURRENT` | 2 | threads of the `pitr` scheduler pool (each borrows pooled DB connections per query) |
 | `PITR_LAG_MINUTES` | 0 (auto) | lag before *lagging*; auto = max(3 × interval, 15) (PostgreSQL: max(15 + 2 × interval, 25)) |
 | `PITR_SHIP_TIMEOUT` | 900 | seconds per shipment |
-| `PITR_HEARTBEAT_MAX_AGE` | 300 | streamer heartbeat older than this = stalled |
+| `PITR_HEARTBEAT_MAX_AGE` | 300 | streamer heartbeat older than this *when a tick read it* (`last_tick_at`) = stalled; between ticks the stored heartbeat ages by up to an interval, so it is not compared with now (backstop if ticks stop: older than this + one interval + 2 min) |
 | `PITR_MAINT_HEALTH_TIMEOUT` / `PITR_MAINT_RECOVERY_MAX_WAIT` | 300 / 7200 | seconds a restarted database may take to be healthy / to finish crash recovery (never rolled back meanwhile) |
 | `PITR_FRESH_BACKUP_MAX_AGE` | 3600 | a successful backup newer than this counts as the backup before a restart |
 | `PITR_BINLOG_BASENAME` / `PITR_BINLOG_EXPIRE_DAYS` | mysql-bin / 2 | what the wizard writes for log_bin / binlog expiry |

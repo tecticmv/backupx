@@ -29,7 +29,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import PitrBadge from "@/components/PitrBadge";
 import { DrillBadge } from "@/components/jobs/RestoreDrillCard";
-import { formatWindow } from "@/lib/pitr";
+import { formatWindow, pitrLagText } from "@/lib/pitr";
 import { formatDateTime, formatRelative } from "@/lib/format";
 import { SEVERITY_META } from "@/lib/health";
 import { cn } from "@/lib/utils";
@@ -201,7 +201,7 @@ export default function JobCard({ job, onRun, onDetailPage = false }: JobCardPro
               <span className="inline-flex items-center gap-1.5">
                 <span className="hidden truncate text-muted-foreground lg:inline" title={formatWindow(pitr.window_start, pitr.window_end)}>
                   {pitr.window_start ? `from ${formatRelative(pitr.window_start)}` : ""}
-                  {pitr.lag_minutes !== null && ` · lag ${Math.round(pitr.lag_minutes)}m`}
+                  {pitrLagText(pitr, true) && ` · ${pitrLagText(pitr, true)}`}
                 </span>
                 <PitrBadge pitr={pitr} />
               </span>

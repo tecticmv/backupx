@@ -57,6 +57,9 @@ export interface PitrSummary {
   window_end: string | null;
   lag_minutes: number | null;
   last_error: string | null;
+  last_ship_at?: string | null;
+  /** Window end of an idle PostgreSQL server (nothing written since); null otherwise. */
+  idle_since?: string | null;
 }
 
 export interface PitrCheck {

@@ -1136,3 +1136,87 @@ def test_pg_tick_writing_server_keeps_time_based_lag(monkeypatch):
     ps._pg_tick('dspace', job, dict(SERVER), {'type': 'postgresql'}, targets)
     assert rows['state'] == pitr.STATE_LAGGING                      # 86 min since the last archive
     assert json.loads(rows['info'])['idle_at'] is None
+
+
+# ---------------------------------------------------------------------------
+# Wording: idle WAL-G servers, last shipment, heartbeat as of the tick
+# ---------------------------------------------------------------------------
+
+def test_idle_since_only_for_an_idle_postgres_with_an_old_window_end():
+    now = T0 + timedelta(hours=9)
+    end = T0
+    assert pitr.idle_since('postgres', end, 0, now.isoformat(), now, 5) == end
+    assert pitr.idle_since('postgres', end, 0, None, now, 5) is None              # last tick not idle
+    assert pitr.idle_since('postgres', end, 30, now.isoformat(), now, 5) is None  # lagging
+    assert pitr.idle_since('mysql', end, 0, now.isoformat(), now, 5) is None
+    assert pitr.idle_since('postgres', None, 0, now.isoformat(), now, 5) is None
+    recent = now - timedelta(minutes=10)                                          # busy: window end recent
+    assert pitr.idle_since('postgres', recent, 0, now.isoformat(), now, 5) is None
+
+
+def test_status_reports_idle_since_and_last_ship(monkeypatch):
+    from app import pitr_service as ps
+    now = T0 + timedelta(hours=9)
+    row = {'kind': 'postgres', 'state': 'ok', 'window_start': T0 - timedelta(days=2), 'window_end': T0,
+           'lag_minutes': 0.0, 'last_tick_at': now, 'last_ship_at': now - timedelta(minutes=4),
+           'info': json.dumps({'idle_at': now.isoformat()})}
+    monkeypatch.setattr(ps, 'load_state', lambda job_id: dict(row))
+    monkeypatch.setattr(ps, '_now', lambda: now)
+    out = ps.status('dspace', {'pitr_enabled': True, 'pitr_interval': 5})
+    assert out['idle_since'] == T0.isoformat() and out['last_ship_at'] == (now - timedelta(minutes=4)).isoformat()
+    row['info'] = json.dumps({'idle_at': None})
+    assert ps.status('dspace', {'pitr_enabled': True})['idle_since'] is None
+
+
+class _Conn:
+    def __init__(self):
+        self.sql = []
+
+    def execute(self, sql, params=()):
+        self.sql.append(sql)
+
+    def commit(self):
+        pass
+
+
+def _apply(monkeypatch, plan_over):
+    from app import pitr_service as ps
+    saved = {}
+    monkeypatch.setattr(ps, '_db', lambda: _Conn())
+    monkeypatch.setattr(ps, 'save_state', lambda job_id, **kw: saved.update(kw))
+    plan = {'breaks': [], 'server_uuid': UUID, 'segments': [], 'partial': None, 'open': None, 'chain_id': 1,
+            'base': 'mysql-bin', 'last_seq': 5}
+    plan.update(plan_over)
+    scan = {'active': 'active', 'heartbeat': 1793411990, 'server_version': '10.11'}
+    shipped = [{'partial': 'snap1', 'segments': {}}] if plan['partial'] else None
+    ps._apply_plan('koha', {}, plan, scan, [dict(TARGET)], shipped, True, T0)
+    return saved
+
+
+def test_copy_of_the_open_binlog_counts_as_a_shipment(monkeypatch):
+    open_file = {'name': 'mysql-bin.000006', 'size': 500, 'mtime': 1793411900}
+    saved = _apply(monkeypatch, {'partial': dict(open_file), 'open': dict(open_file)})
+    assert saved['last_ship_at'] is not None
+    # nothing shipped at all: last_ship_at is left alone
+    saved = _apply(monkeypatch, {'open': dict(open_file)})
+    assert 'last_ship_at' not in saved
+
+
+def test_refresh_state_judges_the_heartbeat_as_of_the_last_tick(monkeypatch):
+    from app import pitr_service as ps
+    tick = T0 + timedelta(minutes=30)
+    rows = {'kind': 'mysql', 'last_tick_at': tick, 'state': pitr.STATE_OK, 'alerted_state': pitr.STATE_OK,
+            'streamer_active': 'active', 'heartbeat': tick - timedelta(seconds=40)}
+    monkeypatch.setattr(ps, 'load_state', lambda job_id: dict(rows))
+    monkeypatch.setattr(ps, 'save_state', lambda job_id, **kw: rows.update(kw))
+    windows = pitr.chain_windows([chain()], [seg(5, 9, 30)], [anchor(6, 8)])
+    monkeypatch.setattr(ps, 'compute_windows', lambda job_id, state=None: windows)
+    import app.main as main
+    monkeypatch.setattr(main, 'send_notification', lambda *a: None)
+    seen = []
+    real = pitr.streamer_health
+    monkeypatch.setattr(pitr, 'streamer_health', lambda a, hb, now, max_age: seen.append(now - hb) or real(a, hb, now, max_age))
+    # 5.5 min after the tick the stored heartbeat is 6+ min old, but it was 40 s old when read
+    monkeypatch.setattr(ps, '_now', lambda: tick + timedelta(minutes=5, seconds=30))
+    ps.refresh_state('epet', {'name': 'E-Petition', 'pitr_enabled': True, 'pitr_interval': 5})
+    assert seen == [40]

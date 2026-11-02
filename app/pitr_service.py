@@ -450,7 +450,8 @@ def _apply_plan(job_id, state, plan, scan, targets, shipped, in_sync, now):
         'server_version': scan['server_version'] or state.get('server_version'),
         'last_tick_at': _ts(now), 'last_error': None, 'consecutive_failures': 0,
     }
-    if plan['segments']:
+    if plan['segments'] or (plan['partial'] and shipped):
+        # a copy of the open binlog is a shipment too (a quiet server may not close a file for days)
         fields['last_ship_at'] = _ts(now)
     open_file = plan['open']
     if plan['partial']:
@@ -540,8 +541,11 @@ def refresh_state(job_id, job, live=None):
                 live = state.get('streamer_active') in (None, 'active')
             else:
                 hb = pitr._utc(state['heartbeat']).timestamp() if state.get('heartbeat') else None
+                # The heartbeat is only read on a tick: judge it as of that tick, not now
+                # (between ticks it ages by up to an interval while the streamer is fine)
+                read_at = pitr._utc(state['last_tick_at']).timestamp() if state.get('last_tick_at') else None
                 live = pitr.streamer_health(state.get('streamer_active') or 'active', hb,
-                                            _now().timestamp(), cfg['heartbeat_max_age'])[1]
+                                            read_at or _now().timestamp(), cfg['heartbeat_max_age'])[1]
         lag_limit = pitr.lag_threshold_minutes(job.get('pitr_interval'), cfg['lag_minutes'], kind)
         new_state, window, lag = pitr.derive_state(enabled, bool(state.get('last_tick_at')), windows,
                                                    _now(), lag_limit, live)
@@ -615,12 +619,23 @@ def status(job_id, job):
         'lag_minutes': state.get('lag_minutes'),
         'last_tick_at': _iso(state.get('last_tick_at')),
         'last_ship_at': _iso(state.get('last_ship_at')),
+        'idle_since': _idle_since(state, job),
         'last_error': state.get('last_error'),
         'streamer_active': state.get('streamer_active'),
         'server_version': state.get('server_version'),
         'kind': state.get('kind'),
     }
     return out
+
+
+def _idle_since(state, job):
+    """ISO window end when an idle PostgreSQL server has written nothing since then (see pitr.idle_since)."""
+    try:
+        info = _json(state.get('info'), {})
+        return _iso(pitr.idle_since(state.get('kind'), state.get('window_end'), state.get('lag_minutes'),
+                                    info.get('idle_at'), _now(), job.get('pitr_interval')))
+    except Exception:
+        return None
 
 
 def summaries(jobs):
@@ -639,6 +654,8 @@ def summaries(jobs):
             'window_end': _iso(s.get('window_end')),
             'lag_minutes': s.get('lag_minutes'),
             'last_error': s.get('last_error'),
+            'last_ship_at': _iso(s.get('last_ship_at')),
+            'idle_since': _idle_since(s, job),
         }
     return out
 

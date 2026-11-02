@@ -2,7 +2,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { PitrState, PitrSummary } from "@/types/job";
 import { History } from "lucide-react";
-import { PITR_STATE_HELP, formatWindow } from "@/lib/pitr";
+import { PITR_STATE_HELP, formatWindow, pitrLagText, pitrLastShipText } from "@/lib/pitr";
 
 const STATE_STYLE: Record<PitrState, { label: string; className: string }> = {
   ok: { label: "PITR ok", className: "border-emerald-500/50 text-emerald-600" },
@@ -28,7 +28,8 @@ export default function PitrBadge({ pitr }: { pitr?: PitrSummary | null }) {
         <div className="space-y-1 text-xs">
           <p>{PITR_STATE_HELP[pitr.state]}</p>
           <p>Restorable: {formatWindow(pitr.window_start, pitr.window_end)}</p>
-          {pitr.lag_minutes !== null && <p>Lag: {Math.round(pitr.lag_minutes)} min</p>}
+          {pitrLagText(pitr) && <p>{pitrLagText(pitr)}</p>}
+          {pitrLastShipText(pitr) && <p>{pitrLastShipText(pitr)}</p>}
           {pitr.last_error && <p className="text-destructive">Last error: {pitr.last_error}</p>}
         </div>
       </TooltipContent>

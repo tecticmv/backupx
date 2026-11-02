@@ -20,7 +20,7 @@ import {
 import { toast } from "sonner";
 import type { JobStorage, PitrDetails } from "@/types/job";
 import PitrBadge from "@/components/PitrBadge";
-import { formatWindow } from "@/lib/pitr";
+import { formatWindow, pitrLagText, pitrLastShipText } from "@/lib/pitr";
 import { Download, Loader2, Send } from "lucide-react";
 import { useTasks } from "@/hooks/useTasks";
 
@@ -131,8 +131,9 @@ export default function PitrRestoreDialog({ jobId, jobName, onOpenChange }: Prop
                   {formatWindow(details.window_start, details.window_end)}
                 </span>
               </div>
-              {details.lag_minutes !== null && (
-                <p className="text-xs text-muted-foreground">Lag {Math.round(details.lag_minutes)} min</p>
+              {pitrLagText(details) && <p className="text-xs text-muted-foreground">{pitrLagText(details)}</p>}
+              {pitrLastShipText(details) && (
+                <p className="text-xs text-muted-foreground">{pitrLastShipText(details)}</p>
               )}
               {details.windows.length > 1 && (
                 <div className="text-xs text-muted-foreground">

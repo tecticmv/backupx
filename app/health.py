@@ -369,6 +369,28 @@ def _iso(value):
     return t.isoformat() if t else None
 
 
+def heartbeat_stalled(heartbeat, read_at, now, max_age, interval_minutes=None) -> bool:
+    """Whether a binlog streamer's heartbeat counts as stalled.
+
+    The streamer touches its heartbeat about once a minute while in sync, but
+    backupx only reads it on a PITR tick (read_at = last_tick_at). Between
+    ticks the stored value ages by up to an interval, so its age is measured
+    when it was read: a streamer that died is seen on the first tick more
+    than max_age after its last heartbeat (within about two ticks). If ticks
+    stop landing, age against now still trips once it exceeds max_age + one
+    interval + 2 min (between healthy ticks it never gets there). No heartbeat
+    yet (just started) is not stalled.
+    """
+    hb = utc(heartbeat)
+    if hb is None:
+        return False
+    read = utc(read_at)
+    if read is not None and (read - hb).total_seconds() > max_age:
+        return True
+    interval = max(1, int(interval_minutes or 5)) * 60
+    return (now - hb).total_seconds() > max_age + interval + 120
+
+
 def detect_pitr(state) -> List[Issue]:
     out = []
     now = state['now']
@@ -387,7 +409,9 @@ def detect_pitr(state) -> List[Issue]:
             hb_age = age_seconds(ps.get('heartbeat'), now)
             active = ps.get('streamer_active')
             down = ps.get('last_tick_at') and (
-                (active and active != 'active') or (hb_age is not None and hb_age > max_age))
+                (active and active != 'active') or
+                heartbeat_stalled(ps.get('heartbeat'), ps.get('last_tick_at'), now, max_age,
+                                  job.get('pitr_interval')))
             failing = int(ps.get('consecutive_failures') or 0) >= 3
             if down or failing:
                 evidence.update(streamer=active, heartbeat_age=human_age(hb_age),

@@ -131,6 +131,8 @@ export interface JobCardPitr {
   window_end: string | null;
   lag_minutes: number | null;
   last_error?: string | null;
+  last_ship_at?: string | null;
+  idle_since?: string | null;
 }
 
 export interface JobCardData {

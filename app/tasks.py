@@ -51,6 +51,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from . import procs
+
 logger = logging.getLogger(__name__)
 
 # Statuses
@@ -633,8 +635,9 @@ class TaskContext:
                on_line: Optional[Callable[[str, str], None]] = None) -> int:
         """Log a process's stdout/stderr line by line until it exits.
 
-        Kills it when the task is cancelled (raises TaskCancelled) or after
-        timeout seconds (raises subprocess.TimeoutExpired). Returns the exit code.
+        Stops it (SIGINT, then SIGTERM, then SIGKILL; procs.stop_gently) when
+        the task is cancelled (raises TaskCancelled) or after timeout seconds
+        (raises subprocess.TimeoutExpired). Returns the exit code.
         """
         lines: 'queue.Queue' = queue.Queue()
 
@@ -657,14 +660,8 @@ class TaskContext:
         deadline = time.monotonic() + timeout if timeout else None
 
         def kill():
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
-                proc.wait(timeout=10)
-            except Exception:
-                pass
+            # SIGINT first: a restic stopped this way removes its own repository lock
+            procs.stop_gently(proc)
 
         while open_pipes:
             if self.cancel_event.is_set():

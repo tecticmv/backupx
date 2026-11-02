@@ -44,6 +44,7 @@ from . import health_service
 from . import restore_service
 from . import pitr_enable_service
 from . import drill_service
+from . import procs
 from .cron import cron_fields, cron_trigger
 
 # =============================================================================
@@ -3302,8 +3303,29 @@ def invalidate_snapshot_cache(job_id):
             cache.pop(key, None)
 
 
+def restic_read_timeout():
+    """Seconds a read-only restic listing may take (`RESTIC_READ_TIMEOUT`, default 180)."""
+    try:
+        return max(10, int(os.environ.get('RESTIC_READ_TIMEOUT', 180)))
+    except (TypeError, ValueError):
+        return 180
+
+
+def _restic_read_cmd(args, target):
+    """restic argv for a read-only command: --no-lock, so it never leaves a lock behind."""
+    cmd = ['restic', *args, '--no-lock']
+    if target.get('skip_ssl_verify'):
+        cmd.append('--insecure-tls')
+    return cmd
+
+
 def _run_restic_json(job, target, args, cache, ttl):
-    """Run a read-only restic command locally against one storage, with a TTL cache."""
+    """Run a read-only restic command locally against one storage, with a TTL cache.
+
+    Runs with --no-lock (listing needs no lock, and a lock left by a killed
+    listing blocks prune and shows up as a stale lock). On timeout restic is
+    stopped gently and the last cached result, if any, is returned instead.
+    """
     import time
     key = (job.get('id'), target.get('id'))
     if key[0] and key in cache:
@@ -3311,10 +3333,16 @@ def _run_restic_json(job, target, args, cache, ttl):
         if time.time() - cached_at < ttl:
             return cached_data
 
-    cmd = ['restic', *args]
-    if target.get('skip_ssl_verify'):
-        cmd.append('--insecure-tls')
-    result = subprocess.run(cmd, capture_output=True, text=True, env=job_restic_env(job, target), timeout=60)
+    timeout = restic_read_timeout()
+    try:
+        result = procs.run_gently(_restic_read_cmd(args, target), timeout=timeout,
+                                  env=job_restic_env(job, target))
+    except subprocess.TimeoutExpired:
+        if key[0] and key in cache:
+            logger.warning(f"restic {args[0]} on {target.get('name')} timed out after {timeout}s; "
+                           f"showing the cached result")
+            return cache[key][1]
+        raise RuntimeError(f"restic {args[0]} timed out after {timeout}s (large repository or slow storage)")
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f'restic {args[0]} failed')
     data = json.loads(result.stdout)
@@ -3373,7 +3401,8 @@ def _restic_local(job, target, args, timeout, lock_wait=None):
         cmd += ['--retry-lock', lock_wait]
     if target.get('skip_ssl_verify'):
         cmd.append('--insecure-tls')
-    return subprocess.run(cmd, capture_output=True, text=True, env=job_restic_env(job, target), timeout=timeout)
+    # forget/prune hold an exclusive lock: on timeout restic gets SIGINT so it removes it
+    return procs.run_gently(cmd, timeout=timeout, env=job_restic_env(job, target))
 
 
 def _restic_error(proc, what):
@@ -4594,23 +4623,13 @@ def api_snapshot_files(job_id, snapshot_id):
     target = _job_storage_from_request(job)
     if not target:
         return jsonify({'error': 'Storage not found for this job'}), 404
-    skip_ssl_verify = target.get('skip_ssl_verify', False)
 
     try:
         env = job_restic_env(job, target)
 
         # Use restic ls to list files in the snapshot at the given path
-        cmd = ['restic', 'ls', '--json', snapshot_id, path]
-        if skip_ssl_verify:
-            cmd.append('--insecure-tls')
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=60
-        )
+        cmd = _restic_read_cmd(['ls', '--json', snapshot_id, path], target)
+        result = procs.run_gently(cmd, timeout=restic_read_timeout(), env=env)
 
         if result.returncode != 0:
             return jsonify({'error': result.stderr or 'Failed to list files'}), 400
@@ -4723,16 +4742,12 @@ def api_snapshot_download(job_id, snapshot_id):
         env = job_restic_env(job, target)
 
         # Use restic dump to get file contents
+        # Keeps its (shared) restic lock: a download may run while prune starts
         cmd = ['restic', 'dump', snapshot_id, file_path]
         if skip_ssl_verify:
             cmd.append('--insecure-tls')
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            env=env,
-            timeout=300  # 5 minute timeout for downloads
-        )
+        result = procs.run_gently(cmd, timeout=300, env=env, text=False)  # 5 minute timeout for downloads
 
         if result.returncode != 0:
             error_msg = result.stderr.decode('utf-8', errors='replace') if result.stderr else 'Failed to download file'

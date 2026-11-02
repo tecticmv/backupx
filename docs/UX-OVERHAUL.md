@@ -231,7 +231,7 @@ ones read `health_probes`.
 | `storage_unreachable` | same, every error a timeout/5xx/524/connection error | same | `storage_retry` (safe: endpoint test, retries with back-off `FIX_RETRY_BACKOFF`) |
 | `repo_open_error` | run error or repo probe: wrong password | critical | manual |
 | `retention_failed` / `retention_refused` / `prune_failed` | latest `retention_runs` | warning | `retry_forget` (safe: unlock-if-eligible + forget) / manual / manual |
-| `pitr_streamer_down` | pitr_state: unit not active, heartbeat older than `PITR_HEARTBEAT_MAX_AGE`, or 3+ failed ticks | critical if lagging/broken | `pitr_kick` (safe: forced reinstall + restart, waits for a fresh heartbeat) |
+| `pitr_streamer_down` | pitr_state: unit not active, heartbeat older than `PITR_HEARTBEAT_MAX_AGE` when the last tick read it (or than that + interval + 2 min against now, if ticks stop), or 3+ failed ticks | critical if lagging/broken | `pitr_kick` (safe: forced reinstall + restart, waits for a fresh heartbeat) |
 | `wal_archive_failing` | pitr_state (PG) `failing` | critical if lagging | `walg_repush` (safe: re-install env/script, `wal-g st ls`) |
 | `wal_archiving_off` | pitr_state (PG) `inactive` | warning | manual (postgresql.conf lines) |
 | `wal_mirror_failed` | pitr_state info.mirror | warning | `wal_mirror_retry` (safe) |
@@ -866,6 +866,24 @@ Not covered end to end: the wizard UI clicked against the real backend
 crash during real InnoDB recovery (decision unit-tested with log fixtures);
 running client tools on the backupx host for servers without docker (not
 built).
+
+### Fixes after go-live (2026-11-02)
+
+- A stale restic lock on E-Petition DB / rustfs k8s (left by a killed restic
+  in the old container) was removed with the built-in `unlock_stale` fix.
+  Causes closed: local read-only restic (snapshots, stats, ls, find) runs with
+  `--no-lock`; every local restic (and `ctx.stream`) is stopped with SIGINT ->
+  SIGTERM -> SIGKILL (`app/procs.py`, `PROC_STOP_GRACE`) so it removes its
+  own lock; listings get `RESTIC_READ_TIMEOUT` (180 s) and fall back to the
+  cached list on timeout. Restore/dump keep their shared lock (protects them
+  from a concurrent prune). `tests/test_procs.py`.
+- `pitr_streamer_down` false alarm between ticks: heartbeat age is measured
+  as of `last_tick_at` (`health.heartbeat_stalled`, also `refresh_state`).
+- Activity timeline: system tasks that succeeded with `result.noop`
+  (restore cleanup "Nothing to clean up") are left out; still in the task list.
+- PITR wording: idle WAL-G server -> `idle_since` ("idle — nothing written
+  since <time>" instead of "lag 0 min"); `last_ship_at` also counts copies of
+  the open binlog and is shown as "Last shipped".
 
 ### Next
 

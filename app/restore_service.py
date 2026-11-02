@@ -43,6 +43,7 @@ from . import pitr
 from . import restore as r
 from . import restore_scripts as rs
 from . import security
+from . import procs
 from . import tasks
 
 logger = logging.getLogger(__name__)
@@ -1614,8 +1615,12 @@ def find_in_snapshot(job_id, snapshot_id, query, storage_id=None):
     if not re.match(r'^[\w .*?@+%-]+$', q):
         raise RestoreError('Only letters, digits, spaces and . _ - * ? are allowed', 'invalid')
     pattern = q if any(c in q for c in '*?') else f'*{q}*'
-    proc = subprocess.run(['restic', 'find', '--json', '-i', '--snapshot', snapshot_id, pattern, *_insecure(target)],
-                          capture_output=True, text=True, env=_restic_env(job, target), timeout=120)
+    try:
+        proc = procs.run_gently(['restic', 'find', '--json', '-i', '--snapshot', snapshot_id, pattern, '--no-lock',
+                                 *_insecure(target)], timeout=max(120, m.restic_read_timeout()),
+                                env=_restic_env(job, target))
+    except subprocess.TimeoutExpired:
+        raise RestoreError('Searching the snapshot timed out; try a more specific name', 'restic_error')
     if proc.returncode != 0:
         raise RestoreError(m.sanitize_error_message(proc.stderr.strip() or 'restic find failed'), 'restic_error')
     limit = r.settings()['find_limit']
@@ -1749,4 +1754,5 @@ def expire_pre_restore(now=None, log=None):
 def _task_cleanup(ctx):
     summary = cleanup(log=lambda t: ctx.log(t, stream='system'))
     n = sum(len(v) for v in summary.values())
-    return {'message': f'{n} item(s) cleaned up' if n else 'Nothing to clean up', **summary}
+    # noop: a scheduled tick that found nothing stays in the task list, not the dashboard activity
+    return {'message': f'{n} item(s) cleaned up' if n else 'Nothing to clean up', 'noop': not n, **summary}

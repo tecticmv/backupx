@@ -15,7 +15,7 @@ import JobRestoresList from "@/components/restore/JobRestoresList";
 import RestoreDrillCard from "@/components/jobs/RestoreDrillCard";
 import Snapshots from "@/pages/Snapshots";
 import { useHealth, usePolledJson, useRunJob } from "@/hooks/useHealth";
-import { formatWindow } from "@/lib/pitr";
+import { formatWindow, pitrLagText, pitrLastShipText } from "@/lib/pitr";
 import type { DashboardOverview } from "@/types/health";
 import type { Jobs } from "@/types/job";
 
@@ -240,8 +240,9 @@ export default function JobDetail() {
               </CardHeader>
               <CardContent className="space-y-1 text-sm">
                 <p>{formatWindow(job.pitr.window_start, job.pitr.window_end)}</p>
-                {job.pitr.lag_minutes !== null && (
-                  <p className="text-muted-foreground">Lag: {Math.round(job.pitr.lag_minutes)} min</p>
+                {pitrLagText(job.pitr) && <p className="text-muted-foreground">{pitrLagText(job.pitr)}</p>}
+                {pitrLastShipText(job.pitr) && (
+                  <p className="text-muted-foreground">{pitrLastShipText(job.pitr)}</p>
                 )}
                 {job.pitr.last_error && <p className="text-destructive">Last error: {job.pitr.last_error}</p>}
               </CardContent>

@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from . import health
+from . import procs
 from . import tasks
 
 logger = logging.getLogger(__name__)
@@ -610,7 +611,8 @@ def _restic(job, target, args, timeout):
     cmd = ['restic', *args]
     if target.get('skip_ssl_verify'):
         cmd.append('--insecure-tls')
-    return subprocess.run(cmd, capture_output=True, text=True, env=m.job_restic_env(job, target), timeout=timeout)
+    # On timeout restic gets SIGINT first, so it can remove a lock it took (check, unlock, key remove)
+    return procs.run_gently(cmd, timeout=timeout, env=m.job_restic_env(job, target))
 
 
 def classify_open(proc):
@@ -2012,7 +2014,8 @@ def dashboard_overview(job_id=None):
             'storages': storages, 'last_run_id': last_run_id, 'failed_storage_ids': failed_ids,
             'pitr': ({'enabled': p['enabled'], 'state': p['state'], 'window_start': p['window_start'],
                       'window_end': p['window_end'], 'lag_minutes': p['lag_minutes'],
-                      'last_error': p.get('last_error')} if p else None),
+                      'last_error': p.get('last_error'), 'last_ship_at': p.get('last_ship_at'),
+                      'idle_since': p.get('idle_since')} if p else None),
             'retention': rstate,
             'last_verified_restore': _drill_card(state['probes'].get(f'drill:{jid}')),
         })
@@ -2096,9 +2099,15 @@ def activity(state=None, days=7, limit=100):
         events.append({'ts': _iso(r['timestamp']), 'type': 'retention', 'status': status,
                        'title': f"{name}: {r['action']} on {r.get('storage_name') or '?'} {r['status']}",
                        'detail': (r.get('message') or '')[:300], 'job_id': r['job_id']})
+    # Scheduled housekeeping that did nothing (restore cleanup "Nothing to clean up", hourly health
+    # sweeps) stays in the task list but would drown the timeline: system-created (created_by NULL)
+    # tasks that succeeded with result.noop, legacy cleanup rows without the flag, scheduled sweeps.
     for r in db.fetchall("SELECT * FROM tasks WHERE created_at >= %s AND kind NOT IN ('backup_run') "
                          "AND NOT (kind = 'health_sweep' AND created_by IS NULL) "
-                         "ORDER BY created_at DESC LIMIT 50", (since,)):
+                         "AND NOT (created_by IS NULL AND status = 'succeeded' AND ("
+                         "COALESCE(result, '') LIKE %s OR (kind = 'restore_cleanup' AND "
+                         "COALESCE(result, '') LIKE %s))) "
+                         "ORDER BY created_at DESC LIMIT 50", (since, '%"noop": true%', '%"Nothing to clean up"%')):
         status = {'succeeded': 'success', 'failed': 'failed', 'running': 'running', 'queued': 'running',
                   'cancelled': 'warning', 'rolled_back': 'warning'}.get(r['status'], 'info')
         events.append({'ts': _iso(r.get('finished_at') or r.get('started_at') or r['created_at']), 'type': 'task',
