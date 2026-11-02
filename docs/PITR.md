@@ -59,8 +59,16 @@ configuration: enabling PITR in the job form still only installs the streamer
    MySQL 8.4) the job dumps again without it - the nightly backup never fails
    because of PITR - and PITR goes *unanchored*.
 4. **Chains**: shipped files must continue the numbering on the same server.
-   A hole, a streamer-reported gap or a `server_uuid` change (failover) starts a
-   new chain. Times after a break become restorable once a dump lands in the
+   A hole, a streamer-reported gap, a `server_uuid` change (failover) or a
+   restart of the server's binlog numbering (`RESET MASTER`, MySQL 8.4
+   `RESET BINARY LOGS AND GTIDS`; detected within a minute by the streamer:
+   file numbers below the highest seen, closed files changing size, our copy
+   bigger than the server's, a different format-description event) starts a
+   new chain; the old spool is shipped first and dumps from before the restart
+   can't anchor the new chain. The window only reaches "now" while the spool
+   verifiably holds what the server has; restore drills check that the latest
+   point's newest replayed event reaches the last time production's binlog
+   position moved. Times after a break become restorable once a dump lands in the
    new chain (next nightly backup, or *Run now*); earlier times stay
    restorable from the old chain.
 
@@ -201,8 +209,13 @@ Spool: up to a few files per job (E-Petition ~10 MB/day total).
   database the last archive time can be hours old with nothing missing. Each
   tick compares `pg_walfile_name(pg_current_wal_lsn())` with
   `last_archived_wal`: equal = everything written is archived, the window is
-  current up to that tick (lag 0). Otherwise lag is measured from the last
-  archive time as before (25 min default). `last_failed_time` newer than
+  current up to that tick (lag 0). Since 2026-11-02 that point is kept as
+  `caught_up_at`: while only the open segment is pending (autovacuum wrote a
+  few bytes) or the position is unknown (restart, timeline switch, recovery)
+  the lag counts from it (or the last archive, if later), so an idle server no
+  longer flaps between ok and lagging. A failed SSH login/check is an error
+  (last state kept, `pitr_ssh_failing`), never "archiving off"; a nightly base
+  backup that is skipped writes history and alerts.  `last_failed_time` newer than
   `last_archived_time` = `archive_command` failing → lagging, with the failed
   WAL in the alert.
 - **Last ship** (Jobs list): set when the archiver is healthy and the R2

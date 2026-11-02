@@ -2893,7 +2893,8 @@ def _stream_restic_progress(proc, job_id, timeout, target_names):
                 # the per-storage log keeps restic's summary (a clean run printed nothing else)
                 results[current]['output'].append(
                     f"snapshot {(msg.get('snapshot_id') or '?')[:8]} saved - {done_text[6:]}; "
-                    f"{msg.get('files_unmodified', 0)} unchanged, {msg.get('total_files_processed', 0)} files total")
+                    f"{msg.get('files_unmodified', 0)} unchanged, {msg.get('total_files_processed', 0)} "
+                    f"file{'' if msg.get('total_files_processed', 0) == 1 else 's'} total")
 
         elif msg_type in ('error', 'exit_error'):
             # restic --json reports errors as JSON; keep them as readable text

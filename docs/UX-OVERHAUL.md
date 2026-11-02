@@ -112,7 +112,7 @@ new `repo_locks(urls, exclusive=False)` keyed `repo:<sha256(url)[:16]>`.
 Backups (scheduled and manual), restores, ZIPs and repository init hold it
 **shared**; `repo_in_use(url)` tries it exclusively. P1's stale-lock fix: only
 `restic unlock` when `repo_in_use()` is false (and hold the exclusive lock while
-unlocking). Retention forget runs inside the backup (shared lock held); prune
+unlocking). Retention forget runs after the backup has released its run lock, under `<job>:retention` with a 30 s lock wait (since 2026-11-02); prune
 takes it shared since P1.
 
 ### Per-storage run results
@@ -252,7 +252,7 @@ ones read `health_probes`.
 ### Stale locks
 
 `lock_decision(lock, now, managed_hosts, backupx_hosts, advisory_held,
-repo_in_use)`: lock age under `STALE_LOCK_MIN_AGE` (1800 s) -> `wait` (never
+repo_in_use)`: lock age under `STALE_LOCK_MIN_AGE` (1800 s; probe and detector both read it) -> `wait` (never
 touched); a backupx advisory lock on any job sharing the repository (`<job>`
 = backup/prune, `<job>:pitr`, `<job>:walg-base`) or the repository lock held
 -> `wait`; host = a managed server (address or probed `hostname`) or a
@@ -894,3 +894,7 @@ built).
 ### Later
 
 - Client tools on the backupx host for job servers without docker.
+
+### 2026-11-02 staging findings (branch `fix/staging-findings`)
+
+Fixed after an isolated staging click-through: binlog numbering restarts (streamer v3), PITR checks treat failed SSH/scripts as errors, idle PostgreSQL `caught_up_at`, PG-specific lagging alert, WAL-copy escalation, `pitr_ship_failing` / `pitr_ssh_failing` / `pitr_checks_failing` issues and the `pitr_ship_retry` fix, retention outside the run lock (activity `retention`), configurable stale-lock age in the detector, drill fixes (WAL-G base by end LSN, latest point must reach production's last write), docker-mode MySQL logins, RFC 1123 host names + unique server names, Verify without key tables / exact small-table counts, fast storage pre-checks, run logs keep restic's summary, missing-bucket message, Undo across workers, UI layout fixes. Regression tests: `tests/test_staging_findings.py`.
