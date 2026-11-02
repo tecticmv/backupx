@@ -1178,7 +1178,9 @@ def postgres_conf_changes(archive_timeout=900):
     ]
 
 
-_WAL_NAME = re.compile(r'^([0-9A-F]{8})([0-9A-F]{8})([0-9A-F]{8})$')
+# A base backup's history file (<segment>.<offset>.BACKUP) or a .PARTIAL file is archived after its
+# segment: it names the segment the archive has reached (pg_stat_archiver shows it after wal-g backup-push)
+_WAL_NAME = re.compile(r'^([0-9A-F]{8})([0-9A-F]{8})([0-9A-F]{8})(\.[0-9A-F]{8}\.BACKUP|\.PARTIAL)?$')
 
 
 def _wal_position(name, segment_size):
@@ -1186,7 +1188,7 @@ def _wal_position(name, segment_size):
     match = _WAL_NAME.match((name or '').strip().upper())
     if not match:
         return None
-    tli, log, seg = (int(x, 16) for x in match.groups())
+    tli, log, seg = (int(x, 16) for x in match.groups()[:3])
     return tli, log * (0x100000000 // segment_size) + seg
 
 

@@ -763,3 +763,13 @@ def test_ship_failure_keeps_the_streamer_facts_fresh(monkeypatch):
     state['pitr'] = {'j1': ps_row}
     [issue] = [i for i in health.detect(state) if i.family.startswith('pitr')]
     assert issue.kind == 'pitr_ship_failing' and 'MinIO 2' in issue.title
+
+
+def test_archiver_health_after_a_base_backup_history_file():
+    # staging: after wal-g backup-push pg_stat_archiver shows the .backup file -> "position unknown"
+    facts = dict(DSPACE_IDLE, archiver_last_archived_wal='00000001000000000000000F.00000028.backup',
+                 current_wal_file='000000010000000000000010')
+    h = pitr.walg_archiver_health(facts)
+    assert h['pending'] == 1 and not h['idle']
+    h = pitr.walg_archiver_health(dict(facts, current_wal_file='00000001000000000000000F'))
+    assert h['idle'] and h['pending'] == 0
