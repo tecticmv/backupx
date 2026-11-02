@@ -254,6 +254,8 @@ export default function Databases() {
         body: JSON.stringify({
           ...formData,
           server_id: testServerId,
+          // editing with the password left blank: the server tests with the stored one
+          config_id: editingConfig?.id,
         }),
       });
 
@@ -528,29 +530,35 @@ export default function Databases() {
                   <Input
                     id="username"
                     name="username"
-                    placeholder={formData.docker_container ? "not needed for docker exec" : "backup_user"}
+                    placeholder={formData.docker_container ? "optional, e.g. root" : "backup_user"}
                     value={formData.username}
                     onChange={handleInputChange}
                     required={!formData.docker_container}
-                    disabled={!!formData.docker_container}
                   />
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="password">
-                    Password {editingConfig && !formData.docker_container && "(leave blank to keep current)"}
+                    Password {editingConfig && "(leave blank to keep current)"}
                   </Label>
                   <Input
                     id="password"
                     name="password"
                     type="password"
-                    placeholder={formData.docker_container ? "not needed for docker exec" : "********"}
+                    placeholder={formData.docker_container ? "optional" : "********"}
                     value={formData.password}
                     onChange={handleInputChange}
                     required={!editingConfig && !formData.docker_container}
-                    disabled={!!formData.docker_container}
                   />
                 </div>
               </div>
+              {formData.docker_container && (
+                <p className="text-xs text-muted-foreground -mt-2">
+                  In docker-exec mode the login runs inside the container. Leave both empty to use the
+                  container's socket login; set them when the database user has a password (stock
+                  mysql/mariadb images). They are passed to the client in a 0600 option file, never on a command line,
+                  and point-in-time recovery uses the same login.
+                </p>
+              )}
               <div className="grid grid-cols-2 gap-4">
                 <div className="grid gap-2">
                   <Label htmlFor="databases">Databases to Backup</Label>
@@ -616,7 +624,11 @@ export default function Databases() {
                 type="button"
                 variant="outline"
                 onClick={handleTestConnection}
-                disabled={isTestingConnection || !formData.host || !formData.username || !testServerId}
+                disabled={
+                  isTestingConnection ||
+                  !testServerId ||
+                  (!formData.docker_container && (!formData.host || !formData.username))
+                }
               >
                 {isTestingConnection ? (
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />

@@ -525,3 +525,56 @@ def test_forget_after_backup_uses_short_lock_wait(monkeypatch):
     with pytest.raises(main.RetentionError) as e:
         main.forget_on_target({'retention_daily': 7}, {'name': 'p'}, cfg)
     assert calls == ['30s'] and 'locked' in str(e.value)
+
+
+# ---------------------------------------------------------------------------
+# B4: docker-mode MySQL/MariaDB configs can use a login (0600 option file, never argv)
+# ---------------------------------------------------------------------------
+
+def test_docker_mode_dump_uses_the_login_in_an_option_file(monkeypatch):
+    from tests.test_secrets_argv import FakeTransport, JOB as SJOB, TARGET as STARGET, SERVER as SSERVER, \
+        DB_PASSWORD, _assert_no_secret_in_argv
+    import app.main as main
+    fake = FakeTransport()
+    monkeypatch.setattr(main.subprocess, 'run', fake.run)
+    monkeypatch.setattr(main.subprocess, 'Popen', fake.popen)
+    for name in ('update_job_progress', 'update_job_status', 'add_history', 'send_notification',
+                 'invalidate_snapshot_cache'):
+        monkeypatch.setattr(main, name, lambda *a, **kw: None)
+    monkeypatch.setattr(main, 'get_server', lambda sid: dict(SSERVER))
+    for user in ('root', ''):
+        fake.calls.clear()
+        monkeypatch.setattr(main, 'load_db_configs', lambda user=user: [{
+            'id': 'db1', 'type': 'mysql', 'host': '', 'port': 3306, 'username': user,
+            'password': DB_PASSWORD if user else '', 'databases': '*', 'docker_container': 'mariadock'}])
+        main.run_database_backup('job1', dict(SJOB), [dict(STARGET)])
+        call = fake.calls[0]
+        _assert_no_secret_in_argv(call['args'])
+        script = fake.stdin_of(call)
+        assert 'bx_mysql_exec "$MYSQLDUMP" --all-databases' in script
+        if user:
+            assert 'BX_CNF=' in script and '--defaults-extra-file="$F"' in script and 'rm -f "$F"' in script
+        else:
+            assert "BX_CNF=''" in script
+
+
+@pytest.mark.skipif(not _bash(), reason='needs bash')
+def test_docker_mysql_exec_passes_login_on_stdin(tmp_path):
+    """bx_mysql_exec against a fake `docker`: the option file reaches the program, never its argv."""
+    import app.main as main
+    secret = 'Root-Stg "x\' $y-SECRET'
+    fakebin = tmp_path / 'bin'
+    fakebin.mkdir()
+    (fakebin / 'docker').write_text('#!/bin/bash\n# docker exec [-i] CONTAINER PROG ARGS... -> run PROG ARGS here\n'
+                                    'shift; [ "$1" = -i ] && shift; shift; exec "$@"\n')
+    (fakebin / 'mysqldump').write_text('#!/bin/bash\necho "ARGV: $*"\nf="${1#--defaults-extra-file=}"\n'
+                                       'echo "MODE: $(stat -c %a "$f")"\ncat "$f"\n')
+    for p in fakebin.iterdir():
+        p.chmod(0o755)
+    lines = main._docker_mysql_exec_lines("'db'", {'username': 'root', 'password': secret})
+    script = f'export PATH={fakebin}:$PATH\nDOCKER=docker\n{lines}\nbx_mysql_exec mysqldump --all-databases\n'
+    out = subprocess.run(['bash', '-c', script], capture_output=True, text=True).stdout
+    argv_line = [l for l in out.splitlines() if l.startswith('ARGV:')][0]
+    assert 'SECRET' not in argv_line and '--all-databases' in argv_line
+    assert 'MODE: 600' in out and 'user="root"' in out
+    assert 'password="' + secret.replace('\\', '\\\\').replace('"', '\\"') + '"' in out

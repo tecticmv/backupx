@@ -2384,6 +2384,35 @@ def _remote_script(script):
     return '{\n' + script.rstrip('\n') + '\n} </dev/null\n'
 
 
+def docker_mysql_cnf(db_config):
+    """[client] option file for docker-exec mode (socket inside the container), or '' without a login."""
+    user = (db_config.get('username') or '').replace('\n', '')
+    if not user:
+        return ''
+    password = (db_config.get('password') or '')
+    if password and is_encrypted(password):
+        password = decrypt_credential(password)
+    value = password.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+    user = user.replace('\\', '\\\\').replace('"', '\\"')
+    return f'[client]\nuser="{user}"\npassword="{value}"\n'
+
+
+def _docker_mysql_exec_lines(safe_container, db_config):
+    """Shell defining bx_mysql_exec PROGRAM ARGS...: docker exec into the database container,
+    with the configured login (if any) in a 0600 temp option file written inside the container
+    from stdin and removed afterwards (--defaults-extra-file must be the first option). Needs
+    $DOCKER. The password is only in this script's text (sent over ssh stdin) and the pipe."""
+    cnf = docker_mysql_cnf(db_config)
+    return f'''BX_CNF={shlex.quote(cnf)}
+bx_mysql_exec() {{
+    if [ -n "$BX_CNF" ]; then
+        printf '%s' "$BX_CNF" | $DOCKER exec -i {safe_container} sh -c 'umask 077; F=$(mktemp) || exit 1; cat > "$F"; P=$1; shift; "$P" --defaults-extra-file="$F" "$@"; RC=$?; rm -f "$F"; exit $RC' sh "$@"
+    else
+        $DOCKER exec {safe_container} "$@"
+    fi
+}}'''
+
+
 def _mysql_option_file(path_expr, password):
     """Shell that writes a 0600 MySQL option file holding the password.
 
@@ -3161,10 +3190,13 @@ def run_database_backup(job_id, job, targets):
                 backup_tag = 'postgres-backup'
                 dump_error_msg = 'pg_dumpall failed'
             else:
-                # MariaDB 11 images ship only mariadb-dump (no mysqldump name)
-                dump_body = (f'$DOCKER exec {safe_container} "$MYSQLDUMP" --all-databases '
+                # MariaDB 11 images ship only mariadb-dump (no mysqldump name). A configured
+                # login (stock images: root has a password) goes in as a 0600 option file
+                # inside the container, never on a command line (_docker_mysql_exec_lines)
+                dump_body = (f'bx_mysql_exec "$MYSQLDUMP" --all-databases '
                              f'--single-transaction --routines --triggers')
-                resolve_lines = (f'MYSQLDUMP=$($DOCKER exec {safe_container} sh -c '
+                resolve_lines = (_docker_mysql_exec_lines(safe_container, db_config) + '\n' +
+                                 f'MYSQLDUMP=$($DOCKER exec {safe_container} sh -c '
                                  f"'command -v mysqldump || command -v mariadb-dump' 2>/dev/null | tail -n1); "
                                  f'[ -n "$MYSQLDUMP" ] || MYSQLDUMP=mysqldump')
                 if pitr_mysql:
@@ -6317,6 +6349,11 @@ def api_test_db_connection():
     db_pass = data.get('password', '')
     docker_container = (data.get('docker_container') or '').strip()
     use_docker = bool(docker_container)
+    if not db_pass and data.get('config_id'):
+        # Editing with the password left blank: test with the stored one
+        stored = get_db_config(data['config_id'])
+        if stored:
+            db_pass = stored.get('password') or ''
 
     # Server config
     server_id = data.get('server_id', '')
@@ -6351,15 +6388,20 @@ def api_test_db_connection():
 
         if use_docker:
             # Pick direct docker or sudo -n docker, then auto-detect DB type and run SELECT 1
+            # (MySQL/MariaDB with the configured login, if any, as in the backups)
+            exec_lines = _docker_mysql_exec_lines(escaped_container, {'username': db_user, 'password': db_pass})
+            pg_user = escaped_user if db_user else 'postgres'
             test_cmd = (
-                f'if docker ps >/dev/null 2>&1; then D="docker"; else D="sudo -n docker"; fi; '
-                f'DETECTED=$($D exec {escaped_container} sh -c "ps aux 2>/dev/null || ps 2>/dev/null" | tr "[:upper:]" "[:lower:]"); '
-                f'if echo "$DETECTED" | grep -qE "mysqld|mariadb"; then '
-                f'  $D exec {escaped_container} mysql -e "SELECT 1" 2>&1 && echo "OK: MySQL/MariaDB"; '
-                f'elif echo "$DETECTED" | grep -q "postgres"; then '
-                f'  $D exec {escaped_container} psql -U postgres -c "SELECT 1" 2>&1 && echo "OK: PostgreSQL"; '
-                f'else '
-                f'  echo "Could not detect database type in container"; exit 2; '
+                f'if docker ps >/dev/null 2>&1; then DOCKER="docker"; else DOCKER="sudo -n docker"; fi\n'
+                f'{exec_lines}\n'
+                f'DETECTED=$($DOCKER exec {escaped_container} sh -c "ps aux 2>/dev/null || ps 2>/dev/null" | tr "[:upper:]" "[:lower:]")\n'
+                f'if echo "$DETECTED" | grep -qE "mysqld|mariadb"; then\n'
+                f'  CLI=$($DOCKER exec {escaped_container} sh -c "command -v mysql || command -v mariadb" 2>/dev/null | tail -n1)\n'
+                f'  bx_mysql_exec "${{CLI:-mysql}}" -e "SELECT 1" 2>&1 && echo "OK: MySQL/MariaDB"\n'
+                f'elif echo "$DETECTED" | grep -q "postgres"; then\n'
+                f'  $DOCKER exec {escaped_container} psql -U {pg_user} -c "SELECT 1" 2>&1 && echo "OK: PostgreSQL"\n'
+                f'else\n'
+                f'  echo "Could not detect database type in container"; exit 2\n'
                 f'fi'
             )
         elif is_postgres:
