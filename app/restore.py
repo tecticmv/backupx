@@ -111,6 +111,22 @@ def iso(value):
     return value.isoformat() if value else None
 
 
+def pg_lsn(value):
+    """WAL-G's LSN (a decimal number, or already 'X/Y') -> PostgreSQL's 'X/Y' text, else None."""
+    if value is None or value == '':
+        return None
+    text = str(value).strip().upper()
+    if re.match(r'^[0-9A-F]{1,8}/[0-9A-F]{1,8}$', text):
+        return text
+    try:
+        n = int(text)
+    except ValueError:
+        return None
+    if n < 0:
+        return None
+    return f'{n >> 32:X}/{n & 0xFFFFFFFF:X}'
+
+
 def parse_last_event_marker(line):
     """'BACKUPX-LAST-EVENT 261102 15:04:01' (the restore script, UTC) -> aware datetime, else None."""
     match = re.match(r'^\s*BACKUPX-LAST-EVENT\s+(\d{6})\s+(\d{1,2}):(\d{2}):(\d{2})\s*$', line or '')

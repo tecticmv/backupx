@@ -704,3 +704,19 @@ def test_missing_bucket_is_explained():
     assert main.bucket_missing_error(err)
     assert 'does not exist' in main.explain_rclone_error(err)
     assert not main.bucket_missing_error('SignatureDoesNotMatch')
+
+
+def test_pg_lsn_and_drill_reference_uses_the_base_end_lsn(monkeypatch):
+    from app import drill_service as ds
+    assert r.pg_lsn(4378853416) == '1/5000028' and r.pg_lsn('0/3000060') == '0/3000060'
+    assert r.pg_lsn(None) is None and r.pg_lsn('x') is None
+
+    class Svc:
+        @staticmethod
+        def derive_plan(data):
+            return ({'method': 'walg', 'storage': {'id': 's1'}, 'target_time': '2026-11-02T18:30:34+00:00',
+                     'wal': {'base_backup': 'base_000000010000000000000003', 'base_time': '2026-11-02T18:15:34.5Z',
+                             'base_finish_lsn': '0/3000138'}}, None)
+    latest, ref = ds._reference(Svc, 'db-pg10')
+    assert ref == {'method': 'walg', 'base_backup': 'base_000000010000000000000003',
+                   'time': '2026-11-02T18:15:35+00:00', 'lsn': '0/3000138'}

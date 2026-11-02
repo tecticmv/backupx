@@ -442,6 +442,7 @@ def derive_plan(data, cfg=None):
         major = r.pg_major((state.get('server_version') or '').replace('PostgreSQL', ''))
         plan['wal'] = {'base_backup': base.get('backup_name') if base else None,
                        'base_time': r.iso(base.get('finish_time')) if base else None,
+                       'base_finish_lsn': r.pg_lsn(base.get('finish_lsn')) if base else None,
                        'uncompressed_size': base.get('uncompressed_size') if base else None,
                        'compressed_size': base.get('compressed_size') if base else None,
                        'pg_major': major}
@@ -768,7 +769,8 @@ def _scratch_walg(ctx, row, plan, job, db_config, target, work):
     ctx.step(1, 5, 'Choosing the base backup')
     backups, err = walg_backups(job, target)
     immediate = plan.get('recovery_target') == 'immediate'
-    wanted = (plan.get('wal') or {}).get('base_backup') if immediate else None
+    target_lsn = plan.get('recovery_target_lsn') or ''
+    wanted = (plan.get('wal') or {}).get('base_backup') if (immediate or target_lsn) else None
     base = next((b for b in backups if b.get('backup_name') == wanted), None) if wanted else \
         _pick_base(backups, target_time)
     if not base:
@@ -796,8 +798,14 @@ def _scratch_walg(ctx, row, plan, job, db_config, target, work):
             f.write(f'{k}={rs.q(v)}\n')
     t = target_time.strftime('%Y-%m-%d %H:%M:%S+00')
     restore_cmd = "restore_command = '/var/lib/postgresql/data/backupx-walg/fetch.sh \"%f\" \"%p\"'\n"
-    # immediate: stop as soon as the base backup is consistent (the base alone, for restore drills)
-    target_line = "recovery_target = 'immediate'\n" if immediate else f"recovery_target_time = '{t}'\n"
+    # immediate: stop as soon as the base backup is consistent (the base alone, for restore drills);
+    # an LSN: replay archived WAL up to exactly that position (the drill's "base backup's own point")
+    if immediate:
+        target_line = "recovery_target = 'immediate'\n"
+    elif target_lsn and re.match(r'^[0-9A-F]{1,8}/[0-9A-F]{1,8}$', target_lsn):
+        target_line = f"recovery_target_lsn = '{target_lsn}'\nrecovery_target_inclusive = true\n"
+    else:
+        target_line = f"recovery_target_time = '{t}'\n"
     settings = restore_cmd + target_line + "recovery_target_action = 'promote'\n"
     try:
         is_old = int(major.split('.')[0]) < 12

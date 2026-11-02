@@ -134,7 +134,7 @@ def _reference(svc, job_id):
         # Restore targets are whole seconds; the base backup finished at a fraction of one
         # (12:04:42.16): its own point is the next whole second, else no base backup "finished before" it
         return latest, {'method': 'walg', 'base_backup': wal['base_backup'],
-                        'time': r.iso(d.ceil_second(wal['base_time']))}
+                        'time': r.iso(d.ceil_second(wal['base_time'])), 'lsn': wal.get('base_finish_lsn')}
     raise tasks.TaskError('point-in-time recovery has no restorable window on this storage (the latest point is '
                           'a plain snapshot)')
 
@@ -230,6 +230,13 @@ def run_drill(ctx, job_id):
         ctx.progress(40, f"Drill B: point-in-time restore to {ref['time']} (the backup's own point)")
         plan_b = _plan(svc, {'job_id': job_id, 'point_type': 'time', 'target_time': ref['time'],
                              'storage_id': storage_id})
+        if ref['method'] == 'walg' and ref.get('lsn'):
+            # The base backup's own point is its end LSN: replaying archived WAL exactly up to there.
+            # A time would race with commits made while the backup was uploading (finish_time is
+            # later than the backup's consistent point) and differ from A on a busy database.
+            plan_b['recovery_target_lsn'] = ref['lsn']
+            plan_b['wal'] = dict(plan_b.get('wal') or {}, base_backup=ref['base_backup'])
+            ctx.log(f"Drill B: WAL replay of {ref['base_backup']} up to its end LSN {ref['lsn']}", stream='system')
         current = _restore(ctx, svc, job, plan_b, 'B')
         ctx.progress(60, 'Drill B: checksumming the copy')
         b = _checksums(current, engine, tables, big)
