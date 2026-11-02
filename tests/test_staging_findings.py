@@ -600,3 +600,49 @@ def test_server_name_must_be_unique(monkeypatch):
     assert main.server_name_taken(' BXSTG-maria106 ')
     assert not main.server_name_taken('bxstg-maria106', exclude_id='s1')
     assert not main.server_name_taken('it-ali-mac')
+
+
+# ---------------------------------------------------------------------------
+# B11: an unreachable storage fails a scratch restore in seconds, not 16 minutes
+# ---------------------------------------------------------------------------
+
+def _http_server(status):
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(status)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    srv = HTTPServer(('127.0.0.1', 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_storage_precheck_fast_failures():
+    import socket
+    import time
+    from app import restore_service as svc
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    closed_port = s.getsockname()[1]
+    s.close()
+    started = time.monotonic()
+    why = svc.storage_precheck({'name': 'MinIO 1', 'endpoint': f'http://127.0.0.1:{closed_port}', 'bucket': 'b'}, 3)
+    assert why and 'refused' in why.lower() and time.monotonic() - started < 10
+    down = _http_server(503)
+    try:
+        why = svc.storage_precheck({'name': 'MinIO 1', 'endpoint': f'http://127.0.0.1:{down.server_port}',
+                                    'bucket': 'b'}, 3)
+        assert why and 'HTTP 503' in why
+    finally:
+        down.shutdown()
+    up = _http_server(403)  # unauthenticated HEAD of a bucket: the storage answers
+    try:
+        assert svc.storage_precheck({'name': 'MinIO 1', 'endpoint': f'http://127.0.0.1:{up.server_port}',
+                                     'bucket': 'b'}, 3) is None
+    finally:
+        up.shutdown()

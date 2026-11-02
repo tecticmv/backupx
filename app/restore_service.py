@@ -860,6 +860,32 @@ def compares_production(row):
     return _json(row.get('info'), {}).get('compare_production') is True
 
 
+def storage_precheck(target, timeout=8):
+    """None if the storage answers, else why not. Fast (seconds): restic and wal-g retry an
+    unreachable or failing storage for about 15 minutes before giving up."""
+    import ssl
+    import urllib.request
+    m = _m()
+    kind, message = m.probe_s3_endpoint(target.get('endpoint') or '', target.get('skip_ssl_verify'), timeout)
+    if kind != 'ok':
+        return message
+    url = f"{m.s3_endpoint_url(target['endpoint']).rstrip('/')}/{target.get('bucket') or ''}"
+    ctx = None
+    if url.startswith('https://') and target.get('skip_ssl_verify'):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    try:
+        # Unauthenticated HEAD of the bucket: 403/404/200 = the storage answers; 5xx = it doesn't
+        urllib.request.urlopen(urllib.request.Request(url, method='HEAD'), timeout=timeout, context=ctx)
+    except urllib.error.HTTPError as e:
+        if e.code >= 500:
+            return f"{target.get('name')} answers HTTP {e.code} ({e.reason})"
+    except Exception as e:
+        return f"{target.get('name')} did not answer: {e}"
+    return None
+
+
 def do_scratch(ctx, row, verify_production=True):
     """Run the scratch restore of `row` (status running -> ready). Cleans up on failure; raises.
 
@@ -876,6 +902,10 @@ def do_scratch(ctx, row, verify_production=True):
     method = plan['method']
     _require_docker()
     try:
+        problem = storage_precheck(target)
+        if problem:
+            raise tasks.TaskError(f"Storage {target.get('name')} is not reachable, nothing was restored: {problem}. "
+                                  'Pick another storage or retry when it is back.')
         with ctx.repo_locks([_m().job_repo_url(job, target)]):
             if method == 'dump':
                 info = _scratch_dump(ctx, row, plan, job, db_config, target, work, engine)

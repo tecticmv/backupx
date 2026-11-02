@@ -220,6 +220,8 @@ def world(db, monkeypatch, tmp_path):
     monkeypatch.setattr(main, 'get_snapshots', lambda job, target: [dict(s) for s in SNAPS])
     monkeypatch.setattr(main.limiter, 'enabled', False)
     monkeypatch.setenv('RESTORE_WORK_DIR', str(tmp_path / 'restores'))
+    from app import restore_service
+    monkeypatch.setattr(restore_service, 'storage_precheck', lambda target, timeout=8: None)
     return main
 
 
