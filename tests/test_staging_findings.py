@@ -815,3 +815,17 @@ def test_snapshot_point_refetches_a_stale_per_worker_cache(monkeypatch):
     monkeypatch.setattr(svc, '_windows', lambda job, engine, state: [])
     plan, _err = svc.derive_plan({'job_id': 'j', 'point_type': 'snapshot', 'snapshot_id': 'pre1', 'target': 'scratch'})
     assert plan['dump']['snapshot_id'] == 'pre1' and 'inv' in calls
+
+
+def test_pg_window_starts_when_the_oldest_base_backup_finished(monkeypatch):
+    """Staging: right after enabling, the latest point (last archive, floored to the second) came before the
+    only base backup's finish (00:36:01 vs 00:36:01.5) and the drill found no base backup."""
+    def fake_run(server, script, timeout):
+        if 'backup-list' in script:
+            return subprocess.CompletedProcess([], 0, json.dumps([
+                {'start_time': '2026-10-31T12:04:30Z', 'finish_time': '2026-10-31T12:04:42.160314Z'},
+                {'start_time': '2026-10-31T13:00:00Z', 'finish_time': '2026-10-31T13:00:09Z'}]), '')
+        return subprocess.CompletedProcess([], 0, '\n'.join(f'PITR\t{k}\t{v}' for k, v in PG_FACTS.items()), '')
+    ps, job, targets, rows, _ = _pg_env_with_run(monkeypatch, fake_run)
+    ps._pg_tick('dspace', job, dict(SERVER), {'type': 'postgresql'}, targets)
+    assert json.loads(rows['info'])['oldest_base_backup'] == '2026-10-31T12:04:43+00:00'

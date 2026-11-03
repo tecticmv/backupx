@@ -1044,8 +1044,15 @@ def _pg_tick(job_id, job, server, db_config, targets):
             except ValueError:
                 backups = None
         if backups is not None:
-            times = sorted(b.get('start_time') for b in backups if b.get('start_time'))
-            info['oldest_base_backup'] = times[0] if times else None
+            # The window starts when the oldest base backup is usable: its finish, rounded up to the next
+            # second (restore targets are whole seconds; a base finishing at 12:04:42.16 can't serve 12:04:42)
+            done = sorted(pitr._utc(b['finish_time']) for b in backups if b.get('finish_time'))
+            if done:
+                first = done[0] if done[0].microsecond == 0 else                     done[0].replace(microsecond=0) + timedelta(seconds=1)
+                info['oldest_base_backup'] = first.isoformat()
+            else:
+                times = sorted(b.get('start_time') for b in backups if b.get('start_time'))
+                info['oldest_base_backup'] = times[0] if times else None
             info['base_backups'] = len(backups)
             info.pop('backup_list_error', None)
         else:
