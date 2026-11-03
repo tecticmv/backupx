@@ -187,37 +187,53 @@ def ceil_second(value):
     return t if t.microsecond == 0 else t.replace(microsecond=0) + timedelta(seconds=1)
 
 
-def latest_reaches(method, target_time, dump_time, last_event_at, server_changed_at, tolerance_minutes):
-    """C, MySQL/MariaDB: does the restored copy really reach as far as the window claims?
+def latest_reaches(method, target_time, dump_time, replayed, record, slack_minutes=2):
+    """C: does the latest-point copy reach as far as the backups say it should?
 
-    The window's end can be "now" because the streamer reported it was in sync; the drill checks
-    that against what was actually replayed: the newest replayed binlog event must be no older
-    than the last time production's binlog position was seen to move (server_changed_at, from
-    the PITR ticks - backupx's own records, not a production query), capped at the target time.
-    A frozen or renumbered chain (data stops at 15:04 while the server kept writing until the
-    claimed 15:23) fails here instead of passing as "verified".
+    Compared only with backupx's own record of what it received and shipped (never production):
+      replayed - from the scratch copy: {'last_event_at'} (MySQL/MariaDB, newest replayed binlog event)
+                 or {'replay_lsn_segment'} (PostgreSQL, (timeline, segment) the copy replayed to)
+      record   - from pitr_state / pitr_segments: {'state', 'in_sync', 'shipped_until' (newest shipped
+                 binlog data: segment end / open-file copy mtime), 'last_archived_segment' (PG)}
+    Fails when the chain is broken (the latest point predates the break), when the window claims a
+    time beyond the last shipped data without the streamer having verified it was in sync, or when
+    the restored copy stops short of the last shipped data.
 
     Returns {'ok': True/False/None (not checkable), 'detail'}.
     """
+    record = record or {}
+    replayed = replayed or {}
+    target = r.utc(target_time) if target_time else None
+    slack = timedelta(minutes=max(1, int(slack_minutes or 0)))
+    if record.get('state') == 'broken':
+        return {'ok': False, 'detail': ('the point-in-time chain is broken: the latest restorable point predates '
+                                        'the break, newer changes are not in the backups until the next full backup')}
+    if method == 'walg':
+        archived, got = record.get('last_archived_segment'), replayed.get('replay_lsn_segment')
+        if not archived or not got:
+            return {'ok': None, 'detail': 'replay position or last archived WAL unknown; not checked'}
+        if tuple(got) >= tuple(archived):
+            return {'ok': True, 'detail': 'replayed into the last archived WAL segment'}
+        return {'ok': False, 'detail': (f'the restored copy replayed WAL only to segment {got[1]:X}, but the archive '
+                                        f'holds up to {archived[1]:X}')}
     if method != 'binlog':
         return {'ok': None, 'detail': ''}
-    target = r.utc(target_time) if target_time else None
-    changed = r.utc(server_changed_at) if server_changed_at else None
-    if target is None or changed is None:
-        return {'ok': None, 'detail': 'no record of when production last wrote; not checked'}
-    expected = min(target, changed)
+    shipped = r.utc(record.get('shipped_until')) if record.get('shipped_until') else None
+    if target is None or shipped is None:
+        return {'ok': None, 'detail': 'no record of shipped binlogs; not checked'}
+    if target > shipped + slack and not record.get('in_sync'):
+        return {'ok': False, 'detail': (f'the window claims {r.fmt_time(target)}, but the last shipped binlog data is '
+                                        f'from {r.fmt_time(shipped)} and the streamer was not verified in sync')}
+    expected = min(target, shipped)
     if dump_time and expected <= r.utc(dump_time):
-        return {'ok': True, 'detail': 'no changes after the full backup'}
-    last = r.utc(last_event_at) if last_event_at else None
+        return {'ok': True, 'detail': 'nothing shipped after the full backup'}
+    last = r.utc(replayed.get('last_event_at')) if replayed.get('last_event_at') else None
     if last is None:
         return {'ok': None, 'detail': "the newest replayed event couldn't be read; not checked"}
-    slack = timedelta(minutes=max(1, int(tolerance_minutes or 0)))
     if last + slack >= expected:
-        return {'ok': True, 'detail': f'replayed up to {r.fmt_time(last)}'}
-    return {'ok': False,
-            'detail': (f'the restored data ends at {r.fmt_time(last)}, but production kept writing until at '
-                       f'least {r.fmt_time(expected)} (window end {r.fmt_time(target)}): the shipped binlogs '
-                       'miss changes')}
+        return {'ok': True, 'detail': f'replayed up to {r.fmt_time(last)} (shipped up to {r.fmt_time(shipped)})'}
+    return {'ok': False, 'detail': (f'the restored data ends at {r.fmt_time(last)}, but binlogs were shipped up to '
+                                    f'{r.fmt_time(shipped)}: the replay misses shipped changes')}
 
 
 def readable(counts):

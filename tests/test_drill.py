@@ -53,7 +53,7 @@ def world(monkeypatch):
     for name in ('_ssh_run', '_ssh_popen', '_build_ssh_cmd_for_server', 'run_backup'):
         if hasattr(main, name):
             monkeypatch.setattr(main, name, forbidden(f'main.{name}'))
-    for name in ('run_tick', '_run'):
+    for name in ('run_tick', '_run', '_run_checked', '_tick', '_mysql_tick', '_pg_tick', 'check_prereqs'):
         monkeypatch.setattr(pitr_service, name, forbidden(f'pitr_service.{name}'))
 
     anchor_time = '2026-11-01T21:00:05+00:00'
@@ -219,7 +219,7 @@ def test_drill_never_references_production_helpers():
     from app import drill_service
     src = inspect.getsource(drill_service)
     for name in ('prod_sql', 'prod_runner', '_ssh_run', '_ssh_popen', '_build_ssh_cmd', 'run_tick', 'run_verify',
-                 'mysql_connect_args'):
+                 'mysql_connect_args', '_tick(', 'check_prereqs', 'ensure_and_scan', 'server_changed_at'):
         assert name not in src, name
 
 

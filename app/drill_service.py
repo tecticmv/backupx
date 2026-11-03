@@ -151,13 +151,34 @@ def _restore(ctx, svc, job, plan, label):
     return svc.do_scratch(ctx, row, verify_production=False)
 
 
-def _server_changed_at(job_id):
-    """When the PITR ticks last saw production's binlog position move (backupx's own row)."""
-    from . import pitr_service
-    try:
-        return svc_json(pitr_service.load_state(job_id).get('info')).get('server_changed_at')
-    except Exception:
-        return None
+def backup_record(job_id):
+    """What backupx itself received and shipped for the job (pitr_state / pitr_segments; no production)."""
+    from . import pitr, pitr_service
+    state = pitr_service.load_state(job_id)
+    info = svc_json(state.get('info'))
+    record = {'state': state.get('state'), 'in_sync': bool(info.get('in_sync')), 'shipped_until': None,
+              'last_archived_segment': None}
+    if (state.get('kind') or 'mysql') == 'postgres':
+        pos = pitr._wal_position(info.get('last_archived_wal'), 16 * 1024 * 1024)
+        record['last_archived_segment'] = (0, pos[1]) if pos else None
+        return record
+    chain = state.get('chain_id')
+    ends = [s['end_time'] for s in pitr_service.load_segments(job_id, include_forgotten=False)
+            if s.get('chain_id') == chain and s.get('end_time')]
+    record['shipped_until'] = max(ends).isoformat() if ends else None
+    return record
+
+
+def _replay_segment(row, engine):
+    """PostgreSQL scratch copy: (0, segment) of the last replayed WAL record (timeline ignored: promotion
+    switches to a new one)."""
+    from . import pitr
+    marked, _res = _scratch_sql(row, engine, rs.RUN_SQL + 'run_sql lsn "" ' + rs.q(
+        'SELECT pg_walfile_name(pg_last_wal_replay_lsn())') + '\n', 120)
+    rc, lines = marked.get('lsn') or (1, [])
+    text = [x.strip() for x in lines if x.strip()]
+    pos = pitr._wal_position(text[-1], 16 * 1024 * 1024) if rc == 0 and text else None
+    return (0, pos[1]) if pos else None
 
 
 def svc_json(text):
@@ -257,13 +278,19 @@ def run_drill(ctx, job_id):
         c_tables = _list_tables(current, engine, databases)[:cfg['max_tables']]
         ctx.progress(90, f'Drill C: reading {len(c_tables)} tables')
         counts = _checksums(current, engine, c_tables, {f'{t[0]}.{t[1]}' for t in c_tables})
+        replayed = {'last_event_at': c_info.get('last_event_at')}
+        if plan_c.get('method') == 'walg':
+            try:
+                replayed['replay_lsn_segment'] = _replay_segment(current, engine)
+            except Exception as e:
+                ctx.log(f'Drill C: replay position unreadable: {e}', stream='system')
         _drop(svc, ctx, current)
         current = None
         latest_check = dict(d.readable(counts), target_time=latest.get('target_time'))
-        # ... and reaches as far as the window claims (backupx's records of production, no query)
+        # ... and reaches what backupx received and shipped (its own records; production is never read)
         reach = d.latest_reaches(plan_c.get('method'), plan_c.get('target_time'),
-                                 (plan_c.get('dump') or {}).get('time'), c_info.get('last_event_at'),
-                                 _server_changed_at(job_id), int(job.get('pitr_interval') or 5) + 2)
+                                 (plan_c.get('dump') or {}).get('time'), replayed, backup_record(job_id),
+                                 int(job.get('pitr_interval') or 5) + 2)
         latest_check.update(reaches=reach['ok'], reaches_detail=reach['detail'],
                             last_event_at=c_info.get('last_event_at'))
         ctx.log(f"Drill C: newest replayed event {c_info.get('last_event_at') or 'unknown'}; "

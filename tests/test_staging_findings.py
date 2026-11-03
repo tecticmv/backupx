@@ -386,22 +386,31 @@ def test_restore_script_reports_the_newest_replayed_event():
     assert r.parse_last_event_marker('BACKUPX-LAST-EVENT unknown') is None
 
 
-def test_drill_latest_point_must_reach_the_claimed_window_end():
+def test_drill_latest_point_checked_against_what_was_shipped():
     dump = datetime(2026, 11, 2, 3, 0, tzinfo=UTC)
     target = datetime(2026, 11, 2, 15, 23, tzinfo=UTC)
-    # frozen chain: data ends 15:04, production kept writing until 15:23
-    res = drill.latest_reaches('binlog', target, dump, datetime(2026, 11, 2, 15, 4, tzinfo=UTC),
-                               datetime(2026, 11, 2, 15, 22, 30, tzinfo=UTC), 7)
-    assert res['ok'] is False and 'miss changes' in res['detail']
-    # healthy: replayed up to 15:21, last write seen 15:22:30
-    assert drill.latest_reaches('binlog', target, dump, datetime(2026, 11, 2, 15, 21, tzinfo=UTC),
-                                datetime(2026, 11, 2, 15, 22, 30, tzinfo=UTC), 7)['ok'] is True
-    # idle server: last write before the dump -> nothing to check
-    assert drill.latest_reaches('binlog', target, dump, dump - timedelta(days=1), dump - timedelta(hours=5),
-                                7)['ok'] is True
-    # no record: not checkable (never a failure)
-    assert drill.latest_reaches('binlog', target, dump, None, None, 7)['ok'] is None
-    assert drill.latest_reaches('walg', target, dump, None, target, 7)['ok'] is None
+    shipped = {'state': 'ok', 'in_sync': True, 'shipped_until': '2026-11-02T15:22:30+00:00'}
+    ok = drill.latest_reaches('binlog', target, dump, {'last_event_at': '2026-11-02T15:22:10+00:00'}, shipped)
+    assert ok['ok'] is True
+    # frozen chain (B1): the window claims 15:23, the last shipped data is 15:04, not verified in sync
+    frozen = dict(shipped, in_sync=False, shipped_until='2026-11-02T15:04:00+00:00')
+    res = drill.latest_reaches('binlog', target, dump, {'last_event_at': '2026-11-02T15:04:00+00:00'}, frozen)
+    assert res['ok'] is False and 'last shipped binlog data' in res['detail']
+    # the replay stops short of what was shipped
+    res = drill.latest_reaches('binlog', target, dump, {'last_event_at': '2026-11-02T14:00:00+00:00'}, shipped)
+    assert res['ok'] is False and 'misses shipped changes' in res['detail']
+    # broken chain: the latest point predates the break
+    res = drill.latest_reaches('binlog', target, dump, {'last_event_at': '2026-11-02T15:22:10+00:00'},
+                               dict(shipped, state='broken'))
+    assert res['ok'] is False and 'broken' in res['detail']
+    # nothing shipped after the dump / no record: not a failure
+    assert drill.latest_reaches('binlog', target, dump, {}, dict(shipped, shipped_until=dump.isoformat()))['ok']
+    assert drill.latest_reaches('binlog', target, dump, {}, {'state': 'ok'})['ok'] is None
+    # PostgreSQL: replayed into the last archived segment
+    pg = {'state': 'ok', 'last_archived_segment': (0, 0x10)}
+    assert drill.latest_reaches('walg', target, dump, {'replay_lsn_segment': (0, 0x10)}, pg)['ok'] is True
+    assert drill.latest_reaches('walg', target, dump, {'replay_lsn_segment': (0, 0x0E)}, pg)['ok'] is False
+    assert drill.latest_reaches('walg', target, dump, {}, pg)['ok'] is None
 
 
 def test_drill_fails_when_latest_point_is_incomplete(world, monkeypatch):
@@ -414,13 +423,26 @@ def test_drill_fails_when_latest_point_is_incomplete(world, monkeypatch):
             out['info'] = json.dumps({'last_event_at': '2026-11-02T01:00:00+00:00'})
         return out
     monkeypatch.setattr(svc, 'do_scratch', do_scratch)
-    monkeypatch.setattr(ds, '_server_changed_at', lambda job_id: '2026-11-02T02:59:00+00:00')
+    monkeypatch.setattr(ds, 'backup_record', lambda job_id: {'state': 'ok', 'in_sync': True,
+                                                             'shipped_until': '2026-11-02T02:59:00+00:00'})
     res = ds.run_drill(Ctx(), 'drj')
     assert not res['ok'] and res['latest']['reaches'] is False and 'INCOMPLETE' in res['summary']
     assert world['alerts'] and world['prod_calls'] == []
-    # reaching the last write passes
-    monkeypatch.setattr(ds, '_server_changed_at', lambda job_id: '2026-11-02T01:03:00+00:00')
+    monkeypatch.setattr(ds, 'backup_record', lambda job_id: {'state': 'ok', 'in_sync': True,
+                                                             'shipped_until': '2026-11-02T01:01:00+00:00'})
     assert ds.run_drill(Ctx(), 'drj')['ok']
+
+
+def test_drill_record_comes_from_backupx_rows_only():
+    """The latest-point check reads pitr_state/pitr_segments (what was shipped), never production
+    or the tick's observations of production."""
+    import inspect
+    from app import drill_service
+    src = inspect.getsource(drill_service)
+    for name in ('server_changed_at', 'server_pos', 'prod_sql', 'prod_runner', '_ssh_run', '_ssh_popen',
+                 '_build_ssh_cmd', 'run_tick', '_tick(', 'run_verify', 'mysql_connect_args', 'ensure_and_scan',
+                 'check_prereqs'):
+        assert name not in src, name
 
 
 # ---------------------------------------------------------------------------
