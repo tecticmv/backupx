@@ -829,3 +829,16 @@ def test_pg_window_starts_when_the_oldest_base_backup_finished(monkeypatch):
     ps, job, targets, rows, _ = _pg_env_with_run(monkeypatch, fake_run)
     ps._pg_tick('dspace', job, dict(SERVER), {'type': 'postgresql'}, targets)
     assert json.loads(rows['info'])['oldest_base_backup'] == '2026-10-31T12:04:43+00:00'
+
+
+def test_walg_scratch_server_gets_this_containers_ca_bundle(tmp_path, monkeypatch):
+    """Production drill: postgres:10-bullseye has no CA bundle, so wal-fetch inside the scratch server
+    failed with x509 against an HTTPS storage the backupx container trusts."""
+    import inspect
+    from app import restore_service as svc
+    bundle = tmp_path / 'ca.crt'
+    bundle.write_text('CERT')
+    monkeypatch.setenv('SSL_CERT_FILE', str(bundle))
+    assert svc.scratch_ca_bundle() == str(bundle)
+    src = inspect.getsource(svc._scratch_walg)
+    assert 'WALG_S3_CA_CERT_FILE=/var/lib/postgresql/data/backupx-walg/ca.crt' in src

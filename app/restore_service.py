@@ -312,6 +312,15 @@ def walg_env(target, prefix):
     }
 
 
+def scratch_ca_bundle():
+    """The CA bundle of this container (passed to WAL-G inside scratch servers), or None."""
+    for path in (os.environ.get('SSL_CERT_FILE') or '', '/etc/ssl/certs/ca-certificates.crt',
+                 '/etc/pki/tls/certs/ca-bundle.crt'):
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
 def walg_backups(job, target):
     """wal-g backup-list --detail in this container (empty list + error text when unavailable)."""
     binary = shutil.which('wal-g') or ('/usr/local/bin/wal-g' if os.path.exists('/usr/local/bin/wal-g') else None)
@@ -812,10 +821,19 @@ def _scratch_walg(ctx, row, plan, job, db_config, target, work):
     with open(os.path.join(helper, 'fetch.sh'), 'w') as f:
         f.write(rs.WALG_FETCH_SH)
     os.chmod(os.path.join(helper, 'fetch.sh'), 0o755)
+    # The scratch server fetches WAL itself: give wal-g there the CA bundle this container trusts
+    # (an older image's bundle may not know the storage's CA: "x509: certificate signed by unknown authority")
+    ca_line = ''
+    bundle = scratch_ca_bundle()
+    if bundle:
+        shutil.copy2(bundle, os.path.join(helper, 'ca.crt'))
+        os.chmod(os.path.join(helper, 'ca.crt'), 0o644)
+        ca_line = 'WALG_S3_CA_CERT_FILE=/var/lib/postgresql/data/backupx-walg/ca.crt\n'
     fd = os.open(os.path.join(helper, 'env'), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w') as f:
         for k, v in walg_env(target, job.get('backup_prefix') or job['id']).items():
             f.write(f'{k}={rs.q(v)}\n')
+        f.write(ca_line)
     t = target_time.strftime('%Y-%m-%d %H:%M:%S+00')
     restore_cmd = "restore_command = '/var/lib/postgresql/data/backupx-walg/fetch.sh \"%f\" \"%p\"'\n"
     # immediate: stop as soon as the base backup is consistent (the base alone, for restore drills);
