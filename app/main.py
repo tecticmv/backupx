@@ -3821,7 +3821,7 @@ def api_login():
             from .audit.decorator import audit_login
             audit_login(username, username, True, ip_address, user_agent)
         except Exception as e:
-            logger.debug(f"Audit logging failed: {e}")
+            logger.warning(f"Audit logging failed: {e}")
         return jsonify({'user': {'id': username, 'username': username}, 'csrf_token': generate_csrf()})
 
     logger.warning(f"Failed login attempt for user: {username} from {request.remote_addr}")
@@ -3830,7 +3830,7 @@ def api_login():
         from .audit.decorator import audit_login
         audit_login(username or 'unknown', username or 'unknown', False, ip_address, user_agent)
     except Exception as e:
-        logger.debug(f"Audit logging failed: {e}")
+        logger.warning(f"Audit logging failed: {e}")
     return jsonify({'error': 'Invalid credentials'}), 401
 
 
@@ -3847,7 +3847,7 @@ def api_logout():
                 request.headers.get('User-Agent', '')
             )
         except Exception as e:
-            logger.debug(f"Audit logging failed: {e}")
+            logger.warning(f"Audit logging failed: {e}")
     security.clear_step_up()
     logout_user()
     return jsonify({'success': True})
@@ -3902,7 +3902,7 @@ def api_step_up():
                       ip_address=request.remote_addr, user_agent=request.headers.get('User-Agent', ''),
                       status='success' if ok else 'failure')
     except Exception as e:
-        logger.debug(f"Audit logging failed: {e}")
+        logger.warning(f"Audit logging failed: {e}")
     if not ok:
         logger.warning(f"Failed step-up for user {current_user.id} from {request.remote_addr}")
         return jsonify({'error': 'Incorrect password', 'code': 'step_up_failed'}), 401
@@ -3970,7 +3970,7 @@ def api_change_password():
                 new_value={'action': 'password_changed'}
             )
     except Exception as e:
-        logger.debug(f"Audit logging failed: {e}")
+        logger.warning(f"Audit logging failed: {e}")
 
     logger.info(f"Password changed for user: {current_user.id}")
     return jsonify({'success': True, 'message': 'Password changed successfully'})
@@ -4212,7 +4212,7 @@ def api_job_pitr_restore_script(job_id):
                              status='success', new_value={'time': target.isoformat()},
                              ip_address=request.remote_addr, user_agent=request.headers.get('User-Agent', ''))
     except Exception as e:
-        logger.debug(f"Audit logging failed: {e}")
+        logger.warning(f"Audit logging failed: {e}")
     response = app.response_class(text, mimetype='text/x-shellscript')
     response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
     return response
@@ -4413,7 +4413,7 @@ def api_create_job():
                 user_agent=request.headers.get('User-Agent', '')
             )
     except Exception as e:
-        logger.debug(f"Audit logging failed: {e}")
+        logger.warning(f"Audit logging failed: {e}")
 
     return jsonify({'success': True, 'job_id': job_id}), 201
 
@@ -4519,7 +4519,7 @@ def api_update_job(job_id):
                 user_agent=request.headers.get('User-Agent', '')
             )
     except Exception as e:
-        logger.debug(f"Audit logging failed: {e}")
+        logger.warning(f"Audit logging failed: {e}")
 
     return jsonify({'success': True})
 
@@ -4555,7 +4555,7 @@ def api_delete_job(job_id):
                 user_agent=request.headers.get('User-Agent', '')
             )
     except Exception as e:
-        logger.debug(f"Audit logging failed: {e}")
+        logger.warning(f"Audit logging failed: {e}")
 
     return jsonify({'success': True})
 
@@ -4598,7 +4598,7 @@ def api_run_job(job_id):
             triggered_by='manual'
         )
     except Exception as e:
-        logger.debug(f"Audit logging failed: {e}")
+        logger.warning(f"Audit logging failed: {e}")
 
     params = {'job_id': job_id, 'trigger': 'rerun' if storage_ids else 'manual'}
     if storage_ids:
@@ -5485,6 +5485,7 @@ def api_delete_s3_config_route(config_id):
                                  f"Remove it from those jobs first."}), 400
 
     delete_s3_config(config_id)
+    _audit_delete('s3_config', config_id, config.get('name', config_id), config)
 
     return jsonify({'success': True})
 
@@ -5924,6 +5925,7 @@ def api_delete_server_route(server_id):
         return jsonify({'error': 'Server not found'}), 404
 
     delete_server_from_db(server_id)
+    _audit_delete('server', server_id, server.get('name', server_id), server)
 
     return jsonify({'success': True})
 
@@ -6376,6 +6378,7 @@ def api_delete_db_config_route(config_id):
         return jsonify({'error': 'Configuration not found'}), 404
 
     delete_db_config_from_db(config_id)
+    _audit_delete('db_config', config_id, config.get('name', config_id), config)
 
     return jsonify({'success': True})
 
@@ -6569,6 +6572,7 @@ def api_delete_notification(channel_id):
         return jsonify({'error': 'Channel not found'}), 404
 
     delete_notification_channel(channel_id)
+    _audit_delete('notification_channel', channel_id, existing.get('name', channel_id), existing)
     return jsonify({'success': True})
 
 
@@ -6941,7 +6945,27 @@ def _audit(action, resource_type, resource_id=None, resource_name=None, details=
                          resource_name=resource_name, new_value=details, user_id=user, user_name=user,
                          ip_address=ip, user_agent=user_agent, status=status, error_message=error)
     except Exception as e:
-        logger.debug(f"Audit logging failed: {e}")
+        logger.warning(f"Audit logging failed: {e}")
+
+
+def _audit_delete(resource_type, resource_id, resource_name, row):
+    """Audit a deleted resource; the row is redacted by the audit logger."""
+    try:
+        from .audit.logger import get_audit_logger, AuditLogger
+        audit_logger = get_audit_logger()
+        if not audit_logger:
+            return
+        user, ip = _actor()
+        try:
+            user_agent = request.headers.get('User-Agent', '')
+        except Exception:
+            user_agent = None
+        audit_logger.log(action=AuditLogger.ACTION_DELETE, resource_type=resource_type,
+                         resource_id=resource_id, resource_name=resource_name,
+                         old_value=dict(row) if row else None, user_id=user, user_name=user,
+                         ip_address=ip, user_agent=user_agent)
+    except Exception as e:
+        logger.warning(f"Audit logging failed: {e}")
 
 
 def _enqueue_task_response(kind, params, title=None, resource_type=None, resource_id=None,
