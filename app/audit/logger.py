@@ -14,8 +14,16 @@ logger = logging.getLogger(__name__)
 SENSITIVE_FIELDS = {
     'password', 'secret_key', 'access_key', 'api_key', 'restic_password',
     's3_secret_key', 's3_access_key', 'agent_api_key', 'smtp_password',
-    'token', 'secret', 'credential', 'private_key', 'ssh_key_content'
+    'token', 'secret', 'credential', 'private_key', 'ssh_key_content',
+    # server / notification channel secrets (deletes record the whole row)
+    'ssh_password', 'bot_token', 'webhook_url', 'url', 'headers',
+    'routing_key', 'integration_key', 'auth_token',
 }
+
+def _dumps(value) -> str:
+    """json.dumps for audit details: datetimes, Decimals, UUIDs... become strings."""
+    return json.dumps(value, default=str)
+
 
 # Global audit logger instance
 _audit_logger: Optional['AuditLogger'] = None
@@ -106,17 +114,24 @@ class AuditLogger:
         if action == self.ACTION_READ and not self.log_reads:
             return None
 
-        # Compute changes for UPDATE operations
+        # Compute changes for UPDATE operations. Rows hold datetimes (and
+        # other non-JSON values), so everything goes through _dumps; a value
+        # that still can't be serialised must not drop the whole entry.
         changes = None
-        if action == self.ACTION_UPDATE and old_value and new_value:
-            changes = self._compute_changes(old_value, new_value)
-        elif action == self.ACTION_CREATE and new_value:
-            changes = json.dumps(self._redact_sensitive(new_value))
-        elif action == self.ACTION_DELETE and old_value:
-            changes = json.dumps({'deleted': self._redact_sensitive(old_value)})
-        elif new_value:
-            # Other actions (RESTORE_FILES, STEP_UP, ...): record their details
-            changes = json.dumps(self._redact_sensitive(new_value), default=str)
+        try:
+            if action == self.ACTION_UPDATE and old_value and new_value:
+                changes = self._compute_changes(old_value, new_value)
+            elif action == self.ACTION_CREATE and new_value:
+                changes = _dumps(self._redact_sensitive(new_value))
+            elif action == self.ACTION_DELETE and old_value:
+                changes = _dumps({'deleted': self._redact_sensitive(old_value)})
+            elif new_value:
+                # Other actions (RESTORE_FILES, STEP_UP, ...): record their details
+                changes = _dumps(self._redact_sensitive(new_value))
+        except Exception as e:
+            logger.warning(f"Audit: could not serialise details of {action} {resource_type} "
+                           f"{resource_id}: {e}")
+            changes = _dumps({'error': 'details could not be serialised'})
 
         timestamp = datetime.now().isoformat()
 
@@ -169,7 +184,7 @@ class AuditLogger:
                         'new': new_val
                     }
 
-        return json.dumps(changes) if changes else None
+        return _dumps(changes) if changes else None
 
     def _redact_sensitive(self, data: Dict) -> Dict:
         """
@@ -186,10 +201,13 @@ class AuditLogger:
 
         redacted = {}
         for key, value in data.items():
-            if key.lower() in SENSITIVE_FIELDS:
+            if str(key).lower() in SENSITIVE_FIELDS:
                 redacted[key] = '[REDACTED]' if value else None
             elif isinstance(value, dict):
                 redacted[key] = self._redact_sensitive(value)
+            elif isinstance(value, (list, tuple)):
+                redacted[key] = [self._redact_sensitive(v) if isinstance(v, dict) else v
+                                 for v in value]
             else:
                 redacted[key] = value
 

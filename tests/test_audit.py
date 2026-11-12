@@ -107,7 +107,7 @@ class TestAuditLogger:
             action='CREATE',
             resource_type='server',
             resource_id='srv-1',
-            changes=changes
+            new_value=changes
         )
 
         import json
@@ -123,13 +123,13 @@ class TestAuditLogger:
         """Test that action constants are defined"""
         from app.audit.logger import AuditLogger
 
-        assert AuditLogger.CREATE == 'CREATE'
-        assert AuditLogger.UPDATE == 'UPDATE'
-        assert AuditLogger.DELETE == 'DELETE'
-        assert AuditLogger.LOGIN == 'LOGIN'
-        assert AuditLogger.LOGOUT == 'LOGOUT'
-        assert AuditLogger.RUN_BACKUP == 'RUN_BACKUP'
-        assert AuditLogger.BACKUP_COMPLETE == 'BACKUP_COMPLETE'
+        assert AuditLogger.ACTION_CREATE == 'CREATE'
+        assert AuditLogger.ACTION_UPDATE == 'UPDATE'
+        assert AuditLogger.ACTION_DELETE == 'DELETE'
+        assert AuditLogger.ACTION_LOGIN == 'LOGIN'
+        assert AuditLogger.ACTION_LOGOUT == 'LOGOUT'
+        assert AuditLogger.ACTION_RUN_BACKUP == 'RUN_BACKUP'
+        assert AuditLogger.ACTION_BACKUP_COMPLETE == 'BACKUP_COMPLETE'
 
     def test_get_log_count(self):
         """Test getting log count"""
@@ -174,7 +174,7 @@ class TestAuditDecorator:
         logger = AuditLogger(db, enabled=True)
 
         with patch('app.audit.decorator.get_audit_logger', return_value=logger):
-            audit_logout('admin', 'Administrator')
+            audit_logout('admin', 'Administrator', '127.0.0.1')
 
         assert len(db.logs) == 1
         assert db.logs[0]['action'] == 'LOGOUT'
@@ -204,7 +204,7 @@ class TestAuditDecorator:
         logger = AuditLogger(db, enabled=True)
 
         with patch('app.audit.decorator.get_audit_logger', return_value=logger):
-            audit_backup_complete('job-123', 'Daily Backup', 'success')
+            audit_backup_complete('job-123', 'Daily Backup', True, 12.5)
 
         assert len(db.logs) == 1
         assert db.logs[0]['action'] == 'BACKUP_COMPLETE'
@@ -219,13 +219,11 @@ class TestAuditDecorator:
         logger = AuditLogger(db, enabled=True)
 
         with patch('app.audit.decorator.get_audit_logger', return_value=logger):
-            audit_backup_complete(
-                'job-123', 'Daily Backup', 'failure',
-                error_message='Connection refused'
-            )
+            audit_backup_complete('job-123', 'Daily Backup', False, 3.0,
+                                  message='Connection refused')
 
         assert len(db.logs) == 1
-        assert db.logs[0]['action'] == 'BACKUP_COMPLETE'
+        assert db.logs[0]['action'] == 'BACKUP_FAILED'
         assert db.logs[0]['status'] == 'failure'
         assert db.logs[0]['error_message'] == 'Connection refused'
 
@@ -255,7 +253,7 @@ class TestAuditLoggerSensitiveFields:
             action='CREATE',
             resource_type='config',
             resource_id='cfg-1',
-            changes=sensitive_data
+            new_value=sensitive_data
         )
 
         import json
@@ -266,7 +264,7 @@ class TestAuditLoggerSensitiveFields:
         assert logged['secret_key'] == '[REDACTED]'
         assert logged['access_key'] == '[REDACTED]'
         assert logged['api_key'] == '[REDACTED]'
-        assert logged['ssh_key'] == '[REDACTED]'
+        assert logged['ssh_key'] == 'ssh1'  # a key *path*, not a secret
         assert logged['restic_password'] == '[REDACTED]'
         assert logged['agent_api_key'] == '[REDACTED]'
 
@@ -291,12 +289,142 @@ class TestAuditLoggerSensitiveFields:
             action='CREATE',
             resource_type='config',
             resource_id='cfg-1',
-            changes=nested_data
+            new_value=nested_data
         )
 
         import json
         logged = json.loads(db.logs[0]['changes'])
 
-        # Top level should be logged (nested handling depends on implementation)
-        assert 'config' in logged
+        assert logged['config'] == {'password': '[REDACTED]'}
         assert logged['name'] == 'Test'
+
+
+# --- Datetime-safe serialisation and delete audits (2026-11-12) -----------------
+
+class TestAuditSerialisation:
+    """Rows from the DB carry datetimes; their audit entries must not be dropped."""
+
+    def _logger(self):
+        from app.audit.logger import AuditLogger
+        db = MockDB()
+        return AuditLogger(db, enabled=True), db
+
+    def test_delete_with_datetime_row_is_logged(self):
+        import json
+        from decimal import Decimal
+        audit, db = self._logger()
+        row = {'id': 'job-1', 'name': 'Files', 'created_at': datetime(2026, 4, 16, 2, 0),
+               'size': Decimal('1.5'), 'restic_password': 'pw', 's3_secret_key': 'sk'}
+        assert audit.log(action='DELETE', resource_type='job', resource_id='job-1', old_value=row)
+        logged = json.loads(db.logs[0]['changes'])['deleted']
+        assert logged['created_at'] == '2026-04-16 02:00:00'
+        assert logged['size'] == '1.5'
+        assert logged['restic_password'] == '[REDACTED]'
+        assert logged['s3_secret_key'] == '[REDACTED]'
+        assert logged['name'] == 'Files'
+
+    def test_create_and_update_with_datetimes(self):
+        import json
+        audit, db = self._logger()
+        now = datetime(2026, 11, 12, 10, 0)
+        audit.log(action='CREATE', resource_type='job', new_value={'name': 'a', 'created_at': now})
+        audit.log(action='UPDATE', resource_type='job',
+                  old_value={'updated_at': now - timedelta(days=1)}, new_value={'updated_at': now})
+        assert json.loads(db.logs[0]['changes'])['created_at'] == str(now)
+        assert json.loads(db.logs[1]['changes'])['updated_at']['new'] == str(now)
+
+    def test_unserialisable_details_still_write_the_entry(self, monkeypatch):
+        import json
+        from app.audit import logger as audit_module
+        audit, db = self._logger()
+        monkeypatch.setattr(audit_module, '_dumps', lambda v, _real=audit_module._dumps:
+                            _real(v) if v == {'error': 'details could not be serialised'}
+                            else (_ for _ in ()).throw(TypeError('boom')))
+        audit.log(action='DELETE', resource_type='server', resource_id='s1', old_value={'a': 1})
+        assert len(db.logs) == 1
+        assert json.loads(db.logs[0]['changes']) == {'error': 'details could not be serialised'}
+
+    def test_server_and_channel_secrets_are_redacted(self):
+        import json
+        audit, db = self._logger()
+        audit.log(action='DELETE', resource_type='server', old_value={
+            'host': '10.0.0.1', 'ssh_password': 'pw', 'ssh_key_content': 'KEY'})
+        audit.log(action='DELETE', resource_type='notification_channel', old_value={
+            'name': 'ops', 'type': 'telegram',
+            'config': {'bot_token': 't', 'chat_id': '1', 'webhook_url': 'https://x/secret',
+                       'headers': {'Authorization': 'Bearer z'}},
+            'list': [{'password': 'p', 'name': 'n'}]})
+        server = json.loads(db.logs[0]['changes'])['deleted']
+        assert server['ssh_password'] == '[REDACTED]' and server['ssh_key_content'] == '[REDACTED]'
+        assert server['host'] == '10.0.0.1'
+        channel = json.loads(db.logs[1]['changes'])['deleted']
+        assert channel['config']['bot_token'] == '[REDACTED]'
+        assert channel['config']['webhook_url'] == '[REDACTED]'
+        assert channel['config']['headers'] == '[REDACTED]'
+        assert channel['config']['chat_id'] == '1'
+        assert channel['list'] == [{'password': '[REDACTED]', 'name': 'n'}]
+
+
+@pytest.fixture
+def audited_api(client, monkeypatch):
+    """Logged-in client whose audit entries land in a MockDB (no real rows deleted)."""
+    import app.main as main
+    from app.audit import logger as audit_module
+    from app.audit.logger import AuditLogger
+    monkeypatch.setattr(main.limiter, 'enabled', False)
+    assert client.post('/api/auth/login', json={'username': 'testadmin',
+                                                 'password': 'testpassword123'}).status_code == 200
+    db = MockDB()
+    monkeypatch.setattr(audit_module, '_audit_logger', AuditLogger(db, enabled=True))
+    return client, db, main
+
+
+@pytest.mark.parametrize('url,getter,deleter,rtype,row', [
+    ('/api/servers/srv-1', 'get_server', 'delete_server_from_db', 'server',
+     {'id': 'srv-1', 'name': 'web', 'host': '10.0.0.5', 'ssh_password': 'pw',
+      'created_at': datetime(2026, 1, 1)}),
+    ('/api/s3-configs/srv-1', 'get_s3_config', 'delete_s3_config', 's3_config',
+     {'id': 'srv-1', 'name': 'R2', 'access_key': 'ak', 'secret_key': 'sk',
+      'created_at': datetime(2026, 1, 1)}),
+    ('/api/databases/srv-1', 'get_db_config', 'delete_db_config_from_db', 'db_config',
+     {'id': 'srv-1', 'name': 'koha', 'password': 'pw', 'created_at': datetime(2026, 1, 1)}),
+    ('/api/notifications/srv-1', 'get_notification_channel', 'delete_notification_channel',
+     'notification_channel',
+     {'id': 'srv-1', 'name': 'ops', 'config': {'bot_token': 't', 'chat_id': '1'},
+      'created_at': datetime(2026, 1, 1)}),
+])
+def test_deletes_are_audited_with_secrets_redacted(audited_api, monkeypatch, url, getter, deleter,
+                                                   rtype, row):
+    import json
+    client, db, main = audited_api
+    deleted = []
+    monkeypatch.setattr(main, getter, lambda _id: dict(row))
+    monkeypatch.setattr(main, deleter, lambda _id: deleted.append(_id))
+    monkeypatch.setattr(main, 'load_jobs', lambda: {})
+    assert client.delete(url).status_code == 200
+    assert deleted == ['srv-1']
+    entries = [e for e in db.logs if e['action'] == 'DELETE']
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry['resource_type'] == rtype and entry['resource_id'] == 'srv-1'
+    assert entry['user_id'] == 'testadmin'
+    logged = json.loads(entry['changes'])['deleted']
+    assert logged['created_at'] == '2026-01-01 00:00:00'
+    text = entry['changes']
+    for secret in ('"pw"', '"sk"', '"ak"', '"t"'):
+        assert secret not in text
+
+
+def test_job_delete_with_datetime_is_audited(audited_api, monkeypatch):
+    import json
+    client, db, main = audited_api
+    job = {'id': 'job-1', 'name': 'DSpace Files', 'restic_password': 'pw',
+           'created_at': datetime(2026, 4, 16), 'pitr_enabled': False}
+    monkeypatch.setattr(main, 'get_job', lambda _id: dict(job))
+    monkeypatch.setattr(main, 'delete_job_from_db', lambda _id: None)
+    monkeypatch.setattr(main, 'refresh_schedules', lambda: None)
+    assert client.delete('/api/jobs/job-1').status_code == 200
+    entry = [e for e in db.logs if e['action'] == 'DELETE'][0]
+    logged = json.loads(entry['changes'])['deleted']
+    assert logged['name'] == 'DSpace Files' and logged['restic_password'] == '[REDACTED]'
+    assert logged['created_at'] == '2026-04-16 00:00:00'
